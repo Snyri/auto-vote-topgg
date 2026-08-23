@@ -1360,7 +1360,7 @@ async def main() -> int:
     print(f"📊 Done — {total} account(s) processed")
     retry_at = write_next_vote_state(all_results)
     if retry_at is not None:
-    print(f"⏰ Next scheduled vote: {format_retry_at(retry_at)}")
+        print(f"⏰ Next scheduled vote: {format_retry_at(retry_at)}")
     if write_browser_startup_retry_state(all_results):
         print("↺ Browser startup fresh-run retry requested")
     report = build_notification(all_results, now)
