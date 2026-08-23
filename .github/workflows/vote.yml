@@ -1,11 +1,6 @@
 name: Top.gg Auto Vote
 
 on:
-  schedule:
-    # 07:00 WIB = 00:00 UTC
-    - cron: '0 0 * * *'
-    # 19:00 WIB = 12:00 UTC
-    - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
       source:
@@ -198,38 +193,7 @@ jobs:
     permissions:
       actions: write
     steps:
-      - name: Configure cooldown scheduler
-        id: scheduler
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          endpoint="repos/$REPOSITORY/actions/workflows/cooldown-retry.yml"
-          artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "next-vote" and .expired == false)] | first // empty')"
-          artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
-          if [ -n "$artifact_id" ]; then
-            state_dir="$(mktemp -d)"
-            trap 'rm -rf "$state_dir"' EXIT
-            gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$state_dir/state.zip"
-            unzip -qq "$state_dir/state.zip" -d "$state_dir/unpacked"
-            next_vote_at="$(jq -er 'if (keys == ["next_vote_at"]) and (.next_vote_at | type == "number") and (.next_vote_at | floor == .) then .next_vote_at else error("invalid cooldown state") end' "$state_dir/unpacked/next-vote.json")"
-            gh api --method PUT "$endpoint/enable"
-            echo "⏰ Cooldown scheduler enabled for epoch $next_vote_at"
-          else
-            state="$(gh api "$endpoint" --jq '.state')"
-            if [ "$state" = "active" ]; then
-              gh api --method PUT "$endpoint/disable"
-              echo "⏰ No valid cooldown state — scheduler disabled"
-            else
-              echo "⏰ No valid cooldown state — scheduler already disabled"
-            fi
-          fi
-
       - name: Clear old repository workflow runs
-        id: old-runs
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -243,18 +207,7 @@ jobs:
             fi
           done
           echo "✅ Cleanup done — latest 10 completed repository runs kept."
-
-      - name: Apply cleanup result
-        if: steps.scheduler.outcome != 'success' || steps.old-runs.outcome != 'success'
-        run: exit 1
-
   # Prevent GitHub from disabling scheduled workflows due to 60-day inactivity
   # Runs only on scheduled triggers (not manual dispatch)
   # Source: https://github.com/liskin/gh-workflow-keepalive
-  workflow-keepalive:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c # v1
+  
