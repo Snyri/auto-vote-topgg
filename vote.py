@@ -39,6 +39,7 @@ DIAGNOSTIC_DETAIL_LIMIT = 600
 BROWSER_RETRY_REASON = "browser_startup_failed"
 BROWSER_STARTUP_DETAIL_PREFIX = "Browser startup failed:"
 COOLDOWN_SAFETY_BUFFER_SEC = 5 * 60
+SUCCESS_NEXT_VOTE_DELAY_SEC = 12 * 60 * 60 + 30
 MIN_COOLDOWN_SEC = 60
 MAX_COOLDOWN_SEC = 24 * 60 * 60
 COOLDOWN_UNITS_SEC = {
@@ -341,13 +342,22 @@ def cooldown_result(bot_id: str, text: str, now: datetime | None = None) -> dict
         result["detail"] = f"Cooldown active; retry after {format_retry_at(retry_at)}"
     return result
 
+def successful_vote_result(bot_id: str) -> dict:
+    confirmed_at = int(datetime.now(timezone.utc).timestamp())
+    return {
+        "bot_id": bot_id,
+        "status": "success",
+        "detail": "Vote successful",
+        "retry_at": confirmed_at + SUCCESS_NEXT_VOTE_DELAY_SEC,
+    }
+
 
 def earliest_retry_at(all_results: list[list[dict]]) -> int | None:
     retry_times = [
         result.get("retry_at")
         for account_results in all_results
         for result in account_results
-        if result.get("status") == "cooldown"
+        if result.get("status") in {"cooldown", "success"}
         and isinstance(result.get("retry_at"), int)
     ]
     return min(retry_times) if retry_times else None
@@ -988,7 +998,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     text = (await body_text(tab)).lower()
     if "thanks for voting" in text:
         print(f"  ✅ Successfully voted for {bot_id}")
-        return {"bot_id": bot_id, "status": "success", "detail": "Vote successful"}
+        return successful_vote_result(bot_id)
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
             return await captcha_result(
@@ -1001,7 +1011,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         text = (await body_text(tab)).lower()
         if "thanks for voting" in text:
             print(f"  ✅ Successfully voted for {bot_id}")
-            return {"bot_id": bot_id, "status": "success", "detail": "Vote successful"}
+            return successful_vote_result(bot_id)
 
     await tab.reload()
     await asyncio.sleep(3)
@@ -1012,7 +1022,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         "can vote again", "thanks for voting", "thank you",
     )):
         print(f"  ✅ Successfully voted for {bot_id}")
-        return {"bot_id": bot_id, "status": "success", "detail": "Vote successful"}
+        return successful_vote_result(bot_id)
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
             return await captcha_result(
@@ -1028,7 +1038,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             "can vote again", "thanks for voting", "thank you",
         )):
             print(f"  ✅ Successfully voted for {bot_id}")
-            return {"bot_id": bot_id, "status": "success", "detail": "Vote successful"}
+            return successful_vote_result(bot_id)
 
     path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_uncertain.png")
     if path:
@@ -1350,7 +1360,7 @@ async def main() -> int:
     print(f"📊 Done — {total} account(s) processed")
     retry_at = write_next_vote_state(all_results)
     if retry_at is not None:
-        print(f"⏰ Next cooldown retry: {format_retry_at(retry_at)}")
+    print(f"⏰ Next scheduled vote: {format_retry_at(retry_at)}")
     if write_browser_startup_retry_state(all_results):
         print("↺ Browser startup fresh-run retry requested")
     report = build_notification(all_results, now)
