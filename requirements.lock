@@ -13,8 +13,8 @@ nodriver==0.50.3 \
     --hash=sha256:a053533108c14c309a7613445e6c7fb460b6b165c144a062e1b2f39e4f7b396b
 numpy==2.2.6 \
     --hash=sha256:ba10f8411898fc418a521833e014a77d3ca01c15b0c6cdcce6a0d2897e6dbbdf
-opencv-python-headless==4.11.0.86 \
-    --hash=sha256:0e0a27c19dd1f40ddff94976cfe43066fbbe9dfbb2ec1907d66c19caef42a57b
+opencv-python-headless==5.0.0.93 \
+    --hash=sha256:09a872a157c1376ab922a69bbf22f9a95bcc7b658a9d8b436a60212b02b2eeb4
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
 urllib3==2.7.0 \
