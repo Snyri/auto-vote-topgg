@@ -723,20 +723,47 @@ async def topgg_auth_state(tab: Any) -> str:
 async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) -> str:
     if not cookies:
         return AUTH_INVALID
+
     print("  → Injecting top.gg Auth.js cookies...")
     await inject_topgg_cookies(tab.browser, cookies)
-    await tab.get(f"https://top.gg/bot/{bot_ids[0]}/vote")
-    await asyncio.sleep(3)
-    await settle_privacy_overlay(tab)
-    state = await topgg_auth_state(tab)
-    if state == AUTHENTICATED:
-        print("  ✅ Authenticated via top.gg cookies")
-    elif state == AUTH_CAPTCHA_REQUIRED:
-        print("  🔒 CAPTCHA blocked top.gg cookie authentication")
-    else:
-        print("  ⚠️  Cookie session invalid or expired")
-    return state
 
+    vote_url = f"https://top.gg/bot/{bot_ids[0]}/vote"
+    await tab.get(vote_url)
+
+    # Give the first page load a little time to establish the session.
+    await asyncio.sleep(3)
+
+    # A fresh GitHub runner/top.gg session can occasionally fail the first
+    # session probe even when the cookie itself is still valid.
+    retry_delays = (0, 2, 3, 5)
+
+    for attempt, delay in enumerate(retry_delays, 1):
+        if attempt > 1:
+            print(
+                f"  ↺ Rechecking top.gg cookie session "
+                f"({attempt}/{len(retry_delays)})..."
+            )
+
+            # Halfway through, reload the page once to give top.gg a fresh
+            # opportunity to establish the Auth.js session.
+            if attempt == 3:
+                await tab.reload()
+
+            await asyncio.sleep(delay)
+
+        await settle_privacy_overlay(tab)
+        state = await topgg_auth_state(tab)
+
+        if state == AUTHENTICATED:
+            print("  ✅ Authenticated via top.gg cookies")
+            return AUTHENTICATED
+
+        if state == AUTH_CAPTCHA_REQUIRED:
+            print("  🔒 CAPTCHA blocked top.gg cookie authentication")
+            return AUTH_CAPTCHA_REQUIRED
+
+    print("  ⚠️  Cookie session could not be validated after 4 checks")
+    return AUTH_INVALID
 
 async def _handle_discord_oauth(tab: Any) -> str:
     print("  → Handling Discord OAuth dialog...")
