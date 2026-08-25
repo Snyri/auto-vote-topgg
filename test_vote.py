@@ -584,9 +584,9 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["status"], "auth_failed")
         self.assertEqual(run_account.await_count, vote.MAX_RETRIES)
         self.assertEqual(
-            [call.kwargs["capture_auth_failure"] for call in run_account.await_args_list],
-            [False, False, True],
-        )
+    capture_flags,
+    [False] * (vote.MAX_RETRIES - 1) + [True],
+)
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
