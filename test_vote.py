@@ -569,7 +569,7 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["status"], "success")
         self.assertEqual(run_account.await_count, 2)
 
-        @patch("builtins.print")
+    @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote._run_account", new_callable=AsyncMock)
     async def test_auth_failure_screenshot_capture_only_on_final_attempt(
