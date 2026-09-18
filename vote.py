@@ -694,17 +694,82 @@ async def inject_topgg_cookies(browser: Any, cookies: list[dict]) -> None:
 
 
 async def is_topgg_authenticated(tab: Any) -> bool:
+    # Diagnostic-only session probe: preserve the old True/False decision while
+    # exposing *why* a probe failed. Never log response bodies, cookies, tokens,
+    # headers other than the non-sensitive content type, or session/user data.
     result = await evaluate(tab, """(async () => {
         try {
             const response = await fetch('/api/auth/session', {credentials: 'include'});
-            if (!response.ok) return false;
-            const session = await response.json();
-            return Boolean(session && session.user);
-        } catch (_) {
-            return false;
+            const probe = {
+                ok: Boolean(response.ok),
+                status: Number(response.status || 0),
+                contentType: String(response.headers.get('content-type') || '')
+                    .split(';', 1)[0]
+                    .slice(0, 80),
+                jsonOk: false,
+                userPresent: false,
+                error: null,
+            };
+            if (!response.ok) return probe;
+            try {
+                const session = await response.json();
+                probe.jsonOk = true;
+                probe.userPresent = Boolean(session && session.user);
+                return probe;
+            } catch (error) {
+                probe.error = `json:${error && error.name ? error.name : 'Error'}`;
+                return probe;
+            }
+        } catch (error) {
+            return {
+                ok: false,
+                status: 0,
+                contentType: '',
+                jsonOk: false,
+                userPresent: false,
+                error: `fetch:${error && error.name ? error.name : 'Error'}`,
+            };
         }
     })()""")
-    return bool(result)
+
+    # Backward-compatible fallback for mocked/older evaluate implementations.
+    if isinstance(result, bool):
+        print(f"  🔎 top.gg session probe: legacy boolean={'authenticated' if result else 'unauthenticated'}")
+        return result
+    if not isinstance(result, dict):
+        print(f"  🔎 top.gg session probe: unexpected result type={type(result).__name__}")
+        return bool(result)
+
+    status = result.get("status")
+    status_text = str(status) if isinstance(status, (int, float)) else "?"
+    content_type = str(result.get("contentType") or "unknown")[:80]
+    error = str(result.get("error") or "")[:80]
+    ok = bool(result.get("ok"))
+    json_ok = bool(result.get("jsonOk"))
+    user_present = bool(result.get("userPresent"))
+
+    if error:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_type}, error={error}"
+        )
+    elif not ok:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_type}, response-not-ok"
+        )
+    elif not json_ok:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_type}, JSON-not-available"
+        )
+    else:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_type}, "
+            f"session-user={'present' if user_present else 'absent'}"
+        )
+    return user_present
 
 
 async def topgg_auth_state(tab: Any) -> str:
@@ -762,7 +827,7 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
             print("  🔒 CAPTCHA blocked top.gg cookie authentication")
             return AUTH_CAPTCHA_REQUIRED
 
-    print("  ⚠️  Cookie session could not be validated after 4 checks")
+    print(f"  ⚠️  Cookie session could not be validated after {len(retry_delays)} checks")
     return AUTH_INVALID
 
 async def _handle_discord_oauth(tab: Any) -> str:
@@ -1026,7 +1091,9 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     if "thanks for voting" in text:
         print(f"  ✅ Successfully voted for {bot_id}")
         return successful_vote_result(bot_id)
+    print("  🔎 Vote confirmation not visible after initial post-click wait")
     if await is_turnstile_present(tab):
+        print("  🔎 Turnstile detected after Vote click; solving before verification")
         if not await solve_turnstile(tab):
             return await captcha_result(
                 tab,
@@ -1039,6 +1106,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         if "thanks for voting" in text:
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
+        print("  🔎 No success marker after Turnstile; reloading once to verify vote state")
 
     await tab.reload()
     await asyncio.sleep(3)
@@ -1067,6 +1135,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
 
+    print("  ⚠️  Vote result remained unclear after reload/verification; marking attempt uncertain")
     path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_uncertain.png")
     if path:
         await notify_error_screenshot(bot_id, path, "Vote result unclear")
@@ -1298,12 +1367,22 @@ async def process_account(
 
         if attempt_results and attempt_results[0].get("bot_id") == "all":
             last_account_error = attempt_results[0]
+            print(
+                f"{prefix} 🔎 Attempt {attempt} auth result: "
+                f"status={last_account_error.get('status', '?')}, "
+                f"detail={redact_diagnostic(str(last_account_error.get('detail', '')), 160)}"
+            )
             if not is_retryable_result(last_account_error):
                 print(f"{prefix} 🔒 Authentication requires manual CAPTCHA")
                 return attempt_results
             print(f"{prefix} ❌ Authentication attempt {attempt} failed")
             continue
         for result in attempt_results:
+            print(
+                f"{prefix} 🔎 Attempt {attempt} bot {result.get('bot_id', '?')} result: "
+                f"status={result.get('status', '?')}, "
+                f"detail={redact_diagnostic(str(result.get('detail', '')), 160)}"
+            )
             results_by_bot[str(result["bot_id"])] = result
         pending = retryable_bot_ids(attempt_results)
         if not pending:

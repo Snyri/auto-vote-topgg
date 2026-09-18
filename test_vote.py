@@ -616,6 +616,76 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    async def test_session_probe_reports_authenticated_json_session(self, evaluate, _print):
+        evaluate.return_value = {
+            "ok": True,
+            "status": 200,
+            "contentType": "application/json",
+            "jsonOk": True,
+            "userPresent": True,
+            "error": None,
+        }
+
+        self.assertTrue(await vote.is_topgg_authenticated(AsyncMock()))
+        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
+        self.assertIn("HTTP 200", rendered)
+        self.assertIn("session-user=present", rendered)
+
+    @patch("builtins.print")
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    async def test_session_probe_reports_http_failure_without_exposing_body(self, evaluate, _print):
+        evaluate.return_value = {
+            "ok": False,
+            "status": 403,
+            "contentType": "text/html",
+            "jsonOk": False,
+            "userPresent": False,
+            "error": None,
+        }
+
+        self.assertFalse(await vote.is_topgg_authenticated(AsyncMock()))
+        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
+        self.assertIn("HTTP 403", rendered)
+        self.assertIn("content-type=text/html", rendered)
+        self.assertNotIn("cookie", rendered.lower())
+        self.assertNotIn("token", rendered.lower())
+
+    @patch("builtins.print")
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    async def test_session_probe_reports_user_absent_separately_from_http_failure(self, evaluate, _print):
+        evaluate.return_value = {
+            "ok": True,
+            "status": 200,
+            "contentType": "application/json",
+            "jsonOk": True,
+            "userPresent": False,
+            "error": None,
+        }
+
+        self.assertFalse(await vote.is_topgg_authenticated(AsyncMock()))
+        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
+        self.assertIn("HTTP 200", rendered)
+        self.assertIn("session-user=absent", rendered)
+
+    @patch("builtins.print")
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    async def test_session_probe_reports_fetch_exception_category_only(self, evaluate, _print):
+        evaluate.return_value = {
+            "ok": False,
+            "status": 0,
+            "contentType": "",
+            "jsonOk": False,
+            "userPresent": False,
+            "error": "fetch:TypeError",
+        }
+
+        self.assertFalse(await vote.is_topgg_authenticated(AsyncMock()))
+        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
+        self.assertIn("HTTP 0", rendered)
+        self.assertIn("error=fetch:TypeError", rendered)
+
+    @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.topgg_auth_state", new_callable=AsyncMock)
     @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
