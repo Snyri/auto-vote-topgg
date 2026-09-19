@@ -687,15 +687,54 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
-    @patch("vote.topgg_auth_state", new_callable=AsyncMock)
+    @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
     @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
     async def test_cookie_auth_propagates_captcha(self, _inject, auth_state, _sleep, _print):
-        auth_state.return_value = vote.AUTH_CAPTCHA_REQUIRED
+        auth_state.return_value = (vote.AUTH_CAPTCHA_REQUIRED, 403)
         tab = AsyncMock()
 
         result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
 
         self.assertEqual(result, vote.AUTH_CAPTCHA_REQUIRED)
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
+    @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
+    async def test_cookie_auth_marks_four_persistent_403_checks_for_fresh_browser_retry(
+        self, _inject, auth_state, _sleep, _print
+    ):
+        auth_state.return_value = (vote.AUTH_INVALID, 403)
+        tab = AsyncMock()
+
+        result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
+
+        self.assertEqual(result, vote.AUTH_CLOUDFLARE_BLOCKED)
+        self.assertEqual(auth_state.await_count, 4)
+
+    @patch("builtins.print")
+    @patch("vote.discord_oauth_login", new_callable=AsyncMock)
+    @patch("vote.login_with_cookies", new_callable=AsyncMock)
+    @patch("vote.start_browser", new_callable=AsyncMock)
+    async def test_persistent_cloudflare_block_skips_oauth_and_returns_retryable_auth_failure(
+        self, start_browser, cookie_login, oauth_login, _print
+    ):
+        browser = MagicMock()
+        tab = AsyncMock()
+        browser.__iter__.return_value = iter([tab])
+        browser.cookies.clear = AsyncMock()
+        browser.aclose = AsyncMock()
+        start_browser.return_value = browser
+        cookie_login.return_value = vote.AUTH_CLOUDFLARE_BLOCKED
+
+        results = await vote._run_account("token", ["111"], "id", [{"name": "authjs"}])
+
+        self.assertEqual(results[0]["status"], "auth_failed")
+        self.assertIn("Cloudflare HTTP 403", results[0]["detail"])
+        oauth_login.assert_not_awaited()
+        browser.cookies.clear.assert_not_awaited()
+        browser.aclose.assert_awaited_once()
+        browser.stop.assert_called_once()
 
     @patch("builtins.print")
     @patch("vote.vote_for_bot", new_callable=AsyncMock)
