@@ -690,7 +690,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
     @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
     async def test_cookie_auth_propagates_captcha(self, _inject, auth_state, _sleep, _print):
-        auth_state.return_value = (vote.AUTH_CAPTCHA_REQUIRED, 403)
+        auth_state.return_value = (vote.AUTH_CAPTCHA_REQUIRED, 403, "text/html")
         tab = AsyncMock()
 
         result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
@@ -704,12 +704,27 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_cookie_auth_marks_four_persistent_403_checks_for_fresh_browser_retry(
         self, _inject, auth_state, _sleep, _print
     ):
-        auth_state.return_value = (vote.AUTH_INVALID, 403)
+        auth_state.return_value = (vote.AUTH_INVALID, 403, "text/html")
         tab = AsyncMock()
 
         result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
 
         self.assertEqual(result, vote.AUTH_CLOUDFLARE_BLOCKED)
+        self.assertEqual(auth_state.await_count, 4)
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
+    @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
+    async def test_cookie_auth_does_not_classify_json_403_as_cloudflare_html_block(
+        self, _inject, auth_state, _sleep, _print
+    ):
+        auth_state.return_value = (vote.AUTH_INVALID, 403, "application/json")
+        tab = AsyncMock()
+
+        result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
+
+        self.assertEqual(result, vote.AUTH_INVALID)
         self.assertEqual(auth_state.await_count, 4)
 
     @patch("builtins.print")

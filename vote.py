@@ -794,26 +794,28 @@ async def is_topgg_authenticated(tab: Any) -> bool:
     return bool(probe.get("authenticated"))
 
 
-async def topgg_auth_state_details(tab: Any) -> tuple[str, int | None]:
-    """Return the existing auth state plus the final session-probe HTTP status."""
+async def topgg_auth_state_details(tab: Any) -> tuple[str, int | None, str]:
+    """Return auth state plus the final session-probe status and content type."""
     await dismiss_privacy_overlay(tab)
     probe = await topgg_session_probe(tab)
+    content_type = str(probe.get("content_type") or "unknown").lower()
     if probe.get("authenticated"):
-        return AUTHENTICATED, probe.get("status")
+        return AUTHENTICATED, probe.get("status"), content_type
 
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
-            return AUTH_CAPTCHA_REQUIRED, probe.get("status")
+            return AUTH_CAPTCHA_REQUIRED, probe.get("status"), content_type
         await asyncio.sleep(2)
         probe = await topgg_session_probe(tab)
+        content_type = str(probe.get("content_type") or "unknown").lower()
         if probe.get("authenticated"):
-            return AUTHENTICATED, probe.get("status")
+            return AUTHENTICATED, probe.get("status"), content_type
 
-    return AUTH_INVALID, probe.get("status")
+    return AUTH_INVALID, probe.get("status"), content_type
 
 
 async def topgg_auth_state(tab: Any) -> str:
-    state, _status = await topgg_auth_state_details(tab)
+    state, _status, _content_type = await topgg_auth_state_details(tab)
     return state
 
 
@@ -833,7 +835,7 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
     # A fresh GitHub runner/top.gg session can occasionally fail the first
     # session probe even when the cookie itself is still valid.
     retry_delays = (0, 2, 3, 5)
-    final_probe_statuses: list[int | None] = []
+    final_probes: list[tuple[int | None, str]] = []
 
     for attempt, delay in enumerate(retry_delays, 1):
         if attempt > 1:
@@ -850,8 +852,8 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
             await asyncio.sleep(delay)
 
         await settle_privacy_overlay(tab)
-        state, final_probe_status = await topgg_auth_state_details(tab)
-        final_probe_statuses.append(final_probe_status)
+        state, final_probe_status, final_probe_content_type = await topgg_auth_state_details(tab)
+        final_probes.append((final_probe_status, final_probe_content_type))
 
         if state == AUTHENTICATED:
             print("  ✅ Authenticated via top.gg cookies")
@@ -862,12 +864,15 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
             return AUTH_CAPTCHA_REQUIRED
 
     if (
-        len(final_probe_statuses) == len(retry_delays)
-        and all(status == 403 for status in final_probe_statuses)
+        len(final_probes) == len(retry_delays)
+        and all(
+            status == 403 and content_type == "text/html"
+            for status, content_type in final_probes
+        )
     ):
         print(
-            "  ⚠️  Cookie session remained behind Cloudflare HTTP 403 "
-            "for every validation check"
+            "  ⚠️  Cookie session remained behind Cloudflare-style "
+            "HTTP 403 HTML for every validation check"
         )
         return AUTH_CLOUDFLARE_BLOCKED
 
