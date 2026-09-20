@@ -13,3 +13,11 @@
 - Quantcast consent modals can place visible text inside child spans, so privacy-dismiss detection must prefer stable selectors like #accept-btn and include textContent/id fallback, not only innerText.
 - Privacy/consent modals may appear after navigation completes and after an initial sleep; use a short settle loop after page open/reload before checking auth or clicking Login.
 - Final top.gg auth_failed after all retries needs browser-state evidence, not only text report. Capture on the last retry only and send after the report to avoid retry spam.
+
+- A 403/HTML response from an Auth.js session endpoint is not equivalent to an expired cookie. Preserve HTTP/content-type diagnostics and distinguish explicit unauthenticated JSON from an upstream/protection block.
+- Do not write another origin's localStorage through a cross-origin iframe. Browser same-origin policy blocks it; navigate to the target origin before setting its localStorage.
+- When the vote page itself exposes a strong authenticated voting surface, do not let a separately blocked session-probe endpoint create a false logout.
+- Every failed automation cycle needs a bounded next-attempt timestamp; otherwise an external scheduler can create a retry storm when failures produce no artifact.
+- Retry policy must match failure scope: a protection block tied to runner/IP should get at most one fresh-browser retry, then defer instead of repeatedly hammering the same runner.
+- Workflow cleanup should be scoped to the workflow it owns; repository-wide retention can silently erase diagnostic history from unrelated CI.
+- External scheduler dispatch must snapshot existing workflow-run IDs before POST and identify a genuinely new run afterward; a timestamp-only heuristic can attach to another concurrent dispatch.
