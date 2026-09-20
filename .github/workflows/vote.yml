@@ -1,6 +1,8 @@
 name: Top.gg Auto Vote
 
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       source:
