@@ -111,7 +111,7 @@ class BusinessResultTests(unittest.TestCase):
         self.assertFalse(vote.has_business_failure(results))
 
     def test_incomplete_statuses_fail_workflow(self):
-        for status in ("error", "auth_failed", "uncertain", "captcha_required"):
+        for status in ("error", "auth_failed", "uncertain", "captcha_required", "blocked"):
             with self.subTest(status=status):
                 self.assertTrue(vote.has_business_failure([[{"status": status}]]))
 
@@ -183,11 +183,29 @@ class CooldownSchedulingTests(unittest.TestCase):
             with open(path, encoding="utf-8") as file:
                 self.assertEqual(json.load(file), {"next_vote_at": 1786334400})
 
-    def test_no_state_file_without_parsed_cooldown(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "next-vote.json")
-            self.assertIsNone(vote.write_next_vote_state([[{"status": "cooldown"}]], path))
-            self.assertFalse(os.path.exists(path))
+    def test_unparsed_cooldown_uses_safe_fallback_schedule(self):
+        now = datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc)
+        retry_at = vote.earliest_retry_at([[{"status": "cooldown"}]], now)
+        self.assertEqual(
+            retry_at,
+            int(now.timestamp()) + vote.SUCCESS_NEXT_VOTE_DELAY_SEC,
+        )
+
+    def test_transient_and_blocked_results_receive_backoff(self):
+        now = datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc)
+        base = int(now.timestamp())
+        self.assertEqual(
+            vote.earliest_retry_at([[{"status": "error"}]], now),
+            base + vote.TRANSIENT_RETRY_DELAY_SEC,
+        )
+        self.assertEqual(
+            vote.earliest_retry_at([[{"status": "blocked"}]], now),
+            base + vote.BLOCKED_RETRY_DELAY_SEC,
+        )
+        self.assertEqual(
+            vote.earliest_retry_at([[{"status": "captcha_required"}]], now),
+            base + vote.CAPTCHA_RETRY_DELAY_SEC,
+        )
 
     def test_cooldown_detail_reports_safe_retry_time(self):
         now = datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc)
@@ -410,6 +428,11 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertFalse(vote.is_retryable_result(result))
         self.assertEqual(vote.retryable_bot_ids([result]), [])
 
+    def test_protection_block_is_terminal_for_current_browser_cycle(self):
+        result = {"bot_id": "all", "status": "blocked"}
+        self.assertFalse(vote.is_retryable_result(result))
+        self.assertEqual(vote.retryable_bot_ids([result]), [])
+
 
 class CookieLoaderTests(unittest.TestCase):
     def test_cookie_lines_match_accounts_and_filter_non_authjs(self):
@@ -590,6 +613,21 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote._run_account", new_callable=AsyncMock)
+    async def test_blocked_auth_uses_only_one_fresh_browser_retry(
+        self, run_account, _sleep, _print
+    ):
+        run_account.return_value = [
+            {"bot_id": "all", "status": "blocked", "detail": "blocked", "account_id": "id"}
+        ]
+
+        results = await vote.process_account("token", ["111"], 1, 1)
+
+        self.assertEqual(results[0]["status"], "blocked")
+        self.assertEqual(run_account.await_count, vote.MAX_BLOCKED_ATTEMPTS)
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote._run_account", new_callable=AsyncMock)
     async def test_auth_captcha_is_not_retried(self, run_account, _sleep, _print):
         run_account.return_value = [
             {"bot_id": "all", "status": "captcha_required", "detail": "captcha", "account_id": "id"}
@@ -616,6 +654,52 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    async def test_session_probe_preserves_http_403_diagnostics(self, evaluate, _print):
+        evaluate.return_value = {
+            "ok": False,
+            "status": 403,
+            "contentType": "text/html",
+            "jsonOk": False,
+            "userPresent": False,
+            "error": None,
+        }
+
+        probe = await vote.topgg_session_probe(AsyncMock())
+
+        self.assertEqual(probe["status"], 403)
+        self.assertEqual(probe["content_type"], "text/html")
+        self.assertTrue(vote.probe_looks_blocked(probe))
+
+    @patch("builtins.print")
+    @patch("vote.topgg_session_probe", new_callable=AsyncMock)
+    @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock, return_value=vote.AUTHENTICATED)
+    async def test_page_voting_surface_can_confirm_auth_without_session_endpoint(
+        self, _hint, session_probe, _print
+    ):
+        tab = AsyncMock()
+
+        self.assertEqual(await vote.topgg_auth_state(tab), vote.AUTHENTICATED)
+        session_probe.assert_not_awaited()
+
+    @patch("builtins.print")
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
+    @patch("vote.topgg_session_probe", new_callable=AsyncMock)
+    @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock, return_value="unknown")
+    async def test_http_403_is_classified_as_temporary_block(
+        self, _hint, session_probe, _turnstile, _print
+    ):
+        session_probe.return_value = {
+            "authenticated": False,
+            "status": 403,
+            "content_type": "text/html",
+            "json_ok": False,
+            "error": "",
+        }
+
+        self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
+
+    @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.topgg_auth_state", new_callable=AsyncMock)
     @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
@@ -626,6 +710,51 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
 
         self.assertEqual(result, vote.AUTH_CAPTCHA_REQUIRED)
+
+    @patch("builtins.print")
+    @patch("vote.vote_for_bot", new_callable=AsyncMock)
+    @patch("vote.discord_oauth_login", new_callable=AsyncMock)
+    @patch("vote.login_with_cookies", new_callable=AsyncMock)
+    @patch("vote.start_browser", new_callable=AsyncMock)
+    async def test_blocked_cookie_does_not_start_oauth_on_same_browser(
+        self, start_browser, cookie_login, oauth_login, vote_for_bot, _print
+    ):
+        browser = MagicMock()
+        tab = AsyncMock()
+        browser.__iter__.return_value = iter([tab])
+        browser.cookies.clear = AsyncMock()
+        browser.aclose = AsyncMock()
+        start_browser.return_value = browser
+        cookie_login.return_value = vote.AUTH_BLOCKED
+
+        results = await vote._run_account("token", ["111"], "id", [{"name": "authjs"}])
+
+        self.assertEqual(results[0]["status"], "blocked")
+        oauth_login.assert_not_awaited()
+        vote_for_bot.assert_not_awaited()
+        browser.cookies.clear.assert_not_awaited()
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.topgg_auth_state", new_callable=AsyncMock)
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    @patch("vote.current_url", new_callable=AsyncMock, return_value="https://discord.com/login")
+    async def test_oauth_token_injection_occurs_on_discord_origin(
+        self, _current_url, evaluate, auth_state, _sleep, _print
+    ):
+        auth_state.side_effect = [vote.AUTH_INVALID, vote.AUTHENTICATED]
+        tab = AsyncMock()
+        tab.get = AsyncMock()
+
+        result = await vote.discord_oauth_login(tab, "token", ["111"])
+
+        self.assertEqual(result, vote.AUTHENTICATED)
+        destinations = [call.args[0] for call in tab.get.await_args_list]
+        self.assertEqual(destinations[0], "https://top.gg/bot/111/vote")
+        self.assertIn(vote.DISCORD_LOGIN_URL, destinations)
+        self.assertEqual(destinations[-1], "https://top.gg/bot/111/vote")
+        expression = evaluate.await_args.args[1]
+        self.assertIn("localStorage.setItem('token'", expression)
 
     @patch("builtins.print")
     @patch("vote.vote_for_bot", new_callable=AsyncMock)

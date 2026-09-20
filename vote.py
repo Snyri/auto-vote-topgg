@@ -19,20 +19,23 @@ import nodriver as uc
 import requests
 
 WIB = timezone(timedelta(hours=7))
+DISCORD_LOGIN_URL = "https://discord.com/login"
 DEFAULT_BOT_IDS = ["830530156048285716"]
 TIMEOUT_OAUTH_SEC = 25
 TIMEOUT_VOTE_SEC = 30
 DELAY_BETWEEN_BOTS_SEC = 3
 DELAY_BETWEEN_ACCOUNTS_SEC = 5
-MAX_RETRIES = 6
+MAX_RETRIES = 3
+MAX_BLOCKED_ATTEMPTS = 2
 RETRY_DELAY_SEC = 10
-FINAL_STATUSES = frozenset({"success", "cooldown", "captcha_required"})
+FINAL_STATUSES = frozenset({"success", "cooldown", "captcha_required", "blocked"})
 COMPLETED_STATUSES = frozenset({"success", "cooldown"})
 TRANSIENT_STATUSES = frozenset({"error", "auth_failed", "uncertain"})
-BROWSER_START_RETRIES = 10
-BROWSER_START_RETRY_SEC = 3
+BROWSER_START_RETRIES = 5
+BROWSER_START_RETRY_SEC = 2
 AUTHENTICATED = "authenticated"
 AUTH_INVALID = "invalid"
+AUTH_BLOCKED = "blocked"
 AUTH_CAPTCHA_REQUIRED = "captcha_required"
 TELEGRAM_MESSAGE_LIMIT = 3500
 DIAGNOSTIC_DETAIL_LIMIT = 600
@@ -40,6 +43,9 @@ BROWSER_RETRY_REASON = "browser_startup_failed"
 BROWSER_STARTUP_DETAIL_PREFIX = "Browser startup failed:"
 COOLDOWN_SAFETY_BUFFER_SEC = 5 * 60
 SUCCESS_NEXT_VOTE_DELAY_SEC = 12 * 60 * 60 + 30
+TRANSIENT_RETRY_DELAY_SEC = 20 * 60
+BLOCKED_RETRY_DELAY_SEC = 30 * 60
+CAPTCHA_RETRY_DELAY_SEC = 60 * 60
 MIN_COOLDOWN_SEC = 60
 MAX_COOLDOWN_SEC = 24 * 60 * 60
 COOLDOWN_UNITS_SEC = {
@@ -247,7 +253,7 @@ async def send_auth_failure_screenshots(all_results: list[list[dict]]) -> int:
     handled_paths: set[str] = set()
     for account_results in all_results:
         for result in account_results:
-            if result.get("status") != "auth_failed":
+            if result.get("status") not in {"auth_failed", "blocked"}:
                 continue
             path = result.get("screenshot_path")
             if not isinstance(path, str) or not path or path in handled_paths:
@@ -352,13 +358,35 @@ def successful_vote_result(bot_id: str) -> dict:
     }
 
 
-def earliest_retry_at(all_results: list[list[dict]]) -> int | None:
+def retry_at_for_result(result: dict, now: datetime | None = None) -> int | None:
+    retry_at = result.get("retry_at")
+    if isinstance(retry_at, int):
+        return retry_at
+
+    status = str(result.get("status", ""))
+    current = now or datetime.now(timezone.utc)
+    base = int(current.timestamp())
+
+    if status in {"success", "cooldown"}:
+        return base + SUCCESS_NEXT_VOTE_DELAY_SEC
+    if status == "blocked":
+        return base + BLOCKED_RETRY_DELAY_SEC
+    if status == "captcha_required":
+        return base + CAPTCHA_RETRY_DELAY_SEC
+    if status in TRANSIENT_STATUSES or status:
+        return base + TRANSIENT_RETRY_DELAY_SEC
+    return None
+
+
+def earliest_retry_at(
+    all_results: list[list[dict]],
+    now: datetime | None = None,
+) -> int | None:
     retry_times = [
-        result.get("retry_at")
+        retry_at
         for account_results in all_results
         for result in account_results
-        if result.get("status") in {"cooldown", "success"}
-        and isinstance(result.get("retry_at"), int)
+        if (retry_at := retry_at_for_result(result, now)) is not None
     ]
     return min(retry_times) if retry_times else None
 
@@ -693,31 +721,167 @@ async def inject_topgg_cookies(browser: Any, cookies: list[dict]) -> None:
         await browser.cookies.set_all(params)
 
 
-async def is_topgg_authenticated(tab: Any) -> bool:
+async def topgg_session_probe(tab: Any) -> dict:
+    """Return a credential-free Auth.js probe result for diagnostics and decisions."""
     result = await evaluate(tab, """(async () => {
         try {
             const response = await fetch('/api/auth/session', {credentials: 'include'});
-            if (!response.ok) return false;
-            const session = await response.json();
-            return Boolean(session && session.user);
-        } catch (_) {
-            return false;
+            const probe = {
+                ok: Boolean(response.ok),
+                status: Number(response.status || 0),
+                contentType: String(response.headers.get('content-type') || '')
+                    .split(';', 1)[0]
+                    .slice(0, 80),
+                jsonOk: false,
+                userPresent: false,
+                error: null,
+            };
+            if (!response.ok) return probe;
+            try {
+                const session = await response.json();
+                probe.jsonOk = true;
+                probe.userPresent = Boolean(session && session.user);
+                return probe;
+            } catch (error) {
+                probe.error = 'json:' + (error && error.name ? error.name : 'Error');
+                return probe;
+            }
+        } catch (error) {
+            return {
+                ok: false,
+                status: 0,
+                contentType: '',
+                jsonOk: false,
+                userPresent: false,
+                error: 'fetch:' + (error && error.name ? error.name : 'Error'),
+            };
         }
     })()""")
-    return bool(result)
+
+    if not isinstance(result, dict):
+        result = {
+            "ok": bool(result),
+            "status": None,
+            "contentType": "",
+            "jsonOk": isinstance(result, bool),
+            "userPresent": bool(result),
+            "error": "legacy-result",
+        }
+
+    raw_status = result.get("status")
+    status = int(raw_status) if isinstance(raw_status, (int, float)) else None
+    content_type = str(result.get("contentType") or "").lower()[:80]
+    error = str(result.get("error") or "")[:80]
+    json_ok = bool(result.get("jsonOk"))
+    authenticated = bool(result.get("userPresent"))
+
+    status_text = str(status) if status is not None else "?"
+    content_text = content_type or "unknown"
+    if error:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_text}, error={error}"
+        )
+    elif authenticated:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_text}, session-user=present"
+        )
+    elif json_ok:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_text}, session-user=absent"
+        )
+    else:
+        print(
+            f"  🔎 top.gg session probe: HTTP {status_text}, "
+            f"content-type={content_text}, response-not-usable"
+        )
+
+    return {
+        "authenticated": authenticated,
+        "status": status,
+        "content_type": content_type,
+        "json_ok": json_ok,
+        "error": error,
+    }
+
+
+async def is_topgg_authenticated(tab: Any) -> bool:
+    return bool((await topgg_session_probe(tab)).get("authenticated"))
+
+
+async def topgg_page_auth_hint(tab: Any) -> str:
+    """Infer auth only from strong vote-page UI signals; otherwise return unknown."""
+    result = await evaluate(tab, """(() => {
+        const body = (document.body ? document.body.innerText : '').toLowerCase();
+        const buttons = [...document.querySelectorAll('button, a, [role="button"]')];
+        const exactText = (node) => (node.textContent || '').trim().toLowerCase();
+        const hasVoteButton = buttons.some(node => exactText(node) === 'vote');
+        const hasLoginButton = buttons.some(node => exactText(node) === 'login');
+        const loginRequired =
+            body.includes('must be logged in') ||
+            body.includes('login to vote') ||
+            body.includes('log in to vote');
+        const hasVoteSurface =
+            hasVoteButton ||
+            body.includes('you will be able to vote after this ad') ||
+            body.includes('vote again in') ||
+            body.includes('already voted') ||
+            body.includes('can vote again');
+
+        if (loginRequired || (hasLoginButton && !hasVoteSurface)) return 'invalid';
+        if (hasVoteSurface) return 'authenticated';
+        return 'unknown';
+    })()""")
+    return result if result in {AUTHENTICATED, AUTH_INVALID} else "unknown"
+
+
+def probe_looks_blocked(probe: dict) -> bool:
+    status = probe.get("status")
+    content_type = str(probe.get("content_type") or "")
+    return (
+        status in {403, 429}
+        or (isinstance(status, int) and status >= 500)
+        or content_type == "text/html"
+        or bool(probe.get("error"))
+    )
 
 
 async def topgg_auth_state(tab: Any) -> str:
     await dismiss_privacy_overlay(tab)
-    if await is_topgg_authenticated(tab):
+
+    page_hint = await topgg_page_auth_hint(tab)
+    if page_hint == AUTHENTICATED:
+        print("  ✅ top.gg vote page shows an authenticated voting surface")
         return AUTHENTICATED
+
+    probe = await topgg_session_probe(tab)
+    if probe.get("authenticated"):
+        return AUTHENTICATED
+
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
             return AUTH_CAPTCHA_REQUIRED
         await asyncio.sleep(2)
-        if await is_topgg_authenticated(tab):
+        await settle_privacy_overlay(tab)
+
+        page_hint = await topgg_page_auth_hint(tab)
+        if page_hint == AUTHENTICATED:
+            print("  ✅ top.gg vote page became usable after verification")
             return AUTHENTICATED
-    return AUTH_INVALID
+
+        probe = await topgg_session_probe(tab)
+        if probe.get("authenticated"):
+            return AUTHENTICATED
+
+    if page_hint == AUTH_INVALID:
+        return AUTH_INVALID
+    if probe.get("status") == 200 and probe.get("json_ok"):
+        return AUTH_INVALID
+    if probe_looks_blocked(probe):
+        return AUTH_BLOCKED
+    return AUTH_BLOCKED
 
 
 async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) -> str:
@@ -729,13 +893,10 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
 
     vote_url = f"https://top.gg/bot/{bot_ids[0]}/vote"
     await tab.get(vote_url)
-
-    # Give the first page load a little time to establish the session.
     await asyncio.sleep(3)
 
-    # A fresh GitHub runner/top.gg session can occasionally fail the first
-    # session probe even when the cookie itself is still valid.
-    retry_delays = (0, 2, 3, 5)
+    retry_delays = (0, 5)
+    last_state = AUTH_BLOCKED
 
     for attempt, delay in enumerate(retry_delays, 1):
         if attempt > 1:
@@ -743,27 +904,26 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
                 f"  ↺ Rechecking top.gg cookie session "
                 f"({attempt}/{len(retry_delays)})..."
             )
-
-            # Halfway through, reload the page once to give top.gg a fresh
-            # opportunity to establish the Auth.js session.
-            if attempt == 3:
-                await tab.reload()
-
+            await tab.reload()
             await asyncio.sleep(delay)
 
         await settle_privacy_overlay(tab)
         state = await topgg_auth_state(tab)
+        last_state = state
 
         if state == AUTHENTICATED:
             print("  ✅ Authenticated via top.gg cookies")
             return AUTHENTICATED
-
         if state == AUTH_CAPTCHA_REQUIRED:
             print("  🔒 CAPTCHA blocked top.gg cookie authentication")
             return AUTH_CAPTCHA_REQUIRED
+        if state == AUTH_INVALID:
+            print("  ⚠️  top.gg cookie session is explicitly unauthenticated")
+            return AUTH_INVALID
 
-    print("  ⚠️  Cookie session could not be validated after 4 checks")
-    return AUTH_INVALID
+    print("  ⏳ top.gg session validation is temporarily blocked; defer retry")
+    return last_state
+
 
 async def _handle_discord_oauth(tab: Any) -> str:
     print("  → Handling Discord OAuth dialog...")
@@ -789,47 +949,47 @@ async def _handle_discord_oauth(tab: Any) -> str:
 
 
 async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
-    print("  → Setting Discord session for top.gg login...")
-    await tab.get(f"https://top.gg/bot/{bot_ids[0]}/vote")
-    await asyncio.sleep(2)
-    await settle_privacy_overlay(tab)
-    state = await topgg_auth_state(tab)
-    if state != AUTH_INVALID:
-        print("  ✅ Already logged into top.gg" if state == AUTHENTICATED else "  🔒 CAPTCHA blocked top.gg session probe")
-        return state
+    print("  → Preparing Discord session for top.gg login...")
+    vote_url = f"https://top.gg/bot/{bot_ids[0]}/vote"
 
-    # ponytail: avoid discord.com/login navigation; token goes into discord.com
-    # localStorage via an iframe so top.gg can pick up the Discord session on Login.
-    await evaluate(tab, f"""(() => {{
-        const token = {json.dumps(token)};
-        const frame = document.body.appendChild(document.createElement('iframe'));
-        frame.style.display = 'none';
-        frame.src = 'https://discord.com';
-    }})()""")
-    await asyncio.sleep(1.5)
-    await evaluate(tab, f"""(() => {{
-        const token = {json.dumps(token)};
-        const frame = document.querySelector('iframe[src=\"https://discord.com\"]');
-        try {{
-            if (frame && frame.contentWindow) {{
-                frame.contentWindow.localStorage.setItem('token', JSON.stringify(token));
-                frame.contentWindow.localStorage.setItem('tokens', JSON.stringify({{"default": token}}));
-            }}
-        }} catch (_) {{}}
-        if (frame) frame.remove();
-    }})()""")
-    await tab.reload()
+    await tab.get(vote_url)
     await asyncio.sleep(2)
     await settle_privacy_overlay(tab)
     state = await topgg_auth_state(tab)
     if state == AUTHENTICATED:
-        print("  ✅ Session established without OAuth redirect")
+        print("  ✅ Already logged into top.gg")
         return state
-    if state == AUTH_CAPTCHA_REQUIRED:
+    if state in {AUTH_CAPTCHA_REQUIRED, AUTH_BLOCKED}:
+        return state
+
+    print("  → Establishing Discord browser session...")
+    await tab.get(DISCORD_LOGIN_URL)
+    await asyncio.sleep(2)
+    if not url_has_domain(await current_url(tab), "discord.com"):
+        print("  ❌ Discord login page did not open")
+        return AUTH_INVALID
+
+    await evaluate(tab, f"""(() => {{
+        const token = {json.dumps(token)};
+        localStorage.setItem('token', JSON.stringify(token));
+        localStorage.setItem('tokens', JSON.stringify({{"default": token}}));
+    }})()""")
+    await tab.reload()
+    await asyncio.sleep(3)
+
+    print("  → Navigating to top.gg to initiate OAuth...")
+    await tab.get(vote_url)
+    await asyncio.sleep(3)
+    await settle_privacy_overlay(tab)
+    state = await topgg_auth_state(tab)
+    if state == AUTHENTICATED:
+        print("  ✅ Session established before OAuth redirect")
+        return state
+    if state in {AUTH_CAPTCHA_REQUIRED, AUTH_BLOCKED}:
         return state
 
     marker = "data-auto-login"
-    if not await _mark_exact_element(tab, "a,button", ["Login"], marker):
+    if not await _mark_exact_element(tab, "a,button,[role=\"button\"]", ["Login"], marker):
         print("  ❌ Could not find top.gg Login button")
         return AUTH_INVALID
     if not await _click_marked(tab, marker):
@@ -843,6 +1003,7 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
     if "/oauth2/authorize" not in urlparse(await current_url(tab)).path:
         print("  ❌ Unexpected Discord redirect")
         return AUTH_INVALID
+
     oauth_state = await _handle_discord_oauth(tab)
     if oauth_state == AUTH_CAPTCHA_REQUIRED:
         return oauth_state
@@ -854,7 +1015,9 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
             return AUTH_CAPTCHA_REQUIRED
         print("  ❌ OAuth redirect failed")
         return AUTH_INVALID
+
     await asyncio.sleep(3)
+    await settle_privacy_overlay(tab)
     state = await topgg_auth_state(tab)
     print("  ✅ Logged into top.gg" if state == AUTHENTICATED else "  ❌ top.gg session not established")
     return state
@@ -1011,6 +1174,12 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             )
         await asyncio.sleep(2)
     else:
+        text = (await body_text(tab)).lower()
+        if any(marker in text for marker in ("vote again in", "already voted", "come back", "cooldown")):
+            print(f"  ⏳ Already voted for {bot_id} (cooldown)")
+            return cooldown_result(bot_id, text)
+        if "must be logged in" in text or "login to vote" in text or "log in to vote" in text:
+            return {"bot_id": bot_id, "status": "auth_failed", "detail": "Not logged into top.gg"}
         path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_no_btn.png")
         if path:
             await notify_error_screenshot(bot_id, path, "Vote button unavailable")
@@ -1046,7 +1215,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     text = (await body_text(tab)).lower()
     if any(marker in text for marker in (
         "you have already voted", "already voted", "vote again in",
-        "can vote again", "thanks for voting", "thank you",
+        "can vote again", "thanks for voting",
     )):
         print(f"  ✅ Successfully voted for {bot_id}")
         return successful_vote_result(bot_id)
@@ -1062,7 +1231,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         text = (await body_text(tab)).lower()
         if any(marker in text for marker in (
             "you have already voted", "already voted", "vote again in",
-            "can vote again", "thanks for voting", "thank you",
+            "can vote again", "thanks for voting",
         )):
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
@@ -1196,8 +1365,10 @@ async def _run_account(
         if account_cookies:
             auth_state = await login_with_cookies(tab, account_cookies, bot_ids)
             if auth_state == AUTH_INVALID:
-                print("  → Cookie auth failed, falling back to Discord OAuth...")
+                print("  → Cookie auth is invalid; falling back to Discord OAuth...")
                 await browser.cookies.clear()
+            elif auth_state == AUTH_BLOCKED:
+                print("  ⏳ top.gg is blocking this browser; skipping OAuth on the same session")
         if auth_state == AUTH_INVALID:
             auth_state = await discord_oauth_login(tab, token, bot_ids)
         if auth_state == AUTH_CAPTCHA_REQUIRED:
@@ -1216,13 +1387,18 @@ async def _run_account(
                 result["screenshot_path"] = path
             return [result]
         if auth_state != AUTHENTICATED:
+            blocked = auth_state == AUTH_BLOCKED
             result = {
                 "bot_id": "all",
-                "status": "auth_failed",
-                "detail": "Top.gg authentication failed",
+                "status": "blocked" if blocked else "auth_failed",
+                "detail": (
+                    "top.gg temporarily blocked session validation"
+                    if blocked
+                    else "Top.gg authentication failed"
+                ),
                 "account_id": account_id,
             }
-            if capture_auth_failure:
+            if capture_auth_failure or blocked:
                 path = await browser_screenshot(
                     tab,
                     f"screenshots/auth_{account_id}_failed.png",
@@ -1264,6 +1440,7 @@ async def process_account(
     pending = list(bot_ids)
     results_by_bot: dict[str, dict] = {}
     last_account_error: dict | None = None
+    blocked_attempts = 0
     print(f"\n{'─' * 45}")
     print(f"{prefix} Processing account...")
 
@@ -1298,6 +1475,14 @@ async def process_account(
 
         if attempt_results and attempt_results[0].get("bot_id") == "all":
             last_account_error = attempt_results[0]
+            status = last_account_error.get("status")
+            if status == "blocked":
+                blocked_attempts += 1
+                if blocked_attempts < MAX_BLOCKED_ATTEMPTS and attempt < MAX_RETRIES:
+                    print(f"{prefix} ↺ Protection block detected; trying one fresh browser")
+                    continue
+                print(f"{prefix} ⏳ Protection block persists; deferring to scheduled retry")
+                return attempt_results
             if not is_retryable_result(last_account_error):
                 print(f"{prefix} 🔒 Authentication requires manual CAPTCHA")
                 return attempt_results
@@ -1331,7 +1516,7 @@ def build_notification(all_results: list[list[dict]], now: str) -> str:
             detail = escape(str(result.get("detail", "")))
             icon = {
                 "success": "✅", "cooldown": "⏳", "uncertain": "⚠️",
-                "captcha_required": "🔒",
+                "captcha_required": "🔒", "blocked": "⏳",
             }.get(status, "❌")
             lines.append(f"  {icon} {bot_id}: {detail}")
         lines.append("")
