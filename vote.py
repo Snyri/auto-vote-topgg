@@ -1163,13 +1163,13 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         await settle_privacy_overlay(tab)
         text = (await body_text(tab)).lower()
 
-    if "could not be found" in text or "404" in str(await evaluate(tab, "document.title")):
-        return {"bot_id": bot_id, "status": "error", "detail": "Vote page 404"}
     if "must be logged in" in text or "login to vote" in text:
         return {"bot_id": bot_id, "status": "auth_failed", "detail": "Not logged into top.gg"}
     if any(marker in text for marker in ("vote again in", "already voted", "come back", "cooldown")):
         print(f"  ⏳ Already voted for {bot_id} (cooldown)")
         return cooldown_result(bot_id, text)
+    if "could not be found" in text or "404" in str(await evaluate(tab, "document.title")):
+        return {"bot_id": bot_id, "status": "error", "detail": "Vote page 404"}
 
     turnstile_cycles = 0
     if await is_turnstile_present(tab):
