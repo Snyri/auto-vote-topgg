@@ -1,5 +1,8 @@
-* @emowbaik
-/.github/workflows/ @emowbaik
-/requirements.txt @emowbaik
-/requirements.lock @emowbaik
-/vote.py @emowbaik
+* @Snyri
+/.github/workflows/ @Snyri
+/scheduler/ @Snyri
+/requirements.txt @Snyri
+/requirements.lock @Snyri
+/vote.py @Snyri
+/test_vote.py @Snyri
+/test_scheduler.py @Snyri
