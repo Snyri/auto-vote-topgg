@@ -337,9 +337,10 @@ class VotePageReuseTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.current_url", new_callable=AsyncMock)
     @patch("vote.settle_privacy_overlay", new_callable=AsyncMock)
+    @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
     @patch("vote.body_text", new_callable=AsyncMock)
     async def test_reuses_current_authenticated_vote_page_without_navigation(
-        self, body_text, _settle, current_url, _print
+        self, body_text, _evaluate, _settle, current_url, _print
     ):
         current_url.return_value = "https://top.gg/bot/111/vote"
         body_text.return_value = "You have already voted\nYou can vote again in about 1 hour."
