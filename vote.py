@@ -41,6 +41,7 @@ BROWSER_RETRY_REASON = "browser_startup_failed"
 BROWSER_STARTUP_DETAIL_PREFIX = "Browser startup failed:"
 COOLDOWN_SAFETY_BUFFER_SEC = 5 * 60
 SUCCESS_NEXT_VOTE_DELAY_SEC = 12 * 60 * 60 + 30
+CLOUDFLARE_BACKOFF_SEC = 20 * 60
 MIN_COOLDOWN_SEC = 60
 MAX_COOLDOWN_SEC = 24 * 60 * 60
 COOLDOWN_UNITS_SEC = {
@@ -358,7 +359,7 @@ def earliest_retry_at(all_results: list[list[dict]]) -> int | None:
         result.get("retry_at")
         for account_results in all_results
         for result in account_results
-        if result.get("status") in {"cooldown", "success"}
+        if result.get("status") in {"cooldown", "success", "auth_failed"}
         and isinstance(result.get("retry_at"), int)
     ]
     return min(retry_times) if retry_times else None
@@ -1350,6 +1351,15 @@ async def _run_account(
                 "detail": detail,
                 "account_id": account_id,
             }
+            if auth_state == AUTH_CLOUDFLARE_BLOCKED:
+                retry_at = (
+                    int(datetime.now(timezone.utc).timestamp())
+                    + CLOUDFLARE_BACKOFF_SEC
+                )
+                result["retry_at"] = retry_at
+                result["detail"] = (
+                    f"{detail}; retry after {format_retry_at(retry_at)}"
+                )
             if capture_auth_failure:
                 path = await browser_screenshot(
                     tab,
@@ -1433,6 +1443,12 @@ async def process_account(
             )
             if not is_retryable_result(last_account_error):
                 print(f"{prefix} 🔒 Authentication requires manual CAPTCHA")
+                return attempt_results
+            if isinstance(last_account_error.get("retry_at"), int):
+                print(
+                    f"{prefix} ⏳ Persistent Cloudflare block; "
+                    f"pausing until {format_retry_at(last_account_error['retry_at'])}"
+                )
                 return attempt_results
             print(f"{prefix} ❌ Authentication attempt {attempt} failed")
             continue

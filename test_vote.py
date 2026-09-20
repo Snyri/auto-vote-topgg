@@ -121,6 +121,21 @@ class BusinessResultTests(unittest.TestCase):
 
 
 class CooldownSchedulingTests(unittest.TestCase):
+    def test_auth_failure_retry_metadata_drives_next_vote_state(self):
+        retry_at = 2_000_000_000
+        all_results = [[{
+            "bot_id": "all",
+            "status": "auth_failed",
+            "detail": "Persistent Cloudflare HTTP 403 blocked top.gg session",
+            "retry_at": retry_at,
+        }]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "next-vote.json")
+            self.assertEqual(vote.write_next_vote_state(all_results, path), retry_at)
+            with open(path, encoding="utf-8") as file:
+                self.assertEqual(json.load(file), {"next_vote_at": retry_at})
+
     def test_parses_supplied_about_one_hour_text(self):
         text = "You have already voted\nYou can vote again in about 1 hour."
         self.assertEqual(vote.parse_cooldown_seconds(text), 3600)
@@ -590,6 +605,26 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote._run_account", new_callable=AsyncMock)
+    async def test_persistent_cloudflare_auth_failure_stops_same_runner_retries(
+        self, run_account, _sleep, _print
+    ):
+        run_account.return_value = [{
+            "bot_id": "all",
+            "status": "auth_failed",
+            "detail": "Persistent Cloudflare HTTP 403 blocked top.gg session",
+            "account_id": "id",
+            "retry_at": 2_000_000_000,
+        }]
+
+        results = await vote.process_account("token", ["111"], 1, 1)
+
+        self.assertEqual(results[0]["status"], "auth_failed")
+        self.assertEqual(results[0]["retry_at"], 2_000_000_000)
+        self.assertEqual(run_account.await_count, 1)
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote._run_account", new_callable=AsyncMock)
     async def test_auth_captcha_is_not_retried(self, run_account, _sleep, _print):
         run_account.return_value = [
             {"bot_id": "all", "status": "captcha_required", "detail": "captcha", "account_id": "id"}
@@ -746,6 +781,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results[0]["status"], "auth_failed")
         self.assertIn("Cloudflare HTTP 403", results[0]["detail"])
+        self.assertIsInstance(results[0].get("retry_at"), int)
         oauth_login.assert_not_awaited()
         browser.cookies.clear.assert_not_awaited()
         browser.aclose.assert_awaited_once()
