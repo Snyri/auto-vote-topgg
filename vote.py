@@ -612,6 +612,14 @@ async def current_url(tab: Any) -> str:
     return str(await evaluate(tab, "location.href") or "")
 
 
+def is_topgg_vote_url(url: str, bot_id: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        url_has_domain(url, "top.gg")
+        and parsed.path.rstrip("/") == f"/bot/{bot_id}/vote"
+    )
+
+
 def url_has_domain(url: str, domain: str) -> bool:
     """Match exact hostname or its subdomain, never URL query/path text."""
     hostname = (urlparse(url).hostname or "").lower().rstrip(".")
@@ -1127,7 +1135,7 @@ async def mark_vote_button(tab: Any) -> dict:
     return dict(await evaluate(tab, """(() => {
         document.querySelectorAll('[data-auto-vote]').forEach(el => el.removeAttribute('data-auto-vote'));
         const button = [...document.querySelectorAll('button')]
-            .find(el => (el.textContent || '').trim() === 'Vote');
+            .find(el => (el.textContent || '').trim().toLowerCase() === 'vote');
         if (!button) return {found: false, disabled: true};
         button.setAttribute('data-auto-vote', '1');
         return {
@@ -1139,8 +1147,12 @@ async def mark_vote_button(tab: Any) -> dict:
 
 async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> dict:
     print(f"  → Voting for bot {bot_id}...")
-    await tab.get(f"https://top.gg/bot/{bot_id}/vote")
-    await asyncio.sleep(3)
+    vote_url = f"https://top.gg/bot/{bot_id}/vote"
+    if is_topgg_vote_url(await current_url(tab), bot_id):
+        print("  → Reusing current top.gg vote page to preserve verified browser state")
+    else:
+        await tab.get(vote_url)
+        await asyncio.sleep(3)
     await settle_privacy_overlay(tab)
     text = (await body_text(tab)).lower()
 

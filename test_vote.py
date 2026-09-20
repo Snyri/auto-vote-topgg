@@ -44,6 +44,26 @@ class LoaderTests(unittest.TestCase):
 
 
 class UrlMatchingTests(unittest.TestCase):
+    def test_matches_exact_topgg_vote_page_with_query_and_trailing_slash(self):
+        self.assertTrue(
+            vote.is_topgg_vote_url(
+                "https://top.gg/bot/830530156048285716/vote/?source=test",
+                "830530156048285716",
+            )
+        )
+        self.assertFalse(
+            vote.is_topgg_vote_url(
+                "https://top.gg/bot/999999999999999999/vote",
+                "830530156048285716",
+            )
+        )
+        self.assertFalse(
+            vote.is_topgg_vote_url(
+                "https://evil.example/top.gg/bot/830530156048285716/vote",
+                "830530156048285716",
+            )
+        )
+
     def test_matches_topgg_host_and_subdomain(self):
         self.assertTrue(vote.url_has_domain("https://top.gg/bot/123/vote", "top.gg"))
         self.assertTrue(vote.url_has_domain("https://www.top.gg/callback", "top.gg"))
@@ -311,6 +331,24 @@ class PreVoteProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(solver.await_count, vote.MAX_TURNSTILE_CYCLES_PER_PHASE - 1)
+
+
+class VotePageReuseTests(unittest.IsolatedAsyncioTestCase):
+    @patch("builtins.print")
+    @patch("vote.current_url", new_callable=AsyncMock)
+    @patch("vote.settle_privacy_overlay", new_callable=AsyncMock)
+    @patch("vote.body_text", new_callable=AsyncMock)
+    async def test_reuses_current_authenticated_vote_page_without_navigation(
+        self, body_text, _settle, current_url, _print
+    ):
+        current_url.return_value = "https://top.gg/bot/111/vote"
+        body_text.return_value = "You have already voted\nYou can vote again in about 1 hour."
+        tab = AsyncMock()
+
+        result = await vote.vote_for_bot(tab, "111")
+
+        self.assertEqual(result["status"], "cooldown")
+        tab.get.assert_not_awaited()
 
 
 class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
