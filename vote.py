@@ -1184,10 +1184,23 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     if ad_error:
         return ad_error
 
-    if await is_turnstile_present(tab) and not await solve_turnstile(tab):
-        return await captcha_result(
-            tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
-        )
+    if await is_turnstile_present(tab):
+        turnstile_cycles += 1
+        if turnstile_cycles >= MAX_TURNSTILE_CYCLES_PER_PHASE:
+            print(
+                f"  ⏳ Repeated protection challenge before Vote became available "
+                f"for {bot_id}"
+            )
+            return {
+                "bot_id": bot_id,
+                "status": "blocked",
+                "detail": "Repeated protection challenge before Vote became available",
+            }
+        if not await solve_turnstile(tab):
+            return await captcha_result(
+                tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
+            )
+        await asyncio.sleep(2)
 
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     state = {}
