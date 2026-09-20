@@ -834,6 +834,22 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         browser.aclose.assert_awaited_once()
 
 
+class ElementMatchingTests(unittest.IsolatedAsyncioTestCase):
+    @patch("vote.evaluate", new_callable=AsyncMock, return_value=True)
+    async def test_exact_element_matching_is_case_insensitive(self, evaluate):
+        self.assertTrue(
+            await vote._mark_exact_element(
+                AsyncMock(),
+                "a,button",
+                ["Login", "Log in"],
+                "data-test",
+            )
+        )
+        expression = evaluate.await_args.args[1]
+        self.assertIn("toLowerCase", expression)
+        self.assertIn("new Set", expression)
+
+
 class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.evaluate", new_callable=AsyncMock, return_value={"present": True, "dismissed": True})
     async def test_privacy_overlay_dismiss_clicks_detected_consent(self, evaluate_mock):

@@ -629,9 +629,11 @@ async def wait_for_domain(tab: Any, domain: str, timeout: int) -> bool:
 
 async def _mark_exact_element(tab: Any, selector: str, texts: list[str], marker: str) -> bool:
     script = f"""(() => {{
-        const wanted = {json.dumps(texts)};
+        const wanted = new Set({json.dumps(texts)}.map(text => text.trim().toLowerCase()));
         const nodes = [...document.querySelectorAll({json.dumps(selector)})];
-        const element = nodes.find(node => wanted.includes((node.textContent || '').trim()));
+        const element = nodes.find(node =>
+            wanted.has((node.textContent || '').trim().toLowerCase())
+        );
         if (!element) return false;
         element.setAttribute({json.dumps(marker)}, '1');
         return true;
@@ -815,10 +817,13 @@ async def topgg_page_auth_hint(tab: Any) -> str:
     """Infer auth only from strong vote-page UI signals; otherwise return unknown."""
     result = await evaluate(tab, """(() => {
         const body = (document.body ? document.body.innerText : '').toLowerCase();
-        const buttons = [...document.querySelectorAll('button, a, [role="button"]')];
+        const controls = [...document.querySelectorAll('button, a, [role="button"]')];
+        const voteButtons = [...document.querySelectorAll('button')];
         const exactText = (node) => (node.textContent || '').trim().toLowerCase();
-        const hasVoteButton = buttons.some(node => exactText(node) === 'vote');
-        const hasLoginButton = buttons.some(node => exactText(node) === 'login');
+        const hasVoteButton = voteButtons.some(node => exactText(node) === 'vote');
+        const hasLoginButton = controls.some(node =>
+            ['login', 'log in', 'sign in'].includes(exactText(node))
+        );
         const loginRequired =
             body.includes('must be logged in') ||
             body.includes('login to vote') ||
@@ -989,7 +994,12 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
         return state
 
     marker = "data-auto-login"
-    if not await _mark_exact_element(tab, "a,button,[role=\"button\"]", ["Login"], marker):
+    if not await _mark_exact_element(
+        tab,
+        "a,button,[role=\"button\"]",
+        ["Login", "Log in", "Sign in"],
+        marker,
+    ):
         print("  ❌ Could not find top.gg Login button")
         return AUTH_INVALID
     if not await _click_marked(tab, marker):
