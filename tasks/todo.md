@@ -22,3 +22,14 @@
 Browser-startup fresh-run retry merged in PR #18 and verified locally/CI/post-merge. Controlled forced-failure E2E remains unrun because implementation already merged and normal master path verified.
 
 Post-vote CAPTCHA/Turnstile fix: root cause was direct `captcha_result()` after Vote-click/verification detection without `solve_turnstile()`. Fixed those paths to call solver first and only capture/report CAPTCHA after solver failure. Added 3 regression tests. Local suite: 73 tests OK.
+
+- [x] Full reliability audit after protection-block retry storm
+  - [x] Distinguish blocked session probes from explicit logout
+  - [x] Restore Discord-origin localStorage token injection
+  - [x] Add vote-page UI authentication fallback
+  - [x] Bound same-run protection retries
+  - [x] Emit retry schedule for failure states
+  - [x] Harden scheduler timestamp validation, run identification, duplicate prevention, and timeout
+  - [x] Add scheduler regression tests and CI syntax coverage
+  - [x] Align scheduler dependency pin with repository requirements
+  - [x] Scope cleanup to Top.gg vote workflow history
