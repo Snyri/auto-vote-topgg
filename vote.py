@@ -27,6 +27,7 @@ DELAY_BETWEEN_BOTS_SEC = 3
 DELAY_BETWEEN_ACCOUNTS_SEC = 5
 MAX_RETRIES = 3
 MAX_BLOCKED_ATTEMPTS = 2
+MAX_TURNSTILE_CYCLES_PER_PHASE = 3
 RETRY_DELAY_SEC = 10
 FINAL_STATUSES = frozenset({"success", "cooldown", "captcha_required", "blocked"})
 COMPLETED_STATUSES = frozenset({"success", "cooldown"})
@@ -1158,10 +1159,14 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         print(f"  ⏳ Already voted for {bot_id} (cooldown)")
         return cooldown_result(bot_id, text)
 
-    if await is_turnstile_present(tab) and not await solve_turnstile(tab):
-        return await captcha_result(
-            tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
-        )
+    turnstile_cycles = 0
+    if await is_turnstile_present(tab):
+        turnstile_cycles += 1
+        if not await solve_turnstile(tab):
+            return await captcha_result(
+                tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
+            )
+        await asyncio.sleep(2)
 
     ad_error = await wait_for_ad(tab, bot_id)
     if ad_error:
@@ -1178,11 +1183,25 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         state = await mark_vote_button(tab)
         if state.get("found") and not state.get("disabled"):
             break
-        if await is_turnstile_present(tab) and not await solve_turnstile(tab):
-            return await captcha_result(
-                tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
-            )
-        await asyncio.sleep(2)
+        if await is_turnstile_present(tab):
+            turnstile_cycles += 1
+            if turnstile_cycles >= MAX_TURNSTILE_CYCLES_PER_PHASE:
+                print(
+                    f"  ⏳ Repeated protection challenge before Vote became available "
+                    f"for {bot_id}"
+                )
+                return {
+                    "bot_id": bot_id,
+                    "status": "blocked",
+                    "detail": "Repeated protection challenge before Vote became available",
+                }
+            if not await solve_turnstile(tab):
+                return await captcha_result(
+                    tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
+                )
+            await asyncio.sleep(2)
+        else:
+            await asyncio.sleep(2)
     else:
         text = (await body_text(tab)).lower()
         if any(marker in text for marker in ("vote again in", "already voted", "come back", "cooldown")):
@@ -1500,7 +1519,25 @@ async def process_account(
             continue
         for result in attempt_results:
             results_by_bot[str(result["bot_id"])] = result
-        pending = retryable_bot_ids(attempt_results)
+
+        blocked_bot_ids = [
+            str(result["bot_id"])
+            for result in attempt_results
+            if result.get("status") == "blocked"
+            and result.get("bot_id") not in {None, "all"}
+        ]
+        transient_bot_ids = retryable_bot_ids(attempt_results)
+
+        if blocked_bot_ids:
+            blocked_attempts += 1
+            if blocked_attempts < MAX_BLOCKED_ATTEMPTS and attempt < MAX_RETRIES:
+                pending = list(dict.fromkeys(blocked_bot_ids + transient_bot_ids))
+                print(f"{prefix} ↺ Vote-page protection block; trying one fresh browser")
+                continue
+            print(f"{prefix} ⏳ Vote-page protection block persists; deferring")
+            return [results_by_bot[bot_id] for bot_id in bot_ids if bot_id in results_by_bot]
+
+        pending = transient_bot_ids
         if not pending:
             return [results_by_bot[bot_id] for bot_id in bot_ids]
 

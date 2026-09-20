@@ -295,6 +295,24 @@ class CooldownVotePageTests(unittest.IsolatedAsyncioTestCase):
         tab.get.assert_awaited_once_with("https://top.gg/bot/111/vote")
 
 
+class PreVoteProtectionTests(unittest.IsolatedAsyncioTestCase):
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True)
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
+    @patch("vote.mark_vote_button", new_callable=AsyncMock, return_value={"found": False, "disabled": True})
+    @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
+    @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
+    @patch("vote.body_text", new_callable=AsyncMock, return_value="ready")
+    async def test_repeated_turnstile_before_vote_is_classified_as_blocked(
+        self, _body, _evaluate, _ad, _mark, _present, solver, _sleep, _print
+    ):
+        result = await vote.vote_for_bot(AsyncMock(), "111", "account")
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(solver.await_count, vote.MAX_TURNSTILE_CYCLES_PER_PHASE - 1)
+
+
 class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
@@ -624,6 +642,22 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results[0]["status"], "blocked")
         self.assertEqual(run_account.await_count, vote.MAX_BLOCKED_ATTEMPTS)
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote._run_account", new_callable=AsyncMock)
+    async def test_vote_page_block_gets_only_one_fresh_browser_retry(
+        self, run_account, _sleep, _print
+    ):
+        run_account.side_effect = [
+            [{"bot_id": "111", "status": "blocked", "detail": "protection", "account_id": "id"}],
+            [{"bot_id": "111", "status": "success", "detail": "ok", "account_id": "id"}],
+        ]
+
+        results = await vote.process_account("token", ["111"], 1, 1)
+
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(run_account.await_count, 2)
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
