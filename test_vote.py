@@ -121,21 +121,6 @@ class BusinessResultTests(unittest.TestCase):
 
 
 class CooldownSchedulingTests(unittest.TestCase):
-    def test_auth_failure_retry_metadata_drives_next_vote_state(self):
-        retry_at = 2_000_000_000
-        all_results = [[{
-            "bot_id": "all",
-            "status": "auth_failed",
-            "detail": "Persistent Cloudflare HTTP 403 blocked top.gg session",
-            "retry_at": retry_at,
-        }]]
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "next-vote.json")
-            self.assertEqual(vote.write_next_vote_state(all_results, path), retry_at)
-            with open(path, encoding="utf-8") as file:
-                self.assertEqual(json.load(file), {"next_vote_at": retry_at})
-
     def test_parses_supplied_about_one_hour_text(self):
         text = "You have already voted\nYou can vote again in about 1 hour."
         self.assertEqual(vote.parse_cooldown_seconds(text), 3600)
@@ -605,26 +590,6 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote._run_account", new_callable=AsyncMock)
-    async def test_persistent_cloudflare_auth_failure_stops_same_runner_retries(
-        self, run_account, _sleep, _print
-    ):
-        run_account.return_value = [{
-            "bot_id": "all",
-            "status": "auth_failed",
-            "detail": "Persistent Cloudflare HTTP 403 blocked top.gg session",
-            "account_id": "id",
-            "retry_at": 2_000_000_000,
-        }]
-
-        results = await vote.process_account("token", ["111"], 1, 1)
-
-        self.assertEqual(results[0]["status"], "auth_failed")
-        self.assertEqual(results[0]["retry_at"], 2_000_000_000)
-        self.assertEqual(run_account.await_count, 1)
-
-    @patch("builtins.print")
-    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
-    @patch("vote._run_account", new_callable=AsyncMock)
     async def test_auth_captcha_is_not_retried(self, run_account, _sleep, _print):
         run_account.return_value = [
             {"bot_id": "all", "status": "captcha_required", "detail": "captcha", "account_id": "id"}
@@ -651,141 +616,16 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
-    @patch("vote.evaluate", new_callable=AsyncMock)
-    async def test_session_probe_reports_authenticated_json_session(self, evaluate, _print):
-        evaluate.return_value = {
-            "ok": True,
-            "status": 200,
-            "contentType": "application/json",
-            "jsonOk": True,
-            "userPresent": True,
-            "error": None,
-        }
-
-        self.assertTrue(await vote.is_topgg_authenticated(AsyncMock()))
-        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
-        self.assertIn("HTTP 200", rendered)
-        self.assertIn("session-user=present", rendered)
-
-    @patch("builtins.print")
-    @patch("vote.evaluate", new_callable=AsyncMock)
-    async def test_session_probe_reports_http_failure_without_exposing_body(self, evaluate, _print):
-        evaluate.return_value = {
-            "ok": False,
-            "status": 403,
-            "contentType": "text/html",
-            "jsonOk": False,
-            "userPresent": False,
-            "error": None,
-        }
-
-        self.assertFalse(await vote.is_topgg_authenticated(AsyncMock()))
-        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
-        self.assertIn("HTTP 403", rendered)
-        self.assertIn("content-type=text/html", rendered)
-        self.assertNotIn("cookie", rendered.lower())
-        self.assertNotIn("token", rendered.lower())
-
-    @patch("builtins.print")
-    @patch("vote.evaluate", new_callable=AsyncMock)
-    async def test_session_probe_reports_user_absent_separately_from_http_failure(self, evaluate, _print):
-        evaluate.return_value = {
-            "ok": True,
-            "status": 200,
-            "contentType": "application/json",
-            "jsonOk": True,
-            "userPresent": False,
-            "error": None,
-        }
-
-        self.assertFalse(await vote.is_topgg_authenticated(AsyncMock()))
-        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
-        self.assertIn("HTTP 200", rendered)
-        self.assertIn("session-user=absent", rendered)
-
-    @patch("builtins.print")
-    @patch("vote.evaluate", new_callable=AsyncMock)
-    async def test_session_probe_reports_fetch_exception_category_only(self, evaluate, _print):
-        evaluate.return_value = {
-            "ok": False,
-            "status": 0,
-            "contentType": "",
-            "jsonOk": False,
-            "userPresent": False,
-            "error": "fetch:TypeError",
-        }
-
-        self.assertFalse(await vote.is_topgg_authenticated(AsyncMock()))
-        rendered = " ".join(str(arg) for call in _print.call_args_list for arg in call.args)
-        self.assertIn("HTTP 0", rendered)
-        self.assertIn("error=fetch:TypeError", rendered)
-
-    @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
-    @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
+    @patch("vote.topgg_auth_state", new_callable=AsyncMock)
     @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
     async def test_cookie_auth_propagates_captcha(self, _inject, auth_state, _sleep, _print):
-        auth_state.return_value = (vote.AUTH_CAPTCHA_REQUIRED, 403, "text/html")
+        auth_state.return_value = vote.AUTH_CAPTCHA_REQUIRED
         tab = AsyncMock()
 
         result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
 
         self.assertEqual(result, vote.AUTH_CAPTCHA_REQUIRED)
-
-    @patch("builtins.print")
-    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
-    @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
-    @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
-    async def test_cookie_auth_marks_four_persistent_403_checks_for_fresh_browser_retry(
-        self, _inject, auth_state, _sleep, _print
-    ):
-        auth_state.return_value = (vote.AUTH_INVALID, 403, "text/html")
-        tab = AsyncMock()
-
-        result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
-
-        self.assertEqual(result, vote.AUTH_CLOUDFLARE_BLOCKED)
-        self.assertEqual(auth_state.await_count, 4)
-
-    @patch("builtins.print")
-    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
-    @patch("vote.topgg_auth_state_details", new_callable=AsyncMock)
-    @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
-    async def test_cookie_auth_does_not_classify_json_403_as_cloudflare_html_block(
-        self, _inject, auth_state, _sleep, _print
-    ):
-        auth_state.return_value = (vote.AUTH_INVALID, 403, "application/json")
-        tab = AsyncMock()
-
-        result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
-
-        self.assertEqual(result, vote.AUTH_INVALID)
-        self.assertEqual(auth_state.await_count, 4)
-
-    @patch("builtins.print")
-    @patch("vote.discord_oauth_login", new_callable=AsyncMock)
-    @patch("vote.login_with_cookies", new_callable=AsyncMock)
-    @patch("vote.start_browser", new_callable=AsyncMock)
-    async def test_persistent_cloudflare_block_skips_oauth_and_returns_retryable_auth_failure(
-        self, start_browser, cookie_login, oauth_login, _print
-    ):
-        browser = MagicMock()
-        tab = AsyncMock()
-        browser.__iter__.return_value = iter([tab])
-        browser.cookies.clear = AsyncMock()
-        browser.aclose = AsyncMock()
-        start_browser.return_value = browser
-        cookie_login.return_value = vote.AUTH_CLOUDFLARE_BLOCKED
-
-        results = await vote._run_account("token", ["111"], "id", [{"name": "authjs"}])
-
-        self.assertEqual(results[0]["status"], "auth_failed")
-        self.assertIn("Cloudflare HTTP 403", results[0]["detail"])
-        self.assertIsInstance(results[0].get("retry_at"), int)
-        oauth_login.assert_not_awaited()
-        browser.cookies.clear.assert_not_awaited()
-        browser.aclose.assert_awaited_once()
-        browser.stop.assert_called_once()
 
     @patch("builtins.print")
     @patch("vote.vote_for_bot", new_callable=AsyncMock)

@@ -77,7 +77,7 @@ jobs:
           export NEXT_VOTE_STATE_FILE="$RUNNER_TEMP/next-vote.json"
           export BROWSER_RETRY_STATE_FILE="$RUNNER_TEMP/browser-startup-retry.json"
           set +e
-          xvfb-run -a -s "-screen 0 1280x720x24" python -u vote.py
+          xvfb-run -a -s "-screen 0 1280x720x24" python vote.py
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit 0

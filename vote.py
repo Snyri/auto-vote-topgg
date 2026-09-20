@@ -34,14 +34,12 @@ BROWSER_START_RETRY_SEC = 3
 AUTHENTICATED = "authenticated"
 AUTH_INVALID = "invalid"
 AUTH_CAPTCHA_REQUIRED = "captcha_required"
-AUTH_CLOUDFLARE_BLOCKED = "cloudflare_blocked"
 TELEGRAM_MESSAGE_LIMIT = 3500
 DIAGNOSTIC_DETAIL_LIMIT = 600
 BROWSER_RETRY_REASON = "browser_startup_failed"
 BROWSER_STARTUP_DETAIL_PREFIX = "Browser startup failed:"
 COOLDOWN_SAFETY_BUFFER_SEC = 5 * 60
 SUCCESS_NEXT_VOTE_DELAY_SEC = 12 * 60 * 60 + 30
-CLOUDFLARE_BACKOFF_SEC = 20 * 60
 MIN_COOLDOWN_SEC = 60
 MAX_COOLDOWN_SEC = 24 * 60 * 60
 COOLDOWN_UNITS_SEC = {
@@ -359,7 +357,7 @@ def earliest_retry_at(all_results: list[list[dict]]) -> int | None:
         result.get("retry_at")
         for account_results in all_results
         for result in account_results
-        if result.get("status") in {"cooldown", "success", "auth_failed"}
+        if result.get("status") in {"cooldown", "success"}
         and isinstance(result.get("retry_at"), int)
     ]
     return min(retry_times) if retry_times else None
@@ -695,129 +693,31 @@ async def inject_topgg_cookies(browser: Any, cookies: list[dict]) -> None:
         await browser.cookies.set_all(params)
 
 
-async def topgg_session_probe(tab: Any) -> dict:
-    """Probe Auth.js without exposing credentials or response bodies."""
+async def is_topgg_authenticated(tab: Any) -> bool:
     result = await evaluate(tab, """(async () => {
         try {
             const response = await fetch('/api/auth/session', {credentials: 'include'});
-            const probe = {
-                ok: Boolean(response.ok),
-                status: Number(response.status || 0),
-                contentType: String(response.headers.get('content-type') || '')
-                    .split(';', 1)[0]
-                    .slice(0, 80),
-                jsonOk: false,
-                userPresent: false,
-                error: null,
-            };
-            if (!response.ok) return probe;
-            try {
-                const session = await response.json();
-                probe.jsonOk = true;
-                probe.userPresent = Boolean(session && session.user);
-                return probe;
-            } catch (error) {
-                probe.error = `json:${error && error.name ? error.name : 'Error'}`;
-                return probe;
-            }
-        } catch (error) {
-            return {
-                ok: false,
-                status: 0,
-                contentType: '',
-                jsonOk: false,
-                userPresent: false,
-                error: `fetch:${error && error.name ? error.name : 'Error'}`,
-            };
+            if (!response.ok) return false;
+            const session = await response.json();
+            return Boolean(session && session.user);
+        } catch (_) {
+            return false;
         }
     })()""")
-
-    # Backward-compatible normalization for mocked/older evaluate implementations.
-    if isinstance(result, bool):
-        print(
-            f"  🔎 top.gg session probe: legacy boolean="
-            f"{'authenticated' if result else 'unauthenticated'}"
-        )
-        return {
-            "authenticated": result,
-            "status": None,
-            "content_type": "unknown",
-        }
-
-    if not isinstance(result, dict):
-        print(f"  🔎 top.gg session probe: unexpected result type={type(result).__name__}")
-        return {
-            "authenticated": bool(result),
-            "status": None,
-            "content_type": "unknown",
-        }
-
-    status = result.get("status")
-    status_value = int(status) if isinstance(status, (int, float)) else None
-    status_text = str(status_value) if status_value is not None else "?"
-    content_type = str(result.get("contentType") or "unknown")[:80]
-    error = str(result.get("error") or "")[:80]
-    ok = bool(result.get("ok"))
-    json_ok = bool(result.get("jsonOk"))
-    user_present = bool(result.get("userPresent"))
-
-    if error:
-        print(
-            f"  🔎 top.gg session probe: HTTP {status_text}, "
-            f"content-type={content_type}, error={error}"
-        )
-    elif not ok:
-        print(
-            f"  🔎 top.gg session probe: HTTP {status_text}, "
-            f"content-type={content_type}, response-not-ok"
-        )
-    elif not json_ok:
-        print(
-            f"  🔎 top.gg session probe: HTTP {status_text}, "
-            f"content-type={content_type}, JSON-not-available"
-        )
-    else:
-        print(
-            f"  🔎 top.gg session probe: HTTP {status_text}, "
-            f"content-type={content_type}, "
-            f"session-user={'present' if user_present else 'absent'}"
-        )
-
-    return {
-        "authenticated": user_present,
-        "status": status_value,
-        "content_type": content_type,
-    }
-
-
-async def is_topgg_authenticated(tab: Any) -> bool:
-    probe = await topgg_session_probe(tab)
-    return bool(probe.get("authenticated"))
-
-
-async def topgg_auth_state_details(tab: Any) -> tuple[str, int | None, str]:
-    """Return auth state plus the final session-probe status and content type."""
-    await dismiss_privacy_overlay(tab)
-    probe = await topgg_session_probe(tab)
-    content_type = str(probe.get("content_type") or "unknown").lower()
-    if probe.get("authenticated"):
-        return AUTHENTICATED, probe.get("status"), content_type
-
-    if await is_turnstile_present(tab):
-        if not await solve_turnstile(tab):
-            return AUTH_CAPTCHA_REQUIRED, probe.get("status"), content_type
-        await asyncio.sleep(2)
-        probe = await topgg_session_probe(tab)
-        content_type = str(probe.get("content_type") or "unknown").lower()
-        if probe.get("authenticated"):
-            return AUTHENTICATED, probe.get("status"), content_type
-
-    return AUTH_INVALID, probe.get("status"), content_type
+    return bool(result)
 
 
 async def topgg_auth_state(tab: Any) -> str:
-    state, _status, _content_type = await topgg_auth_state_details(tab)
-    return state
+    await dismiss_privacy_overlay(tab)
+    if await is_topgg_authenticated(tab):
+        return AUTHENTICATED
+    if await is_turnstile_present(tab):
+        if not await solve_turnstile(tab):
+            return AUTH_CAPTCHA_REQUIRED
+        await asyncio.sleep(2)
+        if await is_topgg_authenticated(tab):
+            return AUTHENTICATED
+    return AUTH_INVALID
 
 
 async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) -> str:
@@ -836,7 +736,6 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
     # A fresh GitHub runner/top.gg session can occasionally fail the first
     # session probe even when the cookie itself is still valid.
     retry_delays = (0, 2, 3, 5)
-    final_probes: list[tuple[int | None, str]] = []
 
     for attempt, delay in enumerate(retry_delays, 1):
         if attempt > 1:
@@ -853,8 +752,7 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
             await asyncio.sleep(delay)
 
         await settle_privacy_overlay(tab)
-        state, final_probe_status, final_probe_content_type = await topgg_auth_state_details(tab)
-        final_probes.append((final_probe_status, final_probe_content_type))
+        state = await topgg_auth_state(tab)
 
         if state == AUTHENTICATED:
             print("  ✅ Authenticated via top.gg cookies")
@@ -864,20 +762,7 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
             print("  🔒 CAPTCHA blocked top.gg cookie authentication")
             return AUTH_CAPTCHA_REQUIRED
 
-    if (
-        len(final_probes) == len(retry_delays)
-        and all(
-            status == 403 and content_type == "text/html"
-            for status, content_type in final_probes
-        )
-    ):
-        print(
-            "  ⚠️  Cookie session remained behind Cloudflare-style "
-            "HTTP 403 HTML for every validation check"
-        )
-        return AUTH_CLOUDFLARE_BLOCKED
-
-    print(f"  ⚠️  Cookie session could not be validated after {len(retry_delays)} checks")
+    print("  ⚠️  Cookie session could not be validated after 4 checks")
     return AUTH_INVALID
 
 async def _handle_discord_oauth(tab: Any) -> str:
@@ -1141,9 +1026,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     if "thanks for voting" in text:
         print(f"  ✅ Successfully voted for {bot_id}")
         return successful_vote_result(bot_id)
-    print("  🔎 Vote confirmation not visible after initial post-click wait")
     if await is_turnstile_present(tab):
-        print("  🔎 Turnstile detected after Vote click; solving before verification")
         if not await solve_turnstile(tab):
             return await captcha_result(
                 tab,
@@ -1156,7 +1039,6 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         if "thanks for voting" in text:
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
-        print("  🔎 No success marker after Turnstile; reloading once to verify vote state")
 
     await tab.reload()
     await asyncio.sleep(3)
@@ -1185,7 +1067,6 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
 
-    print("  ⚠️  Vote result remained unclear after reload/verification; marking attempt uncertain")
     path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_uncertain.png")
     if path:
         await notify_error_screenshot(bot_id, path, "Vote result unclear")
@@ -1314,12 +1195,7 @@ async def _run_account(
         auth_state = AUTH_INVALID
         if account_cookies:
             auth_state = await login_with_cookies(tab, account_cookies, bot_ids)
-            if auth_state == AUTH_CLOUDFLARE_BLOCKED:
-                print(
-                    "  ↺ Persistent Cloudflare HTTP 403 detected; "
-                    "skipping Discord OAuth and retrying with a fresh browser"
-                )
-            elif auth_state == AUTH_INVALID:
+            if auth_state == AUTH_INVALID:
                 print("  → Cookie auth failed, falling back to Discord OAuth...")
                 await browser.cookies.clear()
         if auth_state == AUTH_INVALID:
@@ -1340,26 +1216,12 @@ async def _run_account(
                 result["screenshot_path"] = path
             return [result]
         if auth_state != AUTHENTICATED:
-            detail = (
-                "Persistent Cloudflare HTTP 403 blocked top.gg session"
-                if auth_state == AUTH_CLOUDFLARE_BLOCKED
-                else "Top.gg authentication failed"
-            )
             result = {
                 "bot_id": "all",
                 "status": "auth_failed",
-                "detail": detail,
+                "detail": "Top.gg authentication failed",
                 "account_id": account_id,
             }
-            if auth_state == AUTH_CLOUDFLARE_BLOCKED:
-                retry_at = (
-                    int(datetime.now(timezone.utc).timestamp())
-                    + CLOUDFLARE_BACKOFF_SEC
-                )
-                result["retry_at"] = retry_at
-                result["detail"] = (
-                    f"{detail}; retry after {format_retry_at(retry_at)}"
-                )
             if capture_auth_failure:
                 path = await browser_screenshot(
                     tab,
@@ -1436,28 +1298,12 @@ async def process_account(
 
         if attempt_results and attempt_results[0].get("bot_id") == "all":
             last_account_error = attempt_results[0]
-            print(
-                f"{prefix} 🔎 Attempt {attempt} auth result: "
-                f"status={last_account_error.get('status', '?')}, "
-                f"detail={redact_diagnostic(str(last_account_error.get('detail', '')), 160)}"
-            )
             if not is_retryable_result(last_account_error):
                 print(f"{prefix} 🔒 Authentication requires manual CAPTCHA")
-                return attempt_results
-            if isinstance(last_account_error.get("retry_at"), int):
-                print(
-                    f"{prefix} ⏳ Persistent Cloudflare block; "
-                    f"pausing until {format_retry_at(last_account_error['retry_at'])}"
-                )
                 return attempt_results
             print(f"{prefix} ❌ Authentication attempt {attempt} failed")
             continue
         for result in attempt_results:
-            print(
-                f"{prefix} 🔎 Attempt {attempt} bot {result.get('bot_id', '?')} result: "
-                f"status={result.get('status', '?')}, "
-                f"detail={redact_diagnostic(str(result.get('detail', '')), 160)}"
-            )
             results_by_bot[str(result["bot_id"])] = result
         pending = retryable_bot_ids(attempt_results)
         if not pending:
