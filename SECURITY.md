@@ -6,7 +6,7 @@ Security fixes apply to latest commit on `master`.
 
 ## Reporting a Vulnerability
 
-Do not open public issue containing credentials, cookies, screenshots, or exploit details. Use [GitHub private vulnerability reporting](https://github.com/emowbaik/auto-vote-topgg/security/advisories/new) for this repository.
+Do not open public issue containing credentials, cookies, screenshots, or exploit details. Use [GitHub private vulnerability reporting](https://github.com/Snyri/auto-vote-topgg/security/advisories/new) for this repository.
 
 Include affected commit, reproduction steps without live credentials, impact, and suggested mitigation if known.
 
@@ -33,9 +33,10 @@ Workflow secrets are handed to Python through mode-`0600` temporary files. Pytho
 - Every Auth.js cookie forced to `Secure` during injection.
 - Every Auth.js session-token cookie forced to `HttpOnly` during injection.
 - Credential redaction in normal diagnostics.
-- Separate write-capable cleanup and cooldown-dispatch jobs without user credentials.
+- Separate write-capable cleanup and browser-startup retry jobs without user credentials.
+- External Northflank scheduler uses a restricted GitHub token and consumes credential-free schedule artifacts.
 - Cooldown artifacts contain only a bounded UTC epoch; no account IDs, bot IDs, cookies, or tokens.
-- Cooldown dispatcher validates latest-run state, dispatches once, then disables its own schedule.
+- Scheduler validates bounded `next_vote_at` values, avoids duplicate active runs, and backs off after failed runs.
 - CAPTCHA outcomes capture current browser view before profile cleanup and send it only to configured Telegram chat after the text report.
 - CAPTCHA captions contain account fingerprint, bot ID, and escaped result detail—not tokens or cookies.
 - Screenshot files are never GitHub artifacts and are deleted after every Telegram delivery attempt.
@@ -65,3 +66,8 @@ Added credential-free cooldown scheduling with timestamp-only one-day artifacts,
 Fixed browser credential inheritance, profile retention, weak cookie attributes, Requests CVE-2026-25645, transitive dependency integrity, and excess browser-job permissions.
 
 Repository protection uses pull requests and required CI. Independent human approval remains unavailable while repository has only one trusted collaborator; add second trusted collaborator before requiring one approval.
+
+
+### 2026-09-20
+
+Hardened authentication and scheduling after repeated protection-block failures: distinguish explicit unauthenticated sessions from temporary top.gg/protection blocks, use strong vote-page UI as an authentication signal, restore Discord localStorage injection on the Discord origin, cap same-run protection retries, emit bounded retry artifacts for failures, add scheduler validation/duplicate protection/tests, and scope workflow cleanup to vote runs.
