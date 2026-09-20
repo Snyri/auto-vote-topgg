@@ -10,8 +10,8 @@ Automated daily voting bot for [top.gg](https://top.gg) using nodriver (visible 
 
 ## Features
 
-- 🗳️ Auto-vote **2× per day** (07:00 & 19:00 WIB) as a baseline/fallback
-- ⏱️ **Cooldown-aware retry** — schedules the next workflow near top.gg eligibility
+- 🗳️ **External scheduler driven** — Northflank dispatches GitHub Actions from the latest `next-vote` artifact
+- ⏱️ **State-aware retry** — success/cooldown and transient failure states all publish a bounded next-attempt timestamp
 - 👥 **Multi-account** — vote with multiple Discord tokens and cookie sessions in one run
 - 🤖 **Multi-bot** — vote for multiple bots per account
 - 🍪 **Cookie-first auth** — injects only top.gg Auth.js cookies, then verifies the session
@@ -31,9 +31,10 @@ Automated daily voting bot for [top.gg](https://top.gg) using nodriver (visible 
 ```
 TOPGG_COOKIES_JSON (same line order as TOKENS)
     ↓ inject top.gg Auth.js cookies
-    ↓ verify /api/auth/session
-    ├── valid → skip OAuth
-    └── invalid/missing → Discord token injection → OAuth Authorize
+    ↓ inspect vote-page UI + verify /api/auth/session
+    ├── vote surface visible → authenticated even if the session endpoint is temporarily blocked
+    ├── explicit unauthenticated state → Discord-origin token injection → OAuth Authorize
+    └── protection block → one fresh-browser retry, then scheduled backoff
 top.gg authenticated
     ↓ navigate to vote page → wait ad → nodriver verify_cf()
     ├── checkbox located by OpenCV → native mouse click → response/page clearance
@@ -118,28 +119,20 @@ The script filters full export automatically and injects only cookie names conta
 
 Go to your repo **Actions** tab → click **"I understand my workflows, go ahead and enable them"**.
 
-## Automatic Schedule and Cooldown-Aware Retry
+## Automatic Schedule and Retry
 
-`vote.yml` still runs twice daily as a baseline:
+This fork uses the persistent service in `scheduler/` as the scheduler. The service runs on Northflank and dispatches `.github/workflows/vote.yml` with `workflow_dispatch`; there is no GitHub cron in `vote.yml`.
 
-- **07:00 WIB** (`00:00 UTC`)
-- **19:00 WIB** (`12:00 UTC`)
-
-When top.gg displays cooldown text such as:
-
-```text
-You can vote again in about 1 hour.
-```
-
-`vote.py` parses the duration, adds a five-minute safety buffer because `about` is approximate, and selects the earliest retry across all account/bot combinations. The workflow stores only this private one-day artifact:
+After every run, `vote.py` writes a private one-day `next-vote` artifact containing only a bounded UTC epoch:
 
 ```json
 {"next_vote_at": 1786334400}
 ```
 
-`cooldown-retry.yml` then activates temporarily and checks the timestamp every five minutes. Once due, it dispatches one `vote.yml` run and disables itself. Practical precision is roughly **target + 5–10 minutes**, plus possible GitHub Actions queue delay.
+Confirmed success normally schedules the next attempt about 12 hours later. Parsed top.gg cooldowns use the reported duration plus the safety buffer. Protection blocks, CAPTCHA states, and other transient failures also receive bounded retry times, so a failed run does not cause the external scheduler to dispatch again every minute.
 
-The artifact and dispatcher job contain no Discord token, top.gg cookie, Telegram token, account ID, or bot ID. Unparseable cooldown text creates no dynamic retry; 07:00/19:00 WIB remains the fallback. If a dynamic run is still early, the new cooldown is parsed and scheduled again.
+The Northflank scheduler waits for an active vote workflow instead of dispatching a duplicate, validates schedule timestamps, retries transient GitHub API reads with backoff, waits at least five minutes after a failed run with no usable schedule, and imposes a maximum workflow wait. Required environment values are `GH_TOKEN`, `GH_REPOSITORY`, `GH_REF`, and `GH_WORKFLOW`; optional timing controls are `POLL_SECONDS`, `ERROR_RETRY_SECONDS`, and `MAX_RUN_WAIT_SECONDS`.
+
 
 ### Browser Startup Fresh-Run Retry
 
@@ -156,17 +149,6 @@ Guards:
 - Only first attempt (`run_attempt == 1`) may dispatch.
 - Marker artifact contains no tokens, cookies, account IDs, bot IDs, or screenshots.
 - Original failed run remains a truthful failure; Telegram error report is sent before retry starts.
-
-### Fork & Scheduled Workflow Protection
-
-GitHub automatically disables scheduled (`cron`) workflows in public repositories after **60 days of inactivity**, including forks.
-
-To prevent this, the workflow includes a `workflow-keepalive` job that uses [`liskin/gh-workflow-keepalive@v1`](https://github.com/liskin/gh-workflow-keepalive). It refreshes the workflow schedule on every scheduled trigger.
-
-If your workflow is ever disabled:
-1. Go to **Actions → Top.gg Auto Vote → Enable workflow** (in the GitHub UI).
-2. Make a dummy commit (`git commit --allow-empty -m "keepalive"`) to reset the 60-day timer.
-3. Or trigger manually from time to time via **Actions → Top.gg Auto Vote → Run workflow**.
 
 ## Debugging
 
@@ -189,12 +171,13 @@ For other GitHub Actions diagnostics, add repository secret `SEND_ERROR_SCREENSH
 > [!WARNING]
 > Use ephemeral, single-tenant GitHub-hosted runners only. Do not run this project on persistent/shared self-hosted runners: browser processes handle live account credentials and temporary profiles.
 
-Transient authentication/browser failures retry up to 3 times. In multi-bot runs, only bots with `error` or `uncertain` results retry; `success`, `cooldown`, and `captcha_required` are final for the current run. Interactive CAPTCHA is intentionally not retried on the same runner/IP. Telegram reports identify accounts using a short SHA-256 fingerprint, never token fragments, and split automatically below Telegram's message limit.
+Transient authentication/browser failures retry up to 3 times. Protection-blocked authentication uses at most two browser attempts before deferring to the external scheduler. In multi-bot runs, only bots with `error` or `uncertain` results retry; `success`, `cooldown`, and `captcha_required` are final for the current run. Interactive CAPTCHA is intentionally not retried on the same runner/IP. Telegram reports identify accounts using a short SHA-256 fingerprint, never token fragments, and split automatically below Telegram's message limit.
 
 - `success`, `cooldown`: final on the current runner/IP.
 - A cooldown with a valid duration schedules an isolated dispatcher instead of sleeping/retrying on the same runner.
 - `captcha_required`: final on the current runner/IP.
 - `error`, `auth_failed`, `uncertain`: retry up to 3 times.
+- `blocked`: one fresh-browser retry, then a scheduled backoff.
 
 `error`, `auth_failed`, `uncertain`, or `captcha_required` sends its report first, then exits non-zero so GitHub Actions shows failure.
 
@@ -203,7 +186,11 @@ Transient authentication/browser failures retry up to 3 times. In multi-bot runs
 ```text
 auto-vote-topgg/
 ├── vote.py                          # Auth, vote, cooldown state, report, browser lifecycle
-├── test_vote.py                     # 81 unit/regression tests
+├── test_vote.py                     # Vote/auth/browser unit and regression tests
+├── test_scheduler.py                # Scheduler validation and dispatch regression tests
+├── scheduler/
+│   ├── Dockerfile                   # Northflank scheduler image
+│   └── scheduler.py                 # Artifact-driven GitHub workflow dispatcher
 ├── audit_dependencies.py            # Stdlib OSV dependency audit
 ├── requirements.txt                 # Direct Python dependencies
 ├── requirements.lock                # Linux/Python 3.11 hashes and transitive pins
@@ -216,16 +203,15 @@ auto-vote-topgg/
 │   ├── CODEOWNERS                   # Sensitive-file ownership
 │   ├── dependabot.yml               # Weekly pip/Actions updates
 │   └── workflows/
-│       ├── security.yml             # Tests and dependency audit
-│       ├── cooldown-retry.yml       # Temporary credential-free dispatcher
-│       └── vote.yml                 # Schedule, secret handoff, vote, cleanup
+│       ├── security.yml             # Tests, syntax checks, dependency audit
+│       └── vote.yml                 # Secret handoff, vote, artifacts, cleanup
 └── .gitignore
 ```
 
 ## Requirements
 
 - Python 3.11+
-- `nodriver==0.50.3`, `opencv-python-headless==4.11.0.86`, and `requests==2.34.2` as direct dependencies
+- `nodriver==0.50.3`, `opencv-python-headless==5.0.0.93`, and `requests==2.34.2` as direct dependencies
 - Hash-locked Linux x86_64 / CPython 3.11 dependencies in `requirements.lock`
 - Google Chrome/Chromium (discovered dynamically by workflow)
 - Xvfb on headless Linux runners (installed by workflow)
@@ -252,7 +238,7 @@ Run local checks:
 
 ```bash
 python -m unittest -v
-python -m py_compile vote.py test_vote.py audit_dependencies.py
+python -m py_compile vote.py test_vote.py test_scheduler.py audit_dependencies.py scheduler/scheduler.py
 python -m pip check
 python audit_dependencies.py requirements.lock
 ```
