@@ -753,8 +753,10 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(destinations[0], "https://top.gg/bot/111/vote")
         self.assertIn(vote.DISCORD_LOGIN_URL, destinations)
         self.assertEqual(destinations[-1], "https://top.gg/bot/111/vote")
-        expression = evaluate.await_args.args[1]
-        self.assertIn("localStorage.setItem('token'", expression)
+        expressions = [call.args[1] for call in evaluate.await_args_list]
+        self.assertTrue(
+            any("localStorage.setItem('token'" in expression for expression in expressions)
+        )
 
     @patch("builtins.print")
     @patch("vote.vote_for_bot", new_callable=AsyncMock)
