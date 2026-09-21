@@ -33,3 +33,13 @@ Post-vote CAPTCHA/Turnstile fix: root cause was direct `captcha_result()` after 
   - [x] Add scheduler regression tests and CI syntax coverage
   - [x] Align scheduler dependency pin with repository requirements
   - [x] Scope cleanup to Top.gg vote workflow history
+
+- [x] 2026-09-21 full post-success reliability pass
+  - [x] Recover slowly-starting Chrome before process restart
+  - [x] Redact individual Auth.js cookie values in diagnostics
+  - [x] Avoid duplicate scheduler dispatch after ambiguous POST result
+  - [x] Skip redundant Xvfb package install when runner already provides it
+  - [x] Pin GitHub-hosted jobs to Ubuntu 24.04
+  - [x] Run scheduler container as non-root and enable Docker Dependabot
+  - [x] Bound security CI jobs with explicit timeouts
+  - [x] Update reliability/security documentation
