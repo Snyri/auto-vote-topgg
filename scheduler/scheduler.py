@@ -18,10 +18,17 @@ def env_int(name, default, minimum=1):
     return max(value, minimum)
 
 
-GH_TOKEN = os.environ["GH_TOKEN"].strip()
-GH_REPOSITORY = os.environ["GH_REPOSITORY"].strip()
-GH_REF = os.environ.get("GH_REF", "master").strip()
-GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "vote.yml").strip()
+def required_env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
+GH_TOKEN = required_env("GH_TOKEN")
+GH_REPOSITORY = required_env("GH_REPOSITORY")
+GH_REF = os.environ.get("GH_REF", "master").strip() or "master"
+GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "vote.yml").strip() or "vote.yml"
 
 POLL_SECONDS = env_int("POLL_SECONDS", 15, 5)
 ERROR_RETRY_SECONDS = env_int("ERROR_RETRY_SECONDS", 300, 300)
@@ -175,7 +182,12 @@ def next_vote_at_from_run(run_id):
     return validate_next_vote_at(data.get("next_vote_at"))
 
 
-def select_new_dispatched_run(runs, known_ids, not_before):
+def select_new_dispatched_run(
+    runs,
+    known_ids,
+    not_before,
+    expected_source=None,
+):
     candidates = []
     for run in runs:
         try:
@@ -190,18 +202,28 @@ def select_new_dispatched_run(runs, known_ids, not_before):
             and run.get("event") == "workflow_dispatch"
             and created_at >= not_before - 5
         ):
+            if expected_source is not None:
+                expected_title = f"Top.gg Auto Vote · {expected_source}"
+                if str(run.get("display_title") or "") != expected_title:
+                    continue
             candidates.append((created_at, run_id))
 
     return max(candidates)[1] if candidates else None
 
 
-def wait_for_new_dispatched_run(known_ids, not_before, timeout_seconds=60):
+def wait_for_new_dispatched_run(
+    known_ids,
+    not_before,
+    timeout_seconds=60,
+    expected_source=None,
+):
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         run_id = select_new_dispatched_run(
             list_vote_runs(20),
             known_ids,
             not_before,
+            expected_source=expected_source,
         )
         if run_id is not None:
             return run_id
@@ -211,8 +233,12 @@ def wait_for_new_dispatched_run(known_ids, not_before, timeout_seconds=60):
 
 def dispatch_vote():
     existing_runs = list_vote_runs(20)
-    if existing_runs and existing_runs[0].get("status") != "completed":
-        run_id = int(existing_runs[0]["id"])
+    active_run = next(
+        (run for run in existing_runs if run.get("status") != "completed"),
+        None,
+    )
+    if active_run is not None:
+        run_id = int(active_run["id"])
         log(f"Vote workflow already active as run {run_id}; reusing it")
         return run_id
 
@@ -245,6 +271,7 @@ def dispatch_vote():
             known_ids,
             before,
             timeout_seconds=30,
+            expected_source="northflank",
         )
         if run_id is not None:
             log(f"Recovered dispatched workflow run {run_id}")
@@ -261,7 +288,11 @@ def dispatch_vote():
         log(f"Dispatched workflow run {run_id}")
         return run_id
 
-    run_id = wait_for_new_dispatched_run(known_ids, before)
+    run_id = wait_for_new_dispatched_run(
+        known_ids,
+        before,
+        expected_source="northflank",
+    )
     if run_id is not None:
         log(f"Dispatched workflow run {run_id}")
         return run_id

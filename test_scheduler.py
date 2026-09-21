@@ -13,6 +13,13 @@ scheduler = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(scheduler)
 
 
+class EnvironmentValidationTests(unittest.TestCase):
+    def test_required_env_rejects_missing_or_blank_values(self):
+        with patch.dict(os.environ, {"EXAMPLE_REQUIRED": ""}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "EXAMPLE_REQUIRED is required"):
+                scheduler.required_env("EXAMPLE_REQUIRED")
+
+
 class SchedulerValidationTests(unittest.TestCase):
     def test_validate_next_vote_at_accepts_reasonable_timestamp(self):
         now = 2_000_000_000
@@ -118,6 +125,52 @@ class WorkflowConfigurationTests(unittest.TestCase):
         security_workflow = (root / ".github/workflows/security.yml").read_text(encoding="utf-8")
         self.assertGreaterEqual(vote_workflow.count("timeout-minutes:"), 5)
         self.assertEqual(security_workflow.count("timeout-minutes: 10"), 2)
+
+
+    def test_select_new_dispatched_run_filters_expected_source(self):
+        runs = [
+            {
+                "id": 13,
+                "event": "workflow_dispatch",
+                "created_at": "2033-05-18T03:33:31Z",
+                "display_title": "Top.gg Auto Vote · manual",
+            },
+            {
+                "id": 12,
+                "event": "workflow_dispatch",
+                "created_at": "2033-05-18T03:33:30Z",
+                "display_title": "Top.gg Auto Vote · northflank",
+            },
+        ]
+        self.assertEqual(
+            scheduler.select_new_dispatched_run(
+                runs,
+                set(),
+                2_000_000_000,
+                expected_source="northflank",
+            ),
+            12,
+        )
+
+    @patch.object(scheduler, "list_vote_runs")
+    @patch.object(scheduler, "api")
+    def test_dispatch_reuses_any_active_run_not_only_first(self, api, list_runs):
+        list_runs.return_value = [
+            {
+                "id": 100,
+                "status": "completed",
+                "event": "workflow_dispatch",
+                "created_at": "2033-05-18T03:34:00Z",
+            },
+            {
+                "id": 99,
+                "status": "in_progress",
+                "event": "workflow_dispatch",
+                "created_at": "2033-05-18T03:33:20Z",
+            },
+        ]
+        self.assertEqual(scheduler.dispatch_vote(), 99)
+        api.assert_not_called()
 
 
 if __name__ == "__main__":
