@@ -195,6 +195,20 @@ def select_new_dispatched_run(runs, known_ids, not_before):
     return max(candidates)[1] if candidates else None
 
 
+def wait_for_new_dispatched_run(known_ids, not_before, timeout_seconds=60):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        run_id = select_new_dispatched_run(
+            list_vote_runs(20),
+            known_ids,
+            not_before,
+        )
+        if run_id is not None:
+            return run_id
+        time.sleep(2)
+    return None
+
+
 def dispatch_vote():
     existing_runs = list_vote_runs(20)
     if existing_runs and existing_runs[0].get("status") != "completed":
@@ -209,18 +223,33 @@ def dispatch_vote():
     }
     before = time.time()
 
-    response = api(
-        "POST",
-        f"/repos/{GH_REPOSITORY}/actions/workflows/"
-        f"{GH_WORKFLOW}/dispatches",
-        json={
-            "ref": GH_REF,
-            "inputs": {
-                "source": "northflank",
-                "origin_run_id": "",
+    try:
+        response = api(
+            "POST",
+            f"/repos/{GH_REPOSITORY}/actions/workflows/"
+            f"{GH_WORKFLOW}/dispatches",
+            json={
+                "ref": GH_REF,
+                "inputs": {
+                    "source": "northflank",
+                    "origin_run_id": "",
+                },
             },
-        },
-    )
+        )
+    except requests.RequestException:
+        log(
+            "Workflow dispatch response was uncertain; "
+            "checking for a newly-created run before retrying"
+        )
+        run_id = wait_for_new_dispatched_run(
+            known_ids,
+            before,
+            timeout_seconds=30,
+        )
+        if run_id is not None:
+            log(f"Recovered dispatched workflow run {run_id}")
+            return run_id
+        raise
 
     try:
         payload = response.json()
@@ -232,17 +261,10 @@ def dispatch_vote():
         log(f"Dispatched workflow run {run_id}")
         return run_id
 
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        run_id = select_new_dispatched_run(
-            list_vote_runs(20),
-            known_ids,
-            before,
-        )
-        if run_id is not None:
-            log(f"Dispatched workflow run {run_id}")
-            return run_id
-        time.sleep(2)
+    run_id = wait_for_new_dispatched_run(known_ids, before)
+    if run_id is not None:
+        log(f"Dispatched workflow run {run_id}")
+        return run_id
 
     raise RuntimeError(
         "Dispatch succeeded but the new workflow run could not be identified"

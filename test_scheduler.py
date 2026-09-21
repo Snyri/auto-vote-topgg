@@ -68,5 +68,37 @@ class SchedulerValidationTests(unittest.TestCase):
         api.assert_not_called()
 
 
+    @patch.object(scheduler, "wait_for_new_dispatched_run", return_value=101)
+    @patch.object(scheduler, "list_vote_runs", return_value=[])
+    @patch.object(scheduler, "api", side_effect=scheduler.requests.Timeout("uncertain"))
+    def test_dispatch_recovers_ambiguous_post_without_duplicate(
+        self, api, _list_runs, wait_new
+    ):
+        self.assertEqual(scheduler.dispatch_vote(), 101)
+        self.assertEqual(api.call_count, 1)
+        wait_new.assert_called_once()
+
+    @patch.object(scheduler.time, "sleep")
+    @patch.object(scheduler, "list_vote_runs")
+    def test_wait_for_new_dispatched_run_polls_until_visible(self, list_runs, _sleep):
+        list_runs.side_effect = [
+            [],
+            [{
+                "id": 12,
+                "event": "workflow_dispatch",
+                "created_at": "2033-05-18T03:33:30Z",
+            }],
+        ]
+        with patch.object(
+            scheduler.time,
+            "monotonic",
+            side_effect=[0.0, 0.0, 1.0, 1.0],
+        ):
+            self.assertEqual(
+                scheduler.wait_for_new_dispatched_run(set(), 2_000_000_000, 10),
+                12,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
