@@ -160,6 +160,13 @@ def next_vote_at_from_run(run_id):
         artifacts,
         key=lambda item: item.get("created_at", ""),
     )[-1]
+    artifact_size = artifact.get("size_in_bytes")
+    if (
+        not isinstance(artifact_size, int)
+        or artifact_size < 1
+        or artifact_size > 1024 * 1024
+    ):
+        raise RuntimeError("next-vote artifact has an invalid size")
 
     archive = api(
         "GET",
@@ -168,18 +175,19 @@ def next_vote_at_from_run(run_id):
     )
 
     with zipfile.ZipFile(io.BytesIO(archive.content)) as zf:
-        names = [
-            name
-            for name in zf.namelist()
-            if name.endswith("next-vote.json")
-        ]
-        if not names:
+        names = [name for name in zf.namelist() if name == "next-vote.json"]
+        if names != ["next-vote.json"]:
             raise RuntimeError(
-                "next-vote artifact does not contain next-vote.json"
+                "next-vote artifact must contain exactly next-vote.json"
             )
-        data = json.loads(zf.read(names[0]).decode("utf-8"))
+        info = zf.getinfo("next-vote.json")
+        if info.file_size > 4096:
+            raise RuntimeError("next-vote.json is unexpectedly large")
+        data = json.loads(zf.read("next-vote.json").decode("utf-8"))
 
-    return validate_next_vote_at(data.get("next_vote_at"))
+    if not isinstance(data, dict) or set(data) != {"next_vote_at"}:
+        raise RuntimeError("next-vote.json has unexpected fields")
+    return validate_next_vote_at(data["next_vote_at"])
 
 
 def select_new_dispatched_run(
@@ -259,6 +267,7 @@ def dispatch_vote():
                 "inputs": {
                     "source": "northflank",
                     "origin_run_id": "",
+                    "recovery_depth": "0",
                 },
             },
         )

@@ -14,6 +14,11 @@ on:
         required: false
         default: ''
         type: string
+      recovery_depth:
+        description: Internal bounded fresh-run recovery depth
+        required: false
+        default: '0'
+        type: string
 
 concurrency:
   group: topgg-vote-${{ github.ref }}
@@ -63,6 +68,7 @@ jobs:
           TOPGG_COOKIES_JSON:        ${{ secrets.TOPGG_COOKIES_JSON }}
           RUN_SOURCE:                 ${{ inputs.source }}
           RUN_ORIGIN_ID:              ${{ inputs.origin_run_id }}
+          RUN_RECOVERY_DEPTH:          ${{ inputs.recovery_depth }}
         run: |
           secret_dir="$(mktemp -d)"
           chmod 700 "$secret_dir"
@@ -194,12 +200,21 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SOURCE: ${{ github.event.inputs.source }}
+          RECOVERY_DEPTH: ${{ github.event.inputs.recovery_depth || '0' }}
         run: |
           set -euo pipefail
-          if [ "$SOURCE" = "browser-startup-retry" ] || [ "$SOURCE" = "protection-retry" ]; then
-            echo "Automatic fresh-run retry already consumed; no second dispatch."
+          case "$RECOVERY_DEPTH" in
+            ''|*[!0-9]*) RECOVERY_DEPTH=0 ;;
+          esac
+          if [ "$SOURCE" = "browser-startup-retry" ]; then
+            echo "Browser-startup fresh-run retry already consumed."
             exit 0
           fi
+          if [ "$RECOVERY_DEPTH" -ge 2 ]; then
+            echo "Fresh-run recovery depth limit reached."
+            exit 0
+          fi
+          NEXT_DEPTH=$((RECOVERY_DEPTH + 1))
 
           artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "browser-startup-retry" and .expired == false)] | first // empty')"
           artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
@@ -218,7 +233,8 @@ jobs:
           gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
             -f "ref=$GITHUB_REF_NAME" \
             -f 'inputs[source]=browser-startup-retry' \
-            -f "inputs[origin_run_id]=$RUN_ID"
+            -f "inputs[origin_run_id]=$RUN_ID" \
+            -f "inputs[recovery_depth]=$NEXT_DEPTH"
           echo "Dispatched one fresh-run retry for browser startup failure from run $RUN_ID"
 
   protection-retry:
@@ -235,12 +251,21 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SOURCE: ${{ github.event.inputs.source }}
+          RECOVERY_DEPTH: ${{ github.event.inputs.recovery_depth || '0' }}
         run: |
           set -euo pipefail
-          if [ "$SOURCE" = "browser-startup-retry" ] || [ "$SOURCE" = "protection-retry" ]; then
-            echo "Automatic fresh-run retry already consumed; no second dispatch."
+          case "$RECOVERY_DEPTH" in
+            ''|*[!0-9]*) RECOVERY_DEPTH=0 ;;
+          esac
+          if [ "$SOURCE" = "protection-retry" ]; then
+            echo "Protection fresh-run retry already consumed."
             exit 0
           fi
+          if [ "$RECOVERY_DEPTH" -ge 2 ]; then
+            echo "Fresh-run recovery depth limit reached."
+            exit 0
+          fi
+          NEXT_DEPTH=$((RECOVERY_DEPTH + 1))
 
           artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "protection-retry" and .expired == false)] | first // empty')"
           artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
@@ -259,7 +284,8 @@ jobs:
           gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
             -f "ref=$GITHUB_REF_NAME" \
             -f 'inputs[source]=protection-retry' \
-            -f "inputs[origin_run_id]=$RUN_ID"
+            -f "inputs[origin_run_id]=$RUN_ID" \
+            -f "inputs[recovery_depth]=$NEXT_DEPTH"
           echo "Dispatched one fresh-run retry for persistent protection block from run $RUN_ID"
 
   cleanup:
@@ -278,9 +304,9 @@ jobs:
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 10 ]; then
+            if [ $count -gt 30 ]; then
               echo "Deleting old completed run: $run_id"
               gh run delete --repo="${{ github.repository }}" "$run_id"
             fi
           done
-          echo "✅ Cleanup done — latest 10 completed repository runs kept."
+          echo "✅ Cleanup done — latest 30 completed vote runs kept."

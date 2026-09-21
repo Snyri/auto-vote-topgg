@@ -107,6 +107,54 @@ class SchedulerValidationTests(unittest.TestCase):
             )
 
 
+class ArtifactValidationTests(unittest.TestCase):
+    @patch.object(scheduler, "api")
+    def test_next_vote_artifact_rejects_unexpected_json_fields(self, api):
+        import io
+        import json
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr(
+                "next-vote.json",
+                json.dumps({"next_vote_at": 2_000_000_100, "extra": True}),
+            )
+        listing = unittest.mock.MagicMock()
+        listing.json.return_value = {
+            "artifacts": [{
+                "id": 1,
+                "name": "next-vote",
+                "expired": False,
+                "created_at": "2033-05-18T03:33:20Z",
+                "size_in_bytes": len(buffer.getvalue()),
+            }]
+        }
+        archive = unittest.mock.MagicMock(content=buffer.getvalue())
+        api.side_effect = [listing, archive]
+
+        with patch.object(scheduler.time, "time", return_value=2_000_000_000):
+            with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+                scheduler.next_vote_at_from_run(123)
+
+    @patch.object(scheduler, "api")
+    def test_next_vote_artifact_rejects_oversized_archive_metadata(self, api):
+        response = unittest.mock.MagicMock()
+        response.json.return_value = {
+            "artifacts": [{
+                "id": 1,
+                "name": "next-vote",
+                "expired": False,
+                "created_at": "2033-05-18T03:33:20Z",
+                "size_in_bytes": 1024 * 1024 + 1,
+            }]
+        }
+        api.return_value = response
+        with self.assertRaisesRegex(RuntimeError, "invalid size"):
+            scheduler.next_vote_at_from_run(123)
+        self.assertEqual(api.call_count, 1)
+
+
 class WorkflowConfigurationTests(unittest.TestCase):
     def test_all_github_jobs_pin_ubuntu_24_04(self):
         root = pathlib.Path(__file__).parent
@@ -172,6 +220,15 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertEqual(scheduler.dispatch_vote(), 99)
         api.assert_not_called()
 
+
+    def test_vote_workflow_bounds_cross_category_recovery(self):
+        root = pathlib.Path(__file__).parent
+        workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
+        self.assertIn("recovery_depth:", workflow)
+        self.assertIn('if [ "$RECOVERY_DEPTH" -ge 2 ]', workflow)
+        self.assertIn('inputs[recovery_depth]=$NEXT_DEPTH', workflow)
+        self.assertIn('if [ "$SOURCE" = "browser-startup-retry" ]', workflow)
+        self.assertIn('if [ "$SOURCE" = "protection-retry" ]', workflow)
 
     def test_scheduler_image_pins_runtime_dependencies_and_non_root_user(self):
         root = pathlib.Path(__file__).parent
