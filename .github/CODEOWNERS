@@ -6,3 +6,7 @@
 /vote.py @Snyri
 /test_vote.py @Snyri
 /test_scheduler.py @Snyri
+/audit_dependencies.py @Snyri
+/test_audit_dependencies.py @Snyri
+/.github/dependabot.yml @Snyri
+/SECURITY.md @Snyri

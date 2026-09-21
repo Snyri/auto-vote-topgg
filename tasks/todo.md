@@ -43,3 +43,12 @@ Post-vote CAPTCHA/Turnstile fix: root cause was direct `captcha_result()` after 
   - [x] Run scheduler container as non-root and enable Docker Dependabot
   - [x] Bound security CI jobs with explicit timeouts
   - [x] Update reliability/security documentation
+
+- [x] 2026-09-21 second reliability sweep
+  - [x] Prevent browser cleanup errors from masking completed vote results
+  - [x] Bound forced Chrome termination waits
+  - [x] Allow bounded cross-category fresh-run recovery with depth tracking
+  - [x] Preserve more vote-run history for diagnostics
+  - [x] Harden scheduler artifact size/name/JSON validation
+  - [x] Prefer protection evidence over stale login-page hints
+  - [x] Re-run full CI after changes
