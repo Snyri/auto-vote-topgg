@@ -21,3 +21,7 @@
 - Retry policy must match failure scope: a protection block tied to runner/IP should get at most one fresh-browser retry, then defer instead of repeatedly hammering the same runner.
 - Workflow cleanup should be scoped to the workflow it owns; repository-wide retention can silently erase diagnostic history from unrelated CI.
 - External scheduler dispatch must snapshot existing workflow-run IDs before POST and identify a genuinely new run afterward; a timestamp-only heuristic can attach to another concurrent dispatch.
+
+- nodriver 0.50.3 gives Chrome only a short internal DevTools discovery window; if its subprocess is still alive after "Failed to connect to browser", poll the existing DevTools endpoint for a bounded late-attach window before killing Chrome. Restarting a healthy-but-slow process wastes a profile and can amplify runner flakiness.
+- A workflow-dispatch POST can succeed server-side while the client sees a timeout. Snapshot existing run IDs before POST and, on an ambiguous transport failure, search for the new run before sending another POST.
+- Redaction should include parsed credential components, not only the original serialized secret blob; an exception may expose one cookie value without reproducing the complete JSON secret.

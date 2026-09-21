@@ -18,7 +18,7 @@ Automated daily voting bot for [top.gg](https://top.gg) using nodriver (visible 
 - 🔐 **OAuth fallback** — uses Discord OAuth when cookies are missing or expired
 - ⚡ **Turnstile verification** — dismisses top.gg privacy overlay, then nodriver clicks Cloudflare checkbox during cookie auth, OAuth, pre-vote, post-vote, and verification reload
 - 🔒 **Explicit CAPTCHA fallback** — unresolved interactive CAPTCHA is reported and not retried on the same runner
-- 🔄 **Browser startup fresh-run retry** — runner-local Chrome startup failure automatically dispatches one fresh-runner retry
+- 🔄 **Fresh-run recovery** — browser-startup failures and persistent protection blocks can dispatch one bounded fresh GitHub runner retry
 - 📨 **Telegram notifications** — chunked per-account reports with privacy-safe account fingerprints
 - 🔁 **Scoped retry** — retries transient authentication and bot failures without repeating final results
 - 📸 **Failure evidence** — always captures CAPTCHA pages and final auth failures for private Telegram; other error screenshots remain opt-in
@@ -134,18 +134,18 @@ Confirmed success normally schedules the next attempt about 12 hours later. Pars
 The Northflank scheduler waits for an active vote workflow instead of dispatching a duplicate, validates schedule timestamps, retries transient GitHub API reads with backoff, waits at least five minutes after a failed run with no usable schedule, and imposes a maximum workflow wait. Required environment values are `GH_TOKEN`, `GH_REPOSITORY`, `GH_REF`, and `GH_WORKFLOW`; optional timing controls are `POLL_SECONDS`, `ERROR_RETRY_SECONDS`, and `MAX_RUN_WAIT_SECONDS`.
 
 
-### Browser Startup Fresh-Run Retry
+### Fresh-Run Recovery
 
-Chrome startup may occasionally fail on a GitHub-hosted runner due to transient runner-level issues. When all accounts fail with a browser startup error (exit code/stderr included in report), `vote.py` writes a credential-free marker artifact:
+Chrome startup may occasionally outlive nodriver's short initial DevTools polling window on a GitHub-hosted runner. The runtime now keeps a still-running Chrome process alive for an additional bounded late-attach window before restarting it. If all accounts still fail with a browser startup error, `vote.py` writes a credential-free marker artifact:
 
 ```json
 {"reason":"browser_startup_failed"}
 ```
 
-The `browser-startup-retry` workflow job reads this artifact and dispatches **exactly one** fresh `vote.yml` run on a new runner. The retry run is identified in the Actions UI by `source=browser-startup-retry` and `origin_run_id=<original-run-id>`.
+The workflow reads this artifact and dispatches **exactly one** fresh `vote.yml` run on a new runner. Persistent top.gg protection blocks use the same bounded pattern with a separate `protection-retry` marker. Retry runs are identified by `source=browser-startup-retry` or `source=protection-retry` plus `origin_run_id=<original-run-id>`.
 
 Guards:
-- Retry run with `source=browser-startup-retry` never dispatches again.
+- Retry runs with `source=browser-startup-retry` or `source=protection-retry` never dispatch another automatic fresh run.
 - Only first attempt (`run_attempt == 1`) may dispatch.
 - Marker artifact contains no tokens, cookies, account IDs, bot IDs, or screenshots.
 - Original failed run remains a truthful failure; Telegram error report is sent before retry starts.
@@ -213,7 +213,7 @@ auto-vote-topgg/
 - Python 3.11+
 - `nodriver==0.50.3`, `opencv-python-headless==5.0.0.93`, and `requests==2.34.2` as direct dependencies
 - Hash-locked Linux x86_64 / CPython 3.11 dependencies in `requirements.lock`
-- Google Chrome/Chromium (discovered dynamically by workflow)
+- Google Chrome/Chromium from the pinned `ubuntu-24.04` GitHub-hosted runner image (discovered dynamically by workflow)
 - Xvfb on headless Linux runners (installed by workflow)
 
 `opencv-python-headless` is required by nodriver `verify_cf()`: nodriver captures the viewport, matches its bundled Cloudflare checkbox template, then dispatches a native mouse click. The headless package supplies image matching without OpenCV GUI components.

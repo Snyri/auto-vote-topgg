@@ -41,9 +41,10 @@ Workflow secrets are handed to Python through mode-`0600` temporary files. Pytho
 - CAPTCHA captions contain account fingerprint, bot ID, and escaped result detail—not tokens or cookies.
 - Screenshot files are never GitHub artifacts and are deleted after every Telegram delivery attempt.
 - nodriver Turnstile checkbox matching uses hash-locked `opencv-python-headless`; response/page clearance is observed without token injection.
-- Browser startup fresh-run retry artifact contains only `{"reason":"browser_startup_failed"}`; no credentials, account IDs, bot IDs, or screenshots.
-- Browser startup retry dispatch job holds `actions: write` only; no credential secrets.
-- Chrome process stderr/stdout diagnostics are bounded to 600 chars and redacted through the same credential-scrub path as exception details.
+- Fresh-run retry artifacts contain only a reason code (`browser_startup_failed` or `protection_blocked`); no credentials, account IDs, bot IDs, or screenshots.
+- Fresh-run retry dispatch jobs hold `actions: write` only; no credential secrets, and automatic retry chains are capped at one fresh run.
+- Chrome process stderr/stdout diagnostics are bounded to 600 chars and redacted through the same credential-scrub path as exception details, including parsed Auth.js cookie values.
+- A still-running Chrome process gets a bounded late DevTools attach window before it is killed and restarted.
 
 ## Audit Log
 
@@ -71,3 +72,7 @@ Repository protection uses pull requests and required CI. Independent human appr
 ### 2026-09-20
 
 Hardened authentication and scheduling after repeated protection-block failures: distinguish explicit unauthenticated sessions from temporary top.gg/protection blocks, use strong vote-page UI as an authentication signal, restore Discord localStorage injection on the Discord origin, cap same-run protection retries, emit bounded retry artifacts for failures, add scheduler validation/duplicate protection/tests, and scope workflow cleanup to vote runs.
+
+### 2026-09-21
+
+Pinned GitHub-hosted jobs to Ubuntu 24.04, added bounded late attachment for slow Chrome DevTools startup, expanded cookie-value redaction, added one-shot protection-block fresh-run recovery, hardened scheduler dispatch ambiguity handling, and moved the Northflank scheduler container to a non-root user.
