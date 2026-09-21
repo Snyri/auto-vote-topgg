@@ -100,5 +100,25 @@ class SchedulerValidationTests(unittest.TestCase):
             )
 
 
+class WorkflowConfigurationTests(unittest.TestCase):
+    def test_all_github_jobs_pin_ubuntu_24_04(self):
+        root = pathlib.Path(__file__).parent
+        for relative in (
+            ".github/workflows/vote.yml",
+            ".github/workflows/security.yml",
+        ):
+            text = (root / relative).read_text(encoding="utf-8")
+            self.assertNotIn("ubuntu-latest", text)
+            self.assertNotIn("ubuntu-22.04", text)
+            self.assertIn("runs-on: ubuntu-24.04", text)
+
+    def test_long_running_jobs_have_explicit_timeouts(self):
+        root = pathlib.Path(__file__).parent
+        vote_workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
+        security_workflow = (root / ".github/workflows/security.yml").read_text(encoding="utf-8")
+        self.assertGreaterEqual(vote_workflow.count("timeout-minutes:"), 5)
+        self.assertEqual(security_workflow.count("timeout-minutes: 10"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

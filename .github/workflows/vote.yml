@@ -167,7 +167,8 @@ jobs:
   verify-vote:
     needs: vote
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions: {}
     steps:
       - name: Apply vote result
@@ -178,7 +179,7 @@ jobs:
   browser-startup-retry:
     needs: vote
     if: always() && github.ref == 'refs/heads/master' && github.run_attempt == 1
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write
@@ -260,7 +261,8 @@ jobs:
   cleanup:
     needs: vote
     if: always() && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       actions: write
     steps:
