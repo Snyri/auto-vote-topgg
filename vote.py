@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -1321,10 +1322,15 @@ async def read_process_stream_excerpt(stream: Any) -> str:
 
 async def chrome_process_diagnostics(process: Any) -> str:
     if process is None:
-        return ""
+        return "process=unavailable"
     parts = []
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int):
+        parts.append(f"pid={pid}")
     returncode = getattr(process, "returncode", None)
-    if returncode is not None:
+    if returncode is None:
+        parts.append("state=running")
+    else:
         parts.append(f"exit={returncode}")
     stderr = await read_process_stream_excerpt(getattr(process, "stderr", None))
     stdout = await read_process_stream_excerpt(getattr(process, "stdout", None))
@@ -1332,7 +1338,58 @@ async def chrome_process_diagnostics(process: Any) -> str:
         parts.append(f"stderr={stderr}")
     if stdout and stdout != "no detail":
         parts.append(f"stdout={stdout}")
-    return redact_diagnostic("; ".join(parts)) if parts else ""
+    return redact_diagnostic("; ".join(parts))
+
+
+def browser_startup_environment_diagnostics() -> str:
+    """Return bounded, credential-free runner facts useful for Chrome startup failures."""
+    parts = []
+
+    getuid = getattr(os, "geteuid", None)
+    if callable(getuid):
+        with suppress(Exception):
+            parts.append(f"uid={getuid()}")
+
+    display = os.environ.get("DISPLAY", "").strip()
+    parts.append(f"display={display or 'unset'}")
+    if display.startswith(":"):
+        display_number = display[1:].split(".", 1)[0]
+        if display_number.isdigit():
+            x11_socket = Path("/tmp/.X11-unix") / f"X{display_number}"
+            parts.append(f"x11_socket={'present' if x11_socket.exists() else 'missing'}")
+
+    chrome_bin = os.environ.get("CHROME_BIN", "").strip()
+    if chrome_bin:
+        parts.append(f"chrome={Path(chrome_bin).name}")
+        try:
+            completed = subprocess.run(
+                [chrome_bin, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            version = (completed.stdout or completed.stderr or "").strip()
+            if version:
+                parts.append(f"chrome_version={redact_diagnostic(version, 120)}")
+            parts.append(f"chrome_version_exit={completed.returncode}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            parts.append(f"chrome_version_error={type(exc).__name__}")
+    else:
+        parts.append("chrome=unset")
+
+    for label, path in (("shm", "/dev/shm"), ("tmp", tempfile.gettempdir())):
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError:
+            parts.append(f"{label}=unavailable")
+            continue
+        parts.append(
+            f"{label}_free_mb={usage.free // (1024 * 1024)}"
+            f"/{usage.total // (1024 * 1024)}"
+        )
+
+    return redact_diagnostic("; ".join(parts))
 
 
 async def close_browser(browser: Any) -> None:
@@ -1392,11 +1449,18 @@ async def start_browser() -> Any:
         except Exception as exc:
             last_error = exc
             process = getattr(browser, "_process", None)
-            diagnostic = await chrome_process_diagnostics(process)
+            process_diagnostic = await chrome_process_diagnostics(process)
+            runner_diagnostic = browser_startup_environment_diagnostics()
             await close_browser(browser)
-            last_error_detail = f"{type(exc).__name__}: {safe_exception_detail(exc)}"
-            if diagnostic:
-                last_error_detail = f"{last_error_detail}; chrome {diagnostic}"
+            last_error_detail = (
+                f"{type(exc).__name__}: {safe_exception_detail(exc)}; "
+                f"chrome {process_diagnostic}; runner {runner_diagnostic}"
+            )
+            last_error_detail = redact_diagnostic(last_error_detail)
+            print(
+                f"  ⚠️  Browser startup {attempt}/{BROWSER_START_RETRIES} failed; "
+                f"{last_error_detail}"
+            )
             dbg(f"Browser startup {attempt}/{BROWSER_START_RETRIES} failed: {type(exc).__name__}")
             if attempt < BROWSER_START_RETRIES:
                 await asyncio.sleep(BROWSER_START_RETRY_SEC)

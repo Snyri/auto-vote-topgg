@@ -1090,13 +1090,54 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
             async def read(self, _limit):
                 return ("secret " + "x" * vote.DIAGNOSTIC_DETAIL_LIMIT).encode()
 
-        process = MagicMock(returncode=9, stderr=Stream(), stdout=None)
+        process = MagicMock(pid=4321, returncode=9, stderr=Stream(), stdout=None)
         with patch.object(vote, "SENSITIVE_VALUES", ["secret"]):
             detail = await vote.chrome_process_diagnostics(process)
 
+        self.assertIn("pid=4321", detail)
         self.assertIn("exit=9", detail)
         self.assertIn("***", detail)
         self.assertNotIn("secret", detail)
+        self.assertLessEqual(len(detail), vote.DIAGNOSTIC_DETAIL_LIMIT)
+
+    async def test_chrome_process_diagnostics_reports_running_process(self):
+        process = MagicMock(pid=99, returncode=None, stderr=None, stdout=None)
+
+        detail = await vote.chrome_process_diagnostics(process)
+
+        self.assertIn("pid=99", detail)
+        self.assertIn("state=running", detail)
+
+    @patch("vote.subprocess.run")
+    @patch("vote.shutil.disk_usage")
+    def test_browser_startup_environment_diagnostics_is_bounded_and_safe(
+        self, disk_usage, run
+    ):
+        disk_usage.return_value = MagicMock(
+            free=512 * 1024 * 1024,
+            total=1024 * 1024 * 1024,
+        )
+        run.return_value = MagicMock(
+            stdout="Google Chrome 140.0.0.0\n",
+            stderr="",
+            returncode=0,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"DISPLAY": ":99", "CHROME_BIN": "/usr/bin/google-chrome"},
+                clear=False,
+            ),
+            patch("vote.Path.exists", return_value=True),
+        ):
+            detail = vote.browser_startup_environment_diagnostics()
+
+        self.assertIn("display=:99", detail)
+        self.assertIn("x11_socket=present", detail)
+        self.assertIn("chrome=google-chrome", detail)
+        self.assertIn("chrome_version=Google Chrome 140.0.0.0", detail)
+        self.assertIn("shm_free_mb=512/1024", detail)
+        self.assertIn("tmp_free_mb=512/1024", detail)
         self.assertLessEqual(len(detail), vote.DIAGNOSTIC_DETAIL_LIMIT)
 
     async def test_close_browser_deletes_explicit_profile(self):
