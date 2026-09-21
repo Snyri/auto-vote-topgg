@@ -1529,8 +1529,13 @@ async def close_browser(browser: Any) -> None:
         except (TimeoutError, asyncio.TimeoutError) as exc:
             with suppress(Exception):
                 process.kill()
-            with suppress(Exception):
-                await process.wait()
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=BROWSER_CLOSE_TIMEOUT_SEC,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
             raise BrowserCleanupError("Chrome process did not terminate cleanly") from exc
     profile_path = getattr(browser, "_security_profile_path", None)
     if isinstance(profile_path, (str, os.PathLike)):
@@ -1542,7 +1547,17 @@ async def close_browser(browser: Any) -> None:
             raise BrowserCleanupError("Sensitive browser profile could not be deleted") from exc
 
 
-
+async def close_browser_safely(browser: Any, context: str) -> bool:
+    """Best-effort cleanup that never turns a completed vote into a duplicate retry."""
+    try:
+        await close_browser(browser)
+        return True
+    except BrowserCleanupError as exc:
+        print(
+            f"  ⚠️  Browser cleanup warning after {context}: "
+            f"{safe_exception_detail(exc)}"
+        )
+        return False
 
 
 async def start_browser() -> Any:
@@ -1587,7 +1602,7 @@ async def start_browser() -> Any:
 
             process_diagnostic = await chrome_process_diagnostics(process)
             runner_diagnostic = browser_startup_environment_diagnostics()
-            await close_browser(browser)
+            await close_browser_safely(browser, "failed startup")
             last_error_detail = (
                 f"{type(exc).__name__}: {safe_exception_detail(exc)}; "
                 f"chrome {process_diagnostic}; runner {runner_diagnostic}"
@@ -1678,7 +1693,7 @@ async def _run_account(
                 await asyncio.sleep(DELAY_BETWEEN_BOTS_SEC)
         return results
     finally:
-        await close_browser(browser)
+        await close_browser_safely(browser, "account attempt")
         await asyncio.sleep(1)
 
 

@@ -997,6 +997,28 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         oauth_login.assert_not_awaited()
         browser.aclose.assert_awaited_once()
     @patch("builtins.print")
+    @patch("vote.close_browser_safely", new_callable=AsyncMock, return_value=False)
+    @patch("vote.vote_for_bot", new_callable=AsyncMock)
+    @patch("vote.login_with_cookies", new_callable=AsyncMock, return_value=vote.AUTHENTICATED)
+    @patch("vote.start_browser", new_callable=AsyncMock)
+    async def test_cleanup_warning_preserves_successful_vote_result(
+        self, start_browser, _cookie_login, vote_for_bot, cleanup, _print
+    ):
+        browser = MagicMock()
+        browser.__iter__.return_value = iter([AsyncMock()])
+        start_browser.return_value = browser
+        vote_for_bot.return_value = {
+            "bot_id": "111", "status": "success", "detail": "ok"
+        }
+
+        results = await vote._run_account(
+            "token", ["111"], "id", [{"name": "authjs"}]
+        )
+
+        self.assertEqual(results[0]["status"], "success")
+        cleanup.assert_awaited_once_with(browser, "account attempt")
+
+    @patch("builtins.print")
     @patch("vote.browser_screenshot", new_callable=AsyncMock)
     @patch("vote.discord_oauth_login", new_callable=AsyncMock)
     @patch("vote.start_browser", new_callable=AsyncMock)
@@ -1302,6 +1324,28 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, browser)
         recover.assert_awaited_once_with(browser)
         browser.stop.assert_not_called()
+
+    @patch("builtins.print")
+    @patch("vote.close_browser", new_callable=AsyncMock)
+    async def test_safe_cleanup_does_not_raise_or_force_vote_retry(self, close_browser, _print):
+        close_browser.side_effect = vote.BrowserCleanupError("cleanup failed")
+        self.assertFalse(await vote.close_browser_safely(MagicMock(), "account attempt"))
+
+    async def test_close_browser_force_wait_is_bounded(self):
+        browser = MagicMock()
+        browser.aclose = AsyncMock()
+        process = MagicMock(returncode=None)
+        process.wait = AsyncMock()
+        process.kill = MagicMock()
+        browser._process = process
+        timeout_error = asyncio.TimeoutError()
+        with patch(
+            "vote.asyncio.wait_for",
+            new=AsyncMock(side_effect=[None, timeout_error, timeout_error]),
+        ):
+            with self.assertRaises(vote.BrowserCleanupError):
+                await vote.close_browser(browser)
+        process.kill.assert_called_once()
 
     async def test_close_browser_deletes_explicit_profile(self):
         browser = MagicMock()
