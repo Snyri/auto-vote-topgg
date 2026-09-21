@@ -35,6 +35,8 @@ COMPLETED_STATUSES = frozenset({"success", "cooldown"})
 TRANSIENT_STATUSES = frozenset({"error", "auth_failed", "uncertain"})
 BROWSER_START_RETRIES = 5
 BROWSER_START_RETRY_SEC = 2
+BROWSER_LATE_ATTACH_TIMEOUT_SEC = 8
+BROWSER_LATE_ATTACH_POLL_SEC = 0.5
 AUTHENTICATED = "authenticated"
 AUTH_INVALID = "invalid"
 AUTH_BLOCKED = "blocked"
@@ -1424,6 +1426,41 @@ def browser_startup_environment_diagnostics() -> str:
     return redact_diagnostic("; ".join(parts))
 
 
+async def recover_slow_browser_start(browser: Any) -> bool:
+    """Attach to Chrome when nodriver's initial DevTools polling window expires too early."""
+    process = getattr(browser, "_process", None)
+    http = getattr(browser, "_http", None)
+    if (
+        process is None
+        or getattr(process, "returncode", None) is not None
+        or http is None
+    ):
+        return False
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + BROWSER_LATE_ATTACH_TIMEOUT_SEC
+    while loop.time() < deadline:
+        try:
+            info = await http.get("version")
+            websocket_url = (
+                info.get("webSocketDebuggerUrl")
+                if isinstance(info, dict)
+                else getattr(info, "webSocketDebuggerUrl", None)
+            )
+            if websocket_url:
+                browser.info = info
+                browser.websocket_url = str(websocket_url)
+                await browser.attach()
+                await browser.update_targets()
+                await browser.get("about:blank")
+                print("  ✅ Recovered slowly-starting Chrome without restarting it")
+                return True
+        except Exception as exc:
+            dbg(f"Late Chrome attach not ready: {type(exc).__name__}")
+        await asyncio.sleep(BROWSER_LATE_ATTACH_POLL_SEC)
+    return False
+
+
 async def close_browser(browser: Any) -> None:
     if browser is None:
         return
@@ -1481,6 +1518,13 @@ async def start_browser() -> Any:
         except Exception as exc:
             last_error = exc
             process = getattr(browser, "_process", None)
+            if (
+                process is not None
+                and getattr(process, "returncode", None) is None
+                and await recover_slow_browser_start(browser)
+            ):
+                return browser
+
             process_diagnostic = await chrome_process_diagnostics(process)
             runner_diagnostic = browser_startup_environment_diagnostics()
             await close_browser(browser)
@@ -1720,6 +1764,12 @@ async def main() -> int:
 
     bot_ids = load_bot_ids()
     all_cookies = load_topgg_cookies(len(tokens), cookies_raw)
+    SENSITIVE_VALUES.extend(
+        str(cookie.get("value", ""))
+        for account_cookies in all_cookies
+        for cookie in account_cookies
+        if cookie.get("value")
+    )
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
     total = len(tokens)
     print("🚀 auto-vote-dcbot starting")

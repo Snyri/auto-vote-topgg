@@ -1141,6 +1141,35 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
         browser.aclose.assert_awaited_once()
         browser.stop.assert_called_once()
 
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    async def test_recovers_browser_when_devtools_endpoint_appears_late(self, _sleep):
+        browser = MagicMock()
+        browser._process = MagicMock(returncode=None)
+        browser._http = MagicMock()
+        browser._http.get = AsyncMock(side_effect=[
+            OSError("not ready"),
+            {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/test"},
+        ])
+        browser.attach = AsyncMock()
+        browser.update_targets = AsyncMock()
+        browser.get = AsyncMock()
+
+        self.assertTrue(await vote.recover_slow_browser_start(browser))
+        self.assertEqual(
+            browser.websocket_url,
+            "ws://127.0.0.1/devtools/browser/test",
+        )
+        browser.attach.assert_awaited_once()
+        browser.update_targets.assert_awaited_once()
+        browser.get.assert_awaited_once_with("about:blank")
+
+    async def test_slow_browser_recovery_skips_dead_or_missing_process(self):
+        browser = MagicMock()
+        browser._process = None
+        browser._http = MagicMock()
+        self.assertFalse(await vote.recover_slow_browser_start(browser))
+        browser._http.get.assert_not_called()
+
     async def test_chrome_process_diagnostics_redacts_and_truncates(self):
         class Stream:
             async def read(self, _limit):
@@ -1195,6 +1224,24 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("shm_free_mb=512/1024", detail)
         self.assertIn("tmp_free_mb=512/1024", detail)
         self.assertLessEqual(len(detail), vote.DIAGNOSTIC_DETAIL_LIMIT)
+
+    @patch("builtins.print")
+    @patch("vote.recover_slow_browser_start", new_callable=AsyncMock, return_value=True)
+    @patch.object(vote, "BROWSER_START_RETRIES", 1)
+    @patch("vote.uc.Browser")
+    @patch("vote.uc.Config")
+    async def test_start_browser_keeps_process_when_late_attach_recovers(
+        self, _config, browser_class, recover, _print
+    ):
+        browser = browser_class.return_value
+        browser.start = AsyncMock(side_effect=RuntimeError("connect failed"))
+        browser._process = MagicMock(returncode=None)
+
+        result = await vote.start_browser()
+
+        self.assertIs(result, browser)
+        recover.assert_awaited_once_with(browser)
+        browser.stop.assert_not_called()
 
     async def test_close_browser_deletes_explicit_profile(self):
         browser = MagicMock()
