@@ -23,7 +23,7 @@ Automated daily voting bot for [top.gg](https://top.gg) using nodriver (visible 
 - 🔁 **Scoped retry** — retries transient authentication and bot failures without repeating final results
 - 📸 **Failure evidence** — always captures CAPTCHA pages and final auth failures for private Telegram; other error screenshots remain opt-in
 - 🚦 **Truthful CI status** — incomplete votes report to Telegram, then fail the workflow
-- 🧹 **Auto-cleanup** — keeps the latest 10 completed GitHub Actions runs repository-wide
+- 🧹 **Auto-cleanup** — keeps the latest 10 completed vote-workflow runs
 - 📌 **Reproducible builds** — Python packages and GitHub Actions are pinned to tested immutable versions
 
 ## How It Works
@@ -39,7 +39,7 @@ top.gg authenticated
     ↓ navigate to vote page → wait ad → nodriver verify_cf()
     ├── checkbox located by OpenCV → native mouse click → response/page clearance
     ├── unresolved CAPTCHA → captcha_required (no retry this run)
-    ├── cooldown text → bounded timestamp → temporary five-minute dispatcher
+    ├── cooldown text → bounded timestamp → scheduler waits until that timestamp
     └── verified → click Vote → confirm success/cooldown
 ```
 
@@ -73,7 +73,7 @@ Go to your repo **Settings → Secrets and variables → Actions → New reposit
 | Secret | Required | Description |
 |--------|:--------:|-------------|
 | `TOKENS` | ✅ | Discord user token(s) — one per line for multi-account |
-| `BOT_IDS` | ❌ | Bot ID(s) to vote for — one per line. Default: `830530156048285716` |
+| `BOT_IDS` | ✅ | Bot ID(s) to vote for — one per line |
 | `TG_BOT_TOKEN` | ❌ | Telegram bot token (from [@BotFather](https://t.me/BotFather)) |
 | `TG_CHAT_ID` | ❌ | Telegram chat/user ID for vote result notifications |
 | `SEND_ERROR_SCREENSHOTS` | ❌ | Set to `1` for non-CAPTCHA error/uncertain screenshots; CAPTCHA screenshots are automatic |
@@ -136,7 +136,7 @@ The Northflank scheduler waits for an active vote workflow instead of dispatchin
 
 ### Fresh-Run Recovery
 
-Chrome startup may occasionally outlive nodriver's short initial DevTools polling window on a GitHub-hosted runner. The runtime now keeps a still-running Chrome process alive for an additional bounded late-attach window before restarting it. If all accounts still fail with a browser startup error, `vote.py` writes a credential-free marker artifact:
+Chrome startup may occasionally outlive nodriver's short initial DevTools polling window on a GitHub-hosted runner. The runtime now bounds the initial start call, gives a still-running Chrome process an additional late-attach window, and retries more than the historical five-attempt limit. The workflow also creates a valid D-Bus session when the runner provides `dbus-run-session`, while preserving Xvfb. If all accounts still fail with a browser startup error, `vote.py` writes a credential-free marker artifact:
 
 ```json
 {"reason":"browser_startup_failed"}
@@ -214,7 +214,7 @@ auto-vote-topgg/
 - `nodriver==0.50.3`, `opencv-python-headless==5.0.0.93`, and `requests==2.34.2` as direct dependencies
 - Hash-locked Linux x86_64 / CPython 3.11 dependencies in `requirements.lock`
 - Google Chrome/Chromium from the pinned `ubuntu-24.04` GitHub-hosted runner image (discovered dynamically by workflow)
-- Xvfb on headless Linux runners (installed by workflow)
+- Xvfb on headless Linux runners (the workflow uses the preinstalled copy when available and installs it only if missing)
 
 `opencv-python-headless` is required by nodriver `verify_cf()`: nodriver captures the viewport, matches its bundled Cloudflare checkbox template, then dispatches a native mouse click. The headless package supplies image matching without OpenCV GUI components.
 

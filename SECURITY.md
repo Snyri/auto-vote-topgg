@@ -44,7 +44,10 @@ Workflow secrets are handed to Python through mode-`0600` temporary files. Pytho
 - Fresh-run retry artifacts contain only a reason code (`browser_startup_failed` or `protection_blocked`); no credentials, account IDs, bot IDs, or screenshots.
 - Fresh-run retry dispatch jobs hold `actions: write` only; no credential secrets, and automatic retry chains are capped at one fresh run.
 - Chrome process stderr/stdout diagnostics are bounded to 600 chars and redacted through the same credential-scrub path as exception details, including parsed Auth.js cookie values.
-- A still-running Chrome process gets a bounded late DevTools attach window before it is killed and restarted.
+- Browser startup, initial page open, shutdown, and late DevTools attachment are all time-bounded; a valid D-Bus session is preserved when available.
+- Auth.js `__Host-` cookies are injected as host-only cookies using the top.gg URL, without a Domain attribute.
+- The Northflank scheduler image pins Requests and all of its runtime dependencies explicitly, runs as non-root, and is built/tested in CI.
+- OSV dependency checks retry bounded transient network/server failures instead of failing CI on a single temporary outage.
 
 ## Audit Log
 
@@ -75,4 +78,4 @@ Hardened authentication and scheduling after repeated protection-block failures:
 
 ### 2026-09-21
 
-Pinned GitHub-hosted jobs to Ubuntu 24.04, added bounded late attachment for slow Chrome DevTools startup, expanded cookie-value redaction, added one-shot protection-block fresh-run recovery, hardened scheduler dispatch ambiguity handling, and moved the Northflank scheduler container to a non-root user.
+Pinned GitHub-hosted jobs to Ubuntu 24.04, added bounded late attachment and startup/shutdown timeouts for Chrome, preserved valid D-Bus sessions, corrected __Host- cookie injection semantics, expanded cookie-value redaction, added one-shot protection-block fresh-run recovery, hardened scheduler dispatch ambiguity handling, pinned scheduler runtime dependencies, added scheduler-image CI, and moved the Northflank scheduler container to a non-root user.

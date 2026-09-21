@@ -29,9 +29,23 @@ jobs:
       - name: Run tests
         run: |
           python -m unittest -v
-          python -m py_compile vote.py test_vote.py test_scheduler.py audit_dependencies.py scheduler/scheduler.py
+          python -m py_compile vote.py test_vote.py test_scheduler.py test_audit_dependencies.py audit_dependencies.py scheduler/scheduler.py
           python -m pip check
           git diff --check
+
+  scheduler-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build scheduler image
+        run: docker build -t topgg-scheduler-ci scheduler
+      - name: Verify scheduler image runtime
+        run: |
+          docker run --rm --entrypoint python topgg-scheduler-ci -c 'import os, requests; assert os.geteuid() != 0; assert requests.__version__ == "2.34.2"'
 
   dependency-audit:
     runs-on: ubuntu-24.04

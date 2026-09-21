@@ -4,10 +4,14 @@
 import json
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
+OSV_ATTEMPTS = 3
+OSV_RETRY_DELAYS_SEC = (1, 2)
 LOCK_ENTRY = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)", re.MULTILINE)
 
 
@@ -31,11 +35,24 @@ def query_osv(packages: list[tuple[str, str]]) -> list[dict]:
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        results = json.load(response).get("results", [])
-    if len(results) != len(packages):
-        raise RuntimeError("OSV returned an incomplete response")
-    return results
+    for attempt in range(1, OSV_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                results = json.load(response).get("results", [])
+            if len(results) != len(packages):
+                raise RuntimeError("OSV returned an incomplete response")
+            return results
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code <= 599
+            if not retryable or attempt == OSV_ATTEMPTS:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == OSV_ATTEMPTS:
+                raise
+
+        time.sleep(OSV_RETRY_DELAYS_SEC[attempt - 1])
+
+    raise RuntimeError("OSV query retry loop exited unexpectedly")
 
 
 def main(path: str = "requirements.lock") -> int:

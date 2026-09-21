@@ -124,7 +124,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
         vote_workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
         security_workflow = (root / ".github/workflows/security.yml").read_text(encoding="utf-8")
         self.assertGreaterEqual(vote_workflow.count("timeout-minutes:"), 5)
-        self.assertEqual(security_workflow.count("timeout-minutes: 10"), 2)
+        self.assertEqual(security_workflow.count("timeout-minutes: 10"), 3)
 
 
     def test_select_new_dispatched_run_filters_expected_source(self):
@@ -171,6 +171,22 @@ class WorkflowConfigurationTests(unittest.TestCase):
         ]
         self.assertEqual(scheduler.dispatch_vote(), 99)
         api.assert_not_called()
+
+
+    def test_scheduler_image_pins_runtime_dependencies_and_non_root_user(self):
+        root = pathlib.Path(__file__).parent
+        dockerfile = (root / "scheduler" / "Dockerfile").read_text(encoding="utf-8")
+        for requirement in (
+            "requests==2.34.2",
+            "urllib3==2.7.0",
+            "certifi==2026.7.22",
+            "charset-normalizer==3.4.9",
+            "idna==3.18",
+        ):
+            self.assertIn(requirement, dockerfile)
+        self.assertIn("--no-deps", dockerfile)
+        self.assertIn("python -m pip check", dockerfile)
+        self.assertIn("USER app", dockerfile)
 
 
 if __name__ == "__main__":
