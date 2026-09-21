@@ -85,7 +85,11 @@ jobs:
           export BROWSER_RETRY_STATE_FILE="$RUNNER_TEMP/browser-startup-retry.json"
           export PROTECTION_RETRY_STATE_FILE="$RUNNER_TEMP/protection-retry.json"
           set +e
-          xvfb-run -a -s "-screen 0 1280x720x24" python -u vote.py
+          if command -v dbus-run-session >/dev/null 2>&1; then
+            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x720x24" python -u vote.py
+          else
+            xvfb-run -a -s "-screen 0 1280x720x24" python -u vote.py
+          fi
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit 0

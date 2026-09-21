@@ -32,9 +32,12 @@ RETRY_DELAY_SEC = 10
 FINAL_STATUSES = frozenset({"success", "cooldown", "captcha_required", "blocked"})
 COMPLETED_STATUSES = frozenset({"success", "cooldown"})
 TRANSIENT_STATUSES = frozenset({"error", "auth_failed", "uncertain"})
-BROWSER_START_RETRIES = 5
+BROWSER_START_RETRIES = 7
 BROWSER_START_RETRY_SEC = 2
-BROWSER_LATE_ATTACH_TIMEOUT_SEC = 8
+BROWSER_START_CALL_TIMEOUT_SEC = 20
+BROWSER_INITIAL_PAGE_TIMEOUT_SEC = 10
+BROWSER_CLOSE_TIMEOUT_SEC = 5
+BROWSER_LATE_ATTACH_TIMEOUT_SEC = 12
 BROWSER_LATE_ATTACH_POLL_SEC = 0.5
 BROWSER_LATE_ATTACH_PROBE_TIMEOUT_SEC = 2
 BROWSER_LATE_ATTACH_STEP_TIMEOUT_SEC = 4
@@ -145,9 +148,11 @@ def scrub_browser_environment() -> None:
     for name in ("TOKENS", "TOPGG_COOKIES_JSON", "TG_BOT_TOKEN", "TG_CHAT_ID"):
         os.environ.pop(name, None)
         os.environ.pop(f"{name}_FILE", None)
-    # GitHub-hosted runners can expose a DBus address Chrome cannot parse.
-    # Chrome does not need a session bus for this headless/Xvfb automation.
-    os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+    # Preserve a valid session bus (for example from dbus-run-session) but
+    # remove malformed runner values that Chrome cannot parse.
+    dbus_address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").strip()
+    if dbus_address and not dbus_address.startswith(("unix:", "tcp:")):
+        os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
 
 
 async def browser_screenshot(tab: Any, path: str, *, required: bool = False) -> str | None:
@@ -764,21 +769,33 @@ async def settle_privacy_overlay(tab: Any, attempts: int = 4, delay: float = 0.7
     return dismissed
 
 
+def topgg_cookie_param(cookie: dict) -> Any:
+    same_site = uc.cdp.network.CookieSameSite(cookie["sameSite"])
+    expires = (
+        uc.cdp.network.TimeSinceEpoch(cookie["expires"])
+        if cookie.get("expires")
+        else None
+    )
+    kwargs = {
+        "name": cookie["name"],
+        "value": cookie["value"],
+        "path": cookie["path"],
+        "secure": cookie["secure"],
+        "http_only": cookie["httpOnly"],
+        "same_site": same_site,
+        "expires": expires,
+    }
+    if cookie["name"].startswith("__Host-"):
+        # __Host- cookies must be host-only: Secure, Path=/, and no Domain.
+        kwargs["url"] = "https://top.gg/"
+        kwargs["path"] = "/"
+    else:
+        kwargs["domain"] = cookie["domain"]
+    return uc.cdp.network.CookieParam(**kwargs)
+
+
 async def inject_topgg_cookies(browser: Any, cookies: list[dict]) -> None:
-    params = []
-    for cookie in cookies:
-        same_site = uc.cdp.network.CookieSameSite(cookie["sameSite"])
-        expires = uc.cdp.network.TimeSinceEpoch(cookie["expires"]) if cookie.get("expires") else None
-        params.append(uc.cdp.network.CookieParam(
-            name=cookie["name"],
-            value=cookie["value"],
-            domain=cookie["domain"],
-            path=cookie["path"],
-            secure=cookie["secure"],
-            http_only=cookie["httpOnly"],
-            same_site=same_site,
-            expires=expires,
-        ))
+    params = [topgg_cookie_param(cookie) for cookie in cookies]
     if params:
         await browser.cookies.set_all(params)
 
@@ -1497,12 +1514,18 @@ async def close_browser(browser: Any) -> None:
         return
     process = getattr(browser, "_process", None)
     with suppress(Exception):
-        await browser.aclose()
+        await asyncio.wait_for(
+            browser.aclose(),
+            timeout=BROWSER_CLOSE_TIMEOUT_SEC,
+        )
     with suppress(Exception):
         browser.stop()
     if process is not None and getattr(process, "returncode", None) is None:
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=BROWSER_CLOSE_TIMEOUT_SEC,
+            )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             with suppress(Exception):
                 process.kill()
@@ -1543,8 +1566,14 @@ async def start_browser() -> Any:
         browser = uc.Browser(config)
         browser._security_profile_path = profile_path
         try:
-            await browser.start()
-            await browser.get("about:blank")
+            await asyncio.wait_for(
+                browser.start(),
+                timeout=BROWSER_START_CALL_TIMEOUT_SEC,
+            )
+            await asyncio.wait_for(
+                browser.get("about:blank"),
+                timeout=BROWSER_INITIAL_PAGE_TIMEOUT_SEC,
+            )
             return browser
         except Exception as exc:
             last_error = exc

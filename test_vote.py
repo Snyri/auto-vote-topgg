@@ -43,6 +43,18 @@ class LoaderTests(unittest.TestCase):
             self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", os.environ)
             self.assertNotIn("TOKENS", os.environ)
 
+    def test_scrub_browser_environment_preserves_valid_dbus_address(self):
+        with patch.dict(
+            os.environ,
+            {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/dbus-test"},
+            clear=False,
+        ):
+            vote.scrub_browser_environment()
+            self.assertEqual(
+                os.environ.get("DBUS_SESSION_BUS_ADDRESS"),
+                "unix:path=/tmp/dbus-test",
+            )
+
     def test_load_bot_ids_requires_explicit_configuration(self):
         with patch.dict(os.environ, {"BOT_IDS": ""}, clear=False):
             with self.assertRaisesRegex(ValueError, "BOT_IDS is required"):
@@ -56,6 +68,35 @@ class LoaderTests(unittest.TestCase):
         with patch.dict(os.environ, {"BOT_IDS": "not-a-snowflake"}):
             with self.assertRaisesRegex(ValueError, "expected a 17-20 digit"):
                 vote.load_bot_ids()
+
+
+class CookieParamTests(unittest.TestCase):
+    def test_host_prefixed_cookie_is_injected_without_domain(self):
+        param = vote.topgg_cookie_param({
+            "name": "__Host-authjs.csrf-token",
+            "value": "secret",
+            "domain": ".top.gg",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "Lax",
+        })
+        self.assertEqual(param.url, "https://top.gg/")
+        self.assertIsNone(param.domain)
+        self.assertEqual(param.path, "/")
+
+    def test_secure_cookie_keeps_topgg_domain(self):
+        param = vote.topgg_cookie_param({
+            "name": "__Secure-authjs.session-token",
+            "value": "secret",
+            "domain": ".top.gg",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+            "sameSite": "Lax",
+        })
+        self.assertIsNone(param.url)
+        self.assertEqual(param.domain, ".top.gg")
 
 
 class UrlMatchingTests(unittest.TestCase):
