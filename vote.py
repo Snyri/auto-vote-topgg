@@ -42,6 +42,7 @@ AUTH_CAPTCHA_REQUIRED = "captcha_required"
 TELEGRAM_MESSAGE_LIMIT = 3500
 DIAGNOSTIC_DETAIL_LIMIT = 600
 BROWSER_RETRY_REASON = "browser_startup_failed"
+PROTECTION_RETRY_REASON = "protection_blocked"
 BROWSER_STARTUP_DETAIL_PREFIX = "Browser startup failed:"
 COOLDOWN_SAFETY_BUFFER_SEC = 5 * 60
 SUCCESS_NEXT_VOTE_DELAY_SEC = 12 * 60 * 60 + 30
@@ -134,6 +135,9 @@ def scrub_browser_environment() -> None:
     for name in ("TOKENS", "TOPGG_COOKIES_JSON", "TG_BOT_TOKEN", "TG_CHAT_ID"):
         os.environ.pop(name, None)
         os.environ.pop(f"{name}_FILE", None)
+    # GitHub-hosted runners can expose a DBus address Chrome cannot parse.
+    # Chrome does not need a session bus for this headless/Xvfb automation.
+    os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
 
 
 async def browser_screenshot(tab: Any, path: str, *, required: bool = False) -> str | None:
@@ -439,6 +443,35 @@ def write_browser_startup_retry_state(
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(
         json.dumps({"reason": BROWSER_RETRY_REASON}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return True
+
+
+def should_request_protection_retry(all_results: list[list[dict]]) -> bool:
+    return any(
+        result.get("status") == "blocked"
+        for account_results in all_results
+        for result in account_results
+    )
+
+
+def write_protection_retry_state(
+    all_results: list[list[dict]], path_value: str | None = None
+) -> bool:
+    path_text = (
+        path_value
+        if path_value is not None
+        else os.environ.get("PROTECTION_RETRY_STATE_FILE", "")
+    )
+    if not path_text.strip() or not should_request_protection_retry(all_results):
+        return False
+    path = Path(path_text)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps({"reason": PROTECTION_RETRY_REASON}, separators=(",", ":")),
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -910,16 +943,15 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
     await tab.get(vote_url)
     await asyncio.sleep(3)
 
-    retry_delays = (0, 5)
+    retry_delays = (0, 6)
     last_state = AUTH_BLOCKED
 
     for attempt, delay in enumerate(retry_delays, 1):
         if attempt > 1:
             print(
-                f"  ↺ Rechecking top.gg cookie session "
+                f"  ↺ Rechecking top.gg cookie session on the same verified page "
                 f"({attempt}/{len(retry_delays)})..."
             )
-            await tab.reload()
             await asyncio.sleep(delay)
 
         await settle_privacy_overlay(tab)
@@ -1711,6 +1743,8 @@ async def main() -> int:
         print(f"⏰ Next scheduled vote: {format_retry_at(retry_at)}")
     if write_browser_startup_retry_state(all_results):
         print("↺ Browser startup fresh-run retry requested")
+    if write_protection_retry_state(all_results):
+        print("↺ Protection-block fresh-run retry requested")
     report = build_notification(all_results, now)
     send_notification(report)
     await send_captcha_screenshots(all_results)

@@ -33,6 +33,16 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual(vote.consume_secret("TOKENS"), "sensitive-value")
             self.assertNotIn("TOKENS", os.environ)
 
+    def test_scrub_browser_environment_removes_invalid_dbus_address(self):
+        with patch.dict(
+            os.environ,
+            {"DBUS_SESSION_BUS_ADDRESS": "autolaunch:", "TOKENS": "secret"},
+            clear=False,
+        ):
+            vote.scrub_browser_environment()
+            self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", os.environ)
+            self.assertNotIn("TOKENS", os.environ)
+
     def test_load_bot_ids_accepts_discord_snowflakes(self):
         with patch.dict(os.environ, {"BOT_IDS": "830530156048285716\n12345678901234567"}):
             self.assertEqual(vote.load_bot_ids(), ["830530156048285716", "12345678901234567"])
@@ -292,6 +302,34 @@ class BrowserStartupRetryStateTests(unittest.TestCase):
                 self.browser_error("a"),
                 [{"bot_id": "111", "status": "success"}],
             ], path))
+            self.assertFalse(os.path.exists(path))
+
+
+class ProtectionRetryStateTests(unittest.TestCase):
+    def test_blocked_result_requests_fresh_run_marker(self):
+        results = [[
+            {"bot_id": "111", "status": "success"},
+            {"bot_id": "222", "status": "blocked"},
+        ]]
+        self.assertTrue(vote.should_request_protection_retry(results))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "protection-retry.json")
+            self.assertTrue(vote.write_protection_retry_state(results, path))
+            with open(path, encoding="utf-8") as file:
+                self.assertEqual(
+                    json.load(file),
+                    {"reason": vote.PROTECTION_RETRY_REASON},
+                )
+
+    def test_non_blocked_results_do_not_request_marker(self):
+        results = [[
+            {"bot_id": "111", "status": "success"},
+            {"bot_id": "222", "status": "cooldown"},
+        ]]
+        self.assertFalse(vote.should_request_protection_retry(results))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "protection-retry.json")
+            self.assertFalse(vote.write_protection_retry_state(results, path))
             self.assertFalse(os.path.exists(path))
 
 
@@ -771,6 +809,24 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         }
 
         self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
+
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.topgg_auth_state", new_callable=AsyncMock)
+    @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)
+    async def test_cookie_block_recheck_preserves_verified_page(
+        self, _inject, auth_state, sleep, _print
+    ):
+        auth_state.side_effect = [vote.AUTH_BLOCKED, vote.AUTHENTICATED]
+        tab = AsyncMock()
+        tab.browser = MagicMock()
+
+        result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
+
+        self.assertEqual(result, vote.AUTHENTICATED)
+        tab.get.assert_awaited_once_with("https://top.gg/bot/111/vote")
+        tab.reload.assert_not_awaited()
+        self.assertTrue(any(call.args == (6,) for call in sleep.await_args_list))
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
