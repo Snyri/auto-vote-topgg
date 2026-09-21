@@ -43,6 +43,11 @@ class LoaderTests(unittest.TestCase):
             self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", os.environ)
             self.assertNotIn("TOKENS", os.environ)
 
+    def test_load_bot_ids_requires_explicit_configuration(self):
+        with patch.dict(os.environ, {"BOT_IDS": ""}, clear=False):
+            with self.assertRaisesRegex(ValueError, "BOT_IDS is required"):
+                vote.load_bot_ids()
+
     def test_load_bot_ids_accepts_discord_snowflakes(self):
         with patch.dict(os.environ, {"BOT_IDS": "830530156048285716\n12345678901234567"}):
             self.assertEqual(vote.load_bot_ids(), ["830530156048285716", "12345678901234567"])
@@ -148,6 +153,20 @@ class BusinessResultTests(unittest.TestCase):
     def test_empty_results_fail_workflow(self):
         self.assertTrue(vote.has_business_failure([]))
         self.assertTrue(vote.has_business_failure([[]]))
+
+
+class VoteSuccessMarkerTests(unittest.TestCase):
+    def test_post_vote_success_markers_cover_confirmation_and_cooldown(self):
+        for text in (
+            "Thanks for voting",
+            "You have already voted",
+            "You can vote again in 12 hours",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(vote.vote_text_confirms_success(text))
+
+    def test_unrelated_vote_page_text_is_not_success(self):
+        self.assertFalse(vote.vote_text_confirms_success("Vote for this bot"))
 
 
 class CooldownSchedulingTests(unittest.TestCase):

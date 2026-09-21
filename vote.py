@@ -21,7 +21,6 @@ import requests
 
 WIB = timezone(timedelta(hours=7))
 DISCORD_LOGIN_URL = "https://discord.com/login"
-DEFAULT_BOT_IDS = ["830530156048285716"]
 TIMEOUT_OAUTH_SEC = 25
 TIMEOUT_VOTE_SEC = 30
 DELAY_BETWEEN_BOTS_SEC = 3
@@ -37,6 +36,8 @@ BROWSER_START_RETRIES = 5
 BROWSER_START_RETRY_SEC = 2
 BROWSER_LATE_ATTACH_TIMEOUT_SEC = 8
 BROWSER_LATE_ATTACH_POLL_SEC = 0.5
+BROWSER_LATE_ATTACH_PROBE_TIMEOUT_SEC = 2
+BROWSER_LATE_ATTACH_STEP_TIMEOUT_SEC = 4
 AUTHENTICATED = "authenticated"
 AUTH_INVALID = "invalid"
 AUTH_BLOCKED = "blocked"
@@ -59,6 +60,13 @@ COOLDOWN_UNITS_SEC = {
     "hour": 60 * 60,
     "day": 24 * 60 * 60,
 }
+POST_VOTE_SUCCESS_MARKERS = (
+    "thanks for voting",
+    "you have already voted",
+    "already voted",
+    "vote again in",
+    "can vote again",
+)
 COOLDOWN_PATTERN = re.compile(
     r"(?:you\s+)?can\s+vote\s+again\s+in\s+"
     r"(?:about\s+|approximately\s+)?"
@@ -296,7 +304,9 @@ def load_tokens(raw: str | None = None) -> list[str]:
 
 def load_bot_ids() -> list[str]:
     raw = os.environ.get("BOT_IDS", "").strip()
-    ids = [line.strip() for line in raw.splitlines() if line.strip()] if raw else DEFAULT_BOT_IDS
+    if not raw:
+        raise ValueError("BOT_IDS is required; configure at least one Discord bot ID")
+    ids = [line.strip() for line in raw.splitlines() if line.strip()]
     invalid = [bot_id for bot_id in ids if not (bot_id.isdigit() and 17 <= len(bot_id) <= 20)]
     if invalid:
         raise ValueError(f"Invalid BOT_IDS value: {invalid[0]!r}; expected a 17-20 digit Discord ID")
@@ -355,6 +365,11 @@ def cooldown_result(bot_id: str, text: str, now: datetime | None = None) -> dict
         result["retry_at"] = retry_at
         result["detail"] = f"Cooldown active; retry after {format_retry_at(retry_at)}"
     return result
+
+def vote_text_confirms_success(text: str) -> bool:
+    normalized = text.casefold()
+    return any(marker in normalized for marker in POST_VOTE_SUCCESS_MARKERS)
+
 
 def successful_vote_result(bot_id: str) -> dict:
     confirmed_at = int(datetime.now(timezone.utc).timestamp())
@@ -1281,7 +1296,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     await asyncio.sleep(5)
 
     text = (await body_text(tab)).lower()
-    if "thanks for voting" in text:
+    if vote_text_confirms_success(text):
         print(f"  ✅ Successfully voted for {bot_id}")
         return successful_vote_result(bot_id)
     if await is_turnstile_present(tab):
@@ -1294,7 +1309,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             )
         await asyncio.sleep(3)
         text = (await body_text(tab)).lower()
-        if "thanks for voting" in text:
+        if vote_text_confirms_success(text):
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
 
@@ -1302,10 +1317,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     await asyncio.sleep(3)
     await settle_privacy_overlay(tab)
     text = (await body_text(tab)).lower()
-    if any(marker in text for marker in (
-        "you have already voted", "already voted", "vote again in",
-        "can vote again", "thanks for voting",
-    )):
+    if vote_text_confirms_success(text):
         print(f"  ✅ Successfully voted for {bot_id}")
         return successful_vote_result(bot_id)
     if await is_turnstile_present(tab):
@@ -1318,10 +1330,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             )
         await asyncio.sleep(3)
         text = (await body_text(tab)).lower()
-        if any(marker in text for marker in (
-            "you have already voted", "already voted", "vote again in",
-            "can vote again", "thanks for voting",
-        )):
+        if vote_text_confirms_success(text):
             print(f"  ✅ Successfully voted for {bot_id}")
             return successful_vote_result(bot_id)
 
@@ -1441,23 +1450,45 @@ async def recover_slow_browser_start(browser: Any) -> bool:
     deadline = loop.time() + BROWSER_LATE_ATTACH_TIMEOUT_SEC
     while loop.time() < deadline:
         try:
-            info = await http.get("version")
-            websocket_url = (
-                info.get("webSocketDebuggerUrl")
-                if isinstance(info, dict)
-                else getattr(info, "webSocketDebuggerUrl", None)
+            info = await asyncio.wait_for(
+                http.get("version"),
+                timeout=BROWSER_LATE_ATTACH_PROBE_TIMEOUT_SEC,
             )
-            if websocket_url:
-                browser.info = info
-                browser.websocket_url = str(websocket_url)
-                await browser.attach()
-                await browser.update_targets()
-                await browser.get("about:blank")
-                print("  ✅ Recovered slowly-starting Chrome without restarting it")
-                return True
         except Exception as exc:
-            dbg(f"Late Chrome attach not ready: {type(exc).__name__}")
-        await asyncio.sleep(BROWSER_LATE_ATTACH_POLL_SEC)
+            dbg(f"Late Chrome DevTools probe not ready: {type(exc).__name__}")
+            await asyncio.sleep(BROWSER_LATE_ATTACH_POLL_SEC)
+            continue
+
+        websocket_url = (
+            info.get("webSocketDebuggerUrl")
+            if isinstance(info, dict)
+            else getattr(info, "webSocketDebuggerUrl", None)
+        )
+        if not websocket_url:
+            await asyncio.sleep(BROWSER_LATE_ATTACH_POLL_SEC)
+            continue
+
+        try:
+            browser.info = info
+            browser.websocket_url = str(websocket_url)
+            await asyncio.wait_for(
+                browser.attach(),
+                timeout=BROWSER_LATE_ATTACH_STEP_TIMEOUT_SEC,
+            )
+            await asyncio.wait_for(
+                browser.update_targets(),
+                timeout=BROWSER_LATE_ATTACH_STEP_TIMEOUT_SEC,
+            )
+            await asyncio.wait_for(
+                browser.get("about:blank"),
+                timeout=BROWSER_LATE_ATTACH_STEP_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            dbg(f"Late Chrome attach failed: {type(exc).__name__}")
+            return False
+
+        print("  ✅ Recovered slowly-starting Chrome without restarting it")
+        return True
     return False
 
 
@@ -1773,6 +1804,12 @@ async def main() -> int:
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
     total = len(tokens)
     print("🚀 auto-vote-dcbot starting")
+    run_source = os.environ.get("RUN_SOURCE", "").strip()
+    run_origin_id = os.environ.get("RUN_ORIGIN_ID", "").strip()
+    if run_source:
+        print(f"   Source  : {run_source}")
+    if run_origin_id:
+        print(f"   Origin  : {run_origin_id}")
     print(f"   Tokens  : {total}")
     print(f"   Cookies : {sum(bool(cookies) for cookies in all_cookies)}/{total} account(s)")
     print(f"   Bots    : {len(bot_ids)}")
