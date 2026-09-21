@@ -872,6 +872,23 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
 
     @patch("builtins.print")
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
+    @patch("vote.topgg_session_probe", new_callable=AsyncMock)
+    @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock, return_value=vote.AUTH_INVALID)
+    async def test_http_403_overrides_login_surface_hint(
+        self, _hint, session_probe, _turnstile, _print
+    ):
+        session_probe.return_value = {
+            "authenticated": False,
+            "status": 403,
+            "content_type": "text/html",
+            "json_ok": False,
+            "error": "",
+        }
+
+        self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
+
+    @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.topgg_auth_state", new_callable=AsyncMock)
     @patch("vote.inject_topgg_cookies", new_callable=AsyncMock)

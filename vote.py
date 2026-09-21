@@ -957,12 +957,12 @@ async def topgg_auth_state(tab: Any) -> str:
         if probe.get("authenticated"):
             return AUTHENTICATED
 
-    if page_hint == AUTH_INVALID:
-        return AUTH_INVALID
     if probe.get("status") == 200 and probe.get("json_ok"):
         return AUTH_INVALID
     if probe_looks_blocked(probe):
         return AUTH_BLOCKED
+    if page_hint == AUTH_INVALID:
+        return AUTH_INVALID
     return AUTH_BLOCKED
 
 
@@ -1850,10 +1850,13 @@ async def main() -> int:
     print("🚀 auto-vote-dcbot starting")
     run_source = os.environ.get("RUN_SOURCE", "").strip()
     run_origin_id = os.environ.get("RUN_ORIGIN_ID", "").strip()
+    run_recovery_depth = os.environ.get("RUN_RECOVERY_DEPTH", "").strip()
     if run_source:
         print(f"   Source  : {run_source}")
     if run_origin_id:
         print(f"   Origin  : {run_origin_id}")
+    if run_recovery_depth:
+        print(f"   Recovery: {run_recovery_depth}/2")
     print(f"   Tokens  : {total}")
     print(f"   Cookies : {sum(bool(cookies) for cookies in all_cookies)}/{total} account(s)")
     print(f"   Bots    : {len(bot_ids)}")
