@@ -29,3 +29,5 @@
 - Browser/profile cleanup must never override a completed vote result: cleanup failures are operational warnings, while retrying a vote because teardown failed can create duplicate attempts.
 - Fresh-run recovery can safely cross failure categories once (for example protection block → startup failure), but must track depth and prevent repeating the same recovery category indefinitely.
 - Scheduler artifacts are control-plane inputs: validate archive size, exact filename, exact JSON shape, and timestamp bounds before acting on them.
+
+- Do not probe Auth.js through an active Turnstile/protection page. Clear the visible challenge first, re-check strong page state, and only call the session endpoint when the page remains ambiguous; this removes predictable 403s without weakening authentication checks.

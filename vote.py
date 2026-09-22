@@ -804,7 +804,10 @@ async def topgg_session_probe(tab: Any) -> dict:
     """Return a credential-free Auth.js probe result for diagnostics and decisions."""
     result = await evaluate(tab, """(async () => {
         try {
-            const response = await fetch('/api/auth/session', {credentials: 'include'});
+            const response = await fetch('/api/auth/session', {
+                credentials: 'include',
+                cache: 'no-store',
+            });
             const probe = {
                 ok: Boolean(response.ok),
                 status: Number(response.status || 0),
@@ -938,11 +941,12 @@ async def topgg_auth_state(tab: Any) -> str:
         print("  ✅ top.gg vote page shows an authenticated voting surface")
         return AUTHENTICATED
 
-    probe = await topgg_session_probe(tab)
-    if probe.get("authenticated"):
-        return AUTHENTICATED
-
+    # Do not call the Auth.js session endpoint through an active protection
+    # challenge. That request is expected to produce a 403 and adds no useful
+    # authentication signal. Clear the page challenge first, then probe only
+    # if the vote surface is still ambiguous.
     if await is_turnstile_present(tab):
+        print("  → top.gg protection is active; clearing it before session validation")
         if not await solve_turnstile(tab):
             return AUTH_CAPTCHA_REQUIRED
         await asyncio.sleep(2)
@@ -953,9 +957,9 @@ async def topgg_auth_state(tab: Any) -> str:
             print("  ✅ top.gg vote page became usable after verification")
             return AUTHENTICATED
 
-        probe = await topgg_session_probe(tab)
-        if probe.get("authenticated"):
-            return AUTHENTICATED
+    probe = await topgg_session_probe(tab)
+    if probe.get("authenticated"):
+        return AUTHENTICATED
 
     if probe.get("status") == 200 and probe.get("json_ok"):
         return AUTH_INVALID

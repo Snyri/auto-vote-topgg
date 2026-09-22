@@ -855,6 +855,51 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         session_probe.assert_not_awaited()
 
     @patch("builtins.print")
+    @patch("vote.settle_privacy_overlay", new_callable=AsyncMock)
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True)
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
+    @patch("vote.topgg_session_probe", new_callable=AsyncMock)
+    @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock)
+    async def test_turnstile_is_cleared_before_session_probe(
+        self, page_hint, session_probe, _present, solver, _sleep, _settle, _print
+    ):
+        page_hint.side_effect = ["unknown", "unknown"]
+        session_probe.return_value = {
+            "authenticated": False,
+            "status": 403,
+            "content_type": "text/html",
+            "json_ok": False,
+            "error": "",
+        }
+
+        self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
+
+        solver.assert_awaited_once()
+        self.assertEqual(session_probe.await_count, 1)
+        self.assertEqual(page_hint.await_count, 2)
+
+    @patch("builtins.print")
+    @patch("vote.settle_privacy_overlay", new_callable=AsyncMock)
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True)
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
+    @patch("vote.topgg_session_probe", new_callable=AsyncMock)
+    @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock)
+    async def test_cleared_turnstile_page_surface_skips_session_probe(
+        self, page_hint, session_probe, _present, solver, _sleep, _settle, _print
+    ):
+        page_hint.side_effect = ["unknown", vote.AUTHENTICATED]
+
+        self.assertEqual(
+            await vote.topgg_auth_state(AsyncMock()),
+            vote.AUTHENTICATED,
+        )
+
+        solver.assert_awaited_once()
+        session_probe.assert_not_awaited()
+
+    @patch("builtins.print")
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
     @patch("vote.topgg_session_probe", new_callable=AsyncMock)
     @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock, return_value="unknown")

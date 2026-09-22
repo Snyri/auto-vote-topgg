@@ -142,10 +142,11 @@ Chrome startup may occasionally outlive nodriver's short initial DevTools pollin
 {"reason":"browser_startup_failed"}
 ```
 
-The workflow reads this artifact and dispatches **exactly one** fresh `vote.yml` run on a new runner. Persistent top.gg protection blocks use the same bounded pattern with a separate `protection-retry` marker. Retry runs are identified by `source=browser-startup-retry` or `source=protection-retry` plus `origin_run_id=<original-run-id>`.
+The workflow reads this artifact and may dispatch a fresh `vote.yml` run on a new runner. Persistent top.gg protection blocks use the same bounded pattern with a separate `protection-retry` marker. Retry runs are identified by `source=browser-startup-retry` or `source=protection-retry`, `origin_run_id=<original-run-id>`, and an internal recovery depth.
 
 Guards:
-- Retry runs with `source=browser-startup-retry` or `source=protection-retry` never dispatch another automatic fresh run.
+- At most two fresh runs are allowed across one recovery chain.
+- The same failure category cannot dispatch itself twice; a cross-category recovery (for example protection block followed by browser-startup failure) is still allowed within the depth limit.
 - Only first attempt (`run_attempt == 1`) may dispatch.
 - Marker artifact contains no tokens, cookies, account IDs, bot IDs, or screenshots.
 - Original failed run remains a truthful failure; Telegram error report is sent before retry starts.
@@ -164,7 +165,7 @@ DEBUG=1 python vote.py
 
 Non-CAPTCHA error screenshots remain disabled unless `SEND_ERROR_SCREENSHOTS=1` is set, except final top.gg authentication failures which are captured automatically on the last retry.
 
-CAPTCHA/Turnstile challenges are solved first with nodriver `verify_cf()` wherever they appear: top.gg cookie authentication, Discord OAuth, before voting, after clicking `Vote`, and after vote verification reload. top.gg privacy-consent overlays are checked repeatedly after page open/reload, then dismissed before auth probes, every marked click, vote interaction, and solver clicks so they cannot cover the checkbox or `Vote` button. If privacy-modal dismissal fails while the modal is detected, one screenshot plus the dismiss error is sent to Telegram. If solver cannot clear the challenge, the current browser page is captured when possible and sent to the configured Telegram chat immediately after the text report. Final `auth_failed` results also capture the last browser state and send it after the text report. No `SEND_ERROR_SCREENSHOTS` secret is required for CAPTCHA or final auth-failure evidence.
+CAPTCHA/Turnstile challenges are solved first with nodriver `verify_cf()` wherever they appear: top.gg cookie authentication, Discord OAuth, before voting, after clicking `Vote`, and after vote verification reload. During top.gg authentication the runtime clears an active Turnstile before probing the Auth.js session endpoint, avoiding predictable protection-page 403 requests while the challenge is still active. top.gg privacy-consent overlays are checked repeatedly after page open/reload, then dismissed before auth probes, every marked click, vote interaction, and solver clicks so they cannot cover the checkbox or `Vote` button. If privacy-modal dismissal fails while the modal is detected, one screenshot plus the dismiss error is sent to Telegram. If solver cannot clear the challenge, the current browser page is captured when possible and sent to the configured Telegram chat immediately after the text report. Final `auth_failed` results also capture the last browser state and send it after the text report. No `SEND_ERROR_SCREENSHOTS` secret is required for CAPTCHA or final auth-failure evidence.
 
 For other GitHub Actions diagnostics, add repository secret `SEND_ERROR_SCREENSHOTS=1`. Error and uncertain states then send screenshots to configured Telegram chat. Keep chat private: screenshots may contain Discord username, avatar, or top.gg account details. Screenshots are never uploaded as GitHub artifacts and local files are deleted after each Telegram delivery attempt.
 
