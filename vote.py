@@ -1269,15 +1269,25 @@ async def wait_for_ad(tab: Any, bot_id: str) -> dict | None:
 
 async def mark_vote_button(tab: Any) -> dict:
     return dict(await evaluate(tab, """(() => {
-        document.querySelectorAll('[data-auto-vote]').forEach(el => el.removeAttribute('data-auto-vote'));
-        const button = [...document.querySelectorAll('button')]
-            .find(el => (el.textContent || '').trim().toLowerCase() === 'vote');
-        if (!button) return {found: false, disabled: true};
+        document.querySelectorAll('[data-auto-vote]').forEach(
+            el => el.removeAttribute('data-auto-vote')
+        );
+        const visible = (el) => Boolean(
+            el && (el.getClientRects().length || el.offsetWidth || el.offsetHeight)
+        );
+        const controls = [...document.querySelectorAll('button, [role="button"], a')];
+        const button = controls.find(el =>
+            visible(el) &&
+            (el.textContent || '').trim().toLowerCase() === 'vote'
+        );
+        if (!button) return {found: false, disabled: true, visible: false};
+        const disabled = Boolean(
+            button.disabled ||
+            button.getAttribute('aria-disabled') === 'true' ||
+            button.hasAttribute('disabled')
+        );
         button.setAttribute('data-auto-vote', '1');
-        return {
-            found: true,
-            disabled: Boolean(button.disabled || button.getAttribute('aria-disabled') === 'true')
-        };
+        return {found: true, disabled, visible: true};
     })()""") or {})
 
 

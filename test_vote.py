@@ -432,6 +432,17 @@ class PreVoteProtectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(solver.await_count, vote.MAX_TURNSTILE_CYCLES_PER_PHASE - 1)
 
 
+class VoteControlDetectionTests(unittest.IsolatedAsyncioTestCase):
+    @patch("vote.evaluate", new_callable=AsyncMock, return_value={"found": True, "disabled": False, "visible": True})
+    async def test_vote_control_detection_covers_role_button_and_links(self, evaluate):
+        state = await vote.mark_vote_button(AsyncMock())
+
+        self.assertTrue(state["found"])
+        expression = evaluate.await_args.args[1]
+        self.assertIn('[role="button"]', expression)
+        self.assertIn("getClientRects", expression)
+
+
 class VotePageReuseTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.current_url", new_callable=AsyncMock)
@@ -537,7 +548,7 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
             "You can vote again in 11 hours",
             "You can vote again in 10 hours 59 minutes",
         ]
-        present.side_effect = [False, False, True, False]
+        present.side_effect = [False, False, True, False, False]
         tab = AsyncMock()
 
         result = await vote.vote_for_bot(tab, "111", "account")
@@ -598,7 +609,7 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
             "You have already voted",
             "You have already voted",
         ]
-        present.side_effect = [False, False, False, True]
+        present.side_effect = [False, False, False, True, False]
         tab = AsyncMock()
 
         result = await vote.vote_for_bot(tab, "111", "account")
