@@ -66,15 +66,22 @@ COOLDOWN_UNITS_SEC = {
 POST_VOTE_STRONG_MARKERS = (
     "thanks for voting",
     "you have already voted",
-    "already voted",
 )
 POST_VOTE_VERIFY_ATTEMPTS = 2
 POST_VOTE_VERIFY_DELAY_SEC = 3
 COOLDOWN_PATTERN = re.compile(
     r"(?:you\s+)?can\s+vote\s+again\s+in\s+"
     r"(?:about\s+|approximately\s+)?"
+    r"(?P<duration>"
+    r"(?:(?:\d+(?:\.\d+)?|a|an|one)\s*"
+    r"(?:seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|hrs?|hr|h|days?|d)"
+    r"\s*(?:,\s*|and\s+|\s+)?){1,4}"
+    r")",
+    re.IGNORECASE,
+)
+COOLDOWN_COMPONENT_PATTERN = re.compile(
     r"(?P<amount>\d+(?:\.\d+)?|a|an|one)\s*"
-    r"(?P<unit>seconds?|minutes?|hours?|days?)\b",
+    r"(?P<unit>seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|hrs?|hr|h|days?|d)\b",
     re.IGNORECASE,
 )
 
@@ -342,15 +349,34 @@ def retryable_bot_ids(results: list[dict]) -> list[str]:
 
 
 def parse_cooldown_seconds(text: str) -> int | None:
-    """Parse bounded top.gg relative cooldown text; reject unrelated durations."""
+    """Parse bounded, possibly compound top.gg relative cooldown text."""
     normalized = " ".join(text.split())
     match = COOLDOWN_PATTERN.search(normalized)
     if not match:
         return None
-    amount_text = match.group("amount").lower()
-    amount = 1.0 if amount_text in {"a", "an", "one"} else float(amount_text)
-    unit = match.group("unit").lower().rstrip("s")
-    seconds = round(amount * COOLDOWN_UNITS_SEC[unit])
+
+    total = 0.0
+    components = list(COOLDOWN_COMPONENT_PATTERN.finditer(match.group("duration")))
+    if not components:
+        return None
+
+    for component in components:
+        amount_text = component.group("amount").lower()
+        amount = 1.0 if amount_text in {"a", "an", "one"} else float(amount_text)
+        raw_unit = component.group("unit").lower()
+        if raw_unit.startswith(("s",)):
+            unit = "second"
+        elif raw_unit.startswith(("m",)):
+            unit = "minute"
+        elif raw_unit.startswith(("h",)):
+            unit = "hour"
+        elif raw_unit.startswith(("d",)):
+            unit = "day"
+        else:
+            return None
+        total += amount * COOLDOWN_UNITS_SEC[unit]
+
+    seconds = round(total)
     return seconds if MIN_COOLDOWN_SEC <= seconds <= MAX_COOLDOWN_SEC else None
 
 
@@ -367,7 +393,6 @@ def page_indicates_cooldown(text: str) -> bool:
     return (
         parse_cooldown_seconds(normalized) is not None
         or "you have already voted" in normalized
-        or "already voted" in normalized
     )
 
 
@@ -1407,8 +1432,6 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     # where strong success/cooldown evidence exists and an enabled Vote button
     # does not.
     last_confirmation = {"confirmed": False, "evidence": None, "vote_enabled": False}
-    confirmed_attempts = 0
-    confirmation_evidence: list[str] = []
     for verification_attempt in range(1, POST_VOTE_VERIFY_ATTEMPTS + 1):
         print(
             f"  → Verifying persisted vote state "
@@ -1431,20 +1454,12 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
 
         last_confirmation = await persisted_vote_confirmation(tab, bot_id)
         if last_confirmation.get("confirmed"):
-            confirmed_attempts += 1
-            confirmation_evidence.append(
-                str(last_confirmation.get("evidence") or "server state")
+            evidence = str(last_confirmation.get("evidence") or "server state")
+            print(
+                f"  ✅ Successfully voted for {bot_id} "
+                f"(persisted confirmation: {evidence})"
             )
-            if confirmed_attempts >= POST_VOTE_VERIFY_ATTEMPTS:
-                evidence = ", ".join(confirmation_evidence)
-                print(
-                    f"  ✅ Successfully voted for {bot_id} "
-                    f"(persisted confirmations: {evidence})"
-                )
-                return successful_vote_result(bot_id)
-        else:
-            confirmed_attempts = 0
-            confirmation_evidence.clear()
+            return successful_vote_result(bot_id)
 
         if last_confirmation.get("vote_enabled"):
             print(
@@ -1465,6 +1480,9 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             )
             break
 
+        # Only spend a second reload on an ambiguous first result. A strong
+        # confirmation after one fresh server round-trip is sufficient; an
+        # unconditional second reload just increases Cloudflare exposure.
         if verification_attempt < POST_VOTE_VERIFY_ATTEMPTS:
             await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 

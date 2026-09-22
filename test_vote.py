@@ -212,6 +212,16 @@ class VoteSuccessMarkerTests(unittest.TestCase):
 
 
 class CooldownSchedulingTests(unittest.TestCase):
+    def test_compound_cooldown_sums_all_components(self):
+        self.assertEqual(
+            vote.parse_cooldown_seconds("You can vote again in 10 hours 59 minutes."),
+            10 * 3600 + 59 * 60,
+        )
+        self.assertEqual(
+            vote.parse_cooldown_seconds("You can vote again in 1h 30m."),
+            90 * 60,
+        )
+
     def test_parses_supplied_about_one_hour_text(self):
         text = "You have already voted\nYou can vote again in about 1 hour."
         self.assertEqual(vote.parse_cooldown_seconds(text), 3600)
@@ -534,7 +544,6 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.mark_vote_button", new_callable=AsyncMock, side_effect=[
         {"found": True, "disabled": False},
         {"found": False, "disabled": True},
-        {"found": False, "disabled": True},
     ])
     @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
     @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
@@ -546,9 +555,8 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
         body_text.side_effect = [
             "ready to vote",
             "You can vote again in 11 hours",
-            "You can vote again in 10 hours 59 minutes",
         ]
-        present.side_effect = [False, False, True, False, False]
+        present.side_effect = [False, False, True, False]
         tab = AsyncMock()
 
         result = await vote.vote_for_bot(tab, "111", "account")
@@ -607,9 +615,8 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
         body_text.side_effect = [
             "ready to vote",
             "You have already voted",
-            "You have already voted",
         ]
-        present.side_effect = [False, False, False, True, False]
+        present.side_effect = [False, False, False, True]
         tab = AsyncMock()
 
         result = await vote.vote_for_bot(tab, "111", "account")
@@ -646,6 +653,36 @@ class FalseSuccessRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "uncertain")
         self.assertIn("still available", result["detail"])
         tab.reload.assert_awaited_once()
+
+
+class AmbiguousVoteVerificationTests(unittest.IsolatedAsyncioTestCase):
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
+    @patch("vote._click_marked", new_callable=AsyncMock, return_value=True)
+    @patch("vote.mark_vote_button", new_callable=AsyncMock, side_effect=[
+        {"found": True, "disabled": False},
+        {"found": False, "disabled": True},
+        {"found": False, "disabled": True},
+    ])
+    @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
+    @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
+    @patch("vote.current_url", new_callable=AsyncMock, return_value="https://top.gg/bot/111/vote")
+    @patch("vote.body_text", new_callable=AsyncMock)
+    async def test_ambiguous_first_reload_gets_one_second_verification(
+        self, body_text, _url, _evaluate, _ad, _mark, _click, _present, _sleep, _print
+    ):
+        body_text.side_effect = [
+            "ready to vote",
+            "processing your vote",
+            "You can vote again in 11 hours 59 minutes",
+        ]
+        tab = AsyncMock()
+
+        result = await vote.vote_for_bot(tab, "111", "account")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(tab.reload.await_count, 2)
 
 
 class MainExitTests(unittest.IsolatedAsyncioTestCase):

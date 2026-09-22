@@ -37,3 +37,6 @@
 
 - Treat vote confirmation as a high-integrity state transition: require repeated independent reload confirmations on the exact bot vote URL, reject enabled Vote controls/login redirects, and prefer false negatives (`uncertain`) over false positives (`success`).
 - An observed cooldown without a parseable remaining duration must not manufacture a new 12-hour schedule from observation time; recheck soon instead.
+
+- More verification is not automatically safer. After the #132 regression, require one independent persisted reload with exact-page/no-login/no-enabled-Vote checks; use a second reload only when the first result is ambiguous. This preserves false-positive protection without unnecessarily multiplying Cloudflare challenges.
+- Cooldown parsing must sum compound durations (for example `10 hours 59 minutes`); using only the first component can schedule the next attempt almost an hour early.
