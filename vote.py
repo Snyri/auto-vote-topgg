@@ -362,13 +362,30 @@ def cooldown_retry_at(text: str, now: datetime | None = None) -> int | None:
     return int(current.timestamp()) + seconds + COOLDOWN_SAFETY_BUFFER_SEC
 
 
+def page_indicates_cooldown(text: str) -> bool:
+    normalized = " ".join(text.casefold().split())
+    return (
+        parse_cooldown_seconds(normalized) is not None
+        or "you have already voted" in normalized
+        or "already voted" in normalized
+    )
+
+
 def cooldown_result(bot_id: str, text: str, now: datetime | None = None) -> dict:
-    retry_at = cooldown_retry_at(text, now)
-    detail = "Cooldown active"
-    result = {"bot_id": bot_id, "status": "cooldown", "detail": detail}
-    if retry_at is not None:
-        result["retry_at"] = retry_at
+    current = now or datetime.now(timezone.utc)
+    retry_at = cooldown_retry_at(text, current)
+    result = {"bot_id": bot_id, "status": "cooldown", "detail": "Cooldown active"}
+    if retry_at is None:
+        # We know a vote is unavailable, but not how much of the cooldown remains.
+        # Never invent a new 12-hour window from observation time.
+        retry_at = int(current.timestamp()) + TRANSIENT_RETRY_DELAY_SEC
+        result["detail"] = (
+            f"Cooldown active; remaining time unavailable; "
+            f"recheck after {format_retry_at(retry_at)}"
+        )
+    else:
         result["detail"] = f"Cooldown active; retry after {format_retry_at(retry_at)}"
+    result["retry_at"] = retry_at
     return result
 
 def vote_success_evidence(text: str) -> str | None:
@@ -389,16 +406,29 @@ def vote_text_confirms_success(text: str) -> bool:
     return vote_success_evidence(text) is not None
 
 
-async def persisted_vote_confirmation(tab: Any) -> dict:
-    """Confirm server-persisted state after a fresh page load."""
+async def persisted_vote_confirmation(tab: Any, bot_id: str) -> dict:
+    """Confirm server-persisted state for the exact bot after a fresh page load."""
+    url = await current_url(tab)
     text = (await body_text(tab)).lower()
     button = await mark_vote_button(tab)
     vote_enabled = bool(button.get("found") and not button.get("disabled"))
     evidence = vote_success_evidence(text)
+    login_required = any(
+        marker in text
+        for marker in ("must be logged in", "login to vote", "log in to vote")
+    )
+    exact_vote_page = is_topgg_vote_url(url, bot_id)
     return {
-        "confirmed": bool(evidence) and not vote_enabled,
+        "confirmed": (
+            exact_vote_page
+            and not login_required
+            and bool(evidence)
+            and not vote_enabled
+        ),
         "evidence": evidence,
         "vote_enabled": vote_enabled,
+        "exact_vote_page": exact_vote_page,
+        "login_required": login_required,
     }
 
 
@@ -926,9 +956,18 @@ async def topgg_page_auth_hint(tab: Any) -> str:
         const controls = [...document.querySelectorAll('button, a, [role="button"]')];
         const voteButtons = [...document.querySelectorAll('button')];
         const exactText = (node) => (node.textContent || '').trim().toLowerCase();
-        const hasVoteButton = voteButtons.some(node => exactText(node) === 'vote');
+        const isVisible = (node) => Boolean(
+            node && (node.getClientRects().length || node.offsetWidth || node.offsetHeight)
+        );
+        const hasVoteButton = voteButtons.some(node =>
+            exactText(node) === 'vote' &&
+            !node.disabled &&
+            node.getAttribute('aria-disabled') !== 'true' &&
+            isVisible(node)
+        );
         const hasLoginButton = controls.some(node =>
-            ['login', 'log in', 'sign in'].includes(exactText(node))
+            ['login', 'log in', 'sign in'].includes(exactText(node)) &&
+            isVisible(node)
         );
         const loginRequired =
             body.includes('must be logged in') ||
@@ -1262,7 +1301,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
 
     if "must be logged in" in text or "login to vote" in text:
         return {"bot_id": bot_id, "status": "auth_failed", "detail": "Not logged into top.gg"}
-    if any(marker in text for marker in ("vote again in", "already voted", "come back", "cooldown")):
+    if page_indicates_cooldown(text):
         print(f"  ⏳ Already voted for {bot_id} (cooldown)")
         return cooldown_result(bot_id, text)
     if "could not be found" in text or "404" in str(await evaluate(tab, "document.title")):
@@ -1326,7 +1365,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             await asyncio.sleep(2)
     else:
         text = (await body_text(tab)).lower()
-        if any(marker in text for marker in ("vote again in", "already voted", "come back", "cooldown")):
+        if page_indicates_cooldown(text):
             print(f"  ⏳ Already voted for {bot_id} (cooldown)")
             return cooldown_result(bot_id, text)
         if "must be logged in" in text or "login to vote" in text or "log in to vote" in text:
@@ -1358,6 +1397,8 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     # where strong success/cooldown evidence exists and an enabled Vote button
     # does not.
     last_confirmation = {"confirmed": False, "evidence": None, "vote_enabled": False}
+    confirmed_attempts = 0
+    confirmation_evidence: list[str] = []
     for verification_attempt in range(1, POST_VOTE_VERIFY_ATTEMPTS + 1):
         print(
             f"  → Verifying persisted vote state "
@@ -1378,18 +1419,38 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
             await settle_privacy_overlay(tab)
 
-        last_confirmation = await persisted_vote_confirmation(tab)
+        last_confirmation = await persisted_vote_confirmation(tab, bot_id)
         if last_confirmation.get("confirmed"):
-            evidence = str(last_confirmation.get("evidence") or "server state")
-            print(
-                f"  ✅ Successfully voted for {bot_id} "
-                f"(persisted confirmation: {evidence})"
+            confirmed_attempts += 1
+            confirmation_evidence.append(
+                str(last_confirmation.get("evidence") or "server state")
             )
-            return successful_vote_result(bot_id)
+            if confirmed_attempts >= POST_VOTE_VERIFY_ATTEMPTS:
+                evidence = ", ".join(confirmation_evidence)
+                print(
+                    f"  ✅ Successfully voted for {bot_id} "
+                    f"(persisted confirmations: {evidence})"
+                )
+                return successful_vote_result(bot_id)
+        else:
+            confirmed_attempts = 0
+            confirmation_evidence.clear()
 
         if last_confirmation.get("vote_enabled"):
             print(
                 f"  ⚠️  Vote is still available after verification "
+                f"for {bot_id}; treating click as unconfirmed"
+            )
+            break
+        if not last_confirmation.get("exact_vote_page", True):
+            print(
+                f"  ⚠️  Vote verification left the expected bot page "
+                f"for {bot_id}; treating click as unconfirmed"
+            )
+            break
+        if last_confirmation.get("login_required"):
+            print(
+                f"  ⚠️  Vote verification lost authenticated state "
                 f"for {bot_id}; treating click as unconfirmed"
             )
             break

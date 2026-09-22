@@ -472,7 +472,8 @@ class VotePersistenceTests(unittest.IsolatedAsyncioTestCase):
         body_text.return_value = "Thanks for voting!"
         button.return_value = {"found": True, "disabled": False}
 
-        confirmation = await vote.persisted_vote_confirmation(AsyncMock())
+        with patch("vote.current_url", new=AsyncMock(return_value="https://top.gg/bot/111/vote")):
+            confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
 
         self.assertFalse(confirmation["confirmed"])
         self.assertTrue(confirmation["vote_enabled"])
@@ -485,10 +486,32 @@ class VotePersistenceTests(unittest.IsolatedAsyncioTestCase):
         body_text.return_value = "You can vote again in 11 hours."
         button.return_value = {"found": False, "disabled": True}
 
-        confirmation = await vote.persisted_vote_confirmation(AsyncMock())
+        with patch("vote.current_url", new=AsyncMock(return_value="https://top.gg/bot/111/vote")):
+            confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
 
         self.assertTrue(confirmation["confirmed"])
         self.assertEqual(confirmation["evidence"], "bounded cooldown")
+
+
+class AdditionalVoteSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_unparsed_cooldown_rechecks_soon_instead_of_inventing_12h(self):
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        result = vote.cooldown_result("111", "You have already voted", now)
+        self.assertEqual(
+            result["retry_at"],
+            int(now.timestamp()) + vote.TRANSIENT_RETRY_DELAY_SEC,
+        )
+
+    def test_generic_come_back_text_is_not_cooldown(self):
+        self.assertFalse(vote.page_indicates_cooldown("Come back soon for more bots."))
+
+    @patch("vote.current_url", new_callable=AsyncMock, return_value="https://top.gg/")
+    @patch("vote.mark_vote_button", new_callable=AsyncMock, return_value={"found": False, "disabled": True})
+    @patch("vote.body_text", new_callable=AsyncMock, return_value="Thanks for voting!")
+    async def test_wrong_page_cannot_confirm_vote(self, _body, _button, _url):
+        confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
+        self.assertFalse(confirmation["confirmed"])
+        self.assertFalse(confirmation["exact_vote_page"])
 
 
 class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
@@ -500,16 +523,19 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.mark_vote_button", new_callable=AsyncMock, side_effect=[
         {"found": True, "disabled": False},
         {"found": False, "disabled": True},
+        {"found": False, "disabled": True},
     ])
     @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
     @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
+    @patch("vote.current_url", new_callable=AsyncMock, return_value="https://top.gg/bot/111/vote")
     @patch("vote.body_text", new_callable=AsyncMock)
     async def test_solves_turnstile_after_clicking_vote(
-        self, body_text, _evaluate, _ad, _mark, _click, present, solver, _sleep, _print
+        self, body_text, _current_url, _evaluate, _ad, _mark, _click, present, solver, _sleep, _print
     ):
         body_text.side_effect = [
             "ready to vote",
             "You can vote again in 11 hours",
+            "You can vote again in 10 hours 59 minutes",
         ]
         present.side_effect = [False, False, True, False]
         tab = AsyncMock()
@@ -562,12 +588,14 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     ])
     @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
     @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
+    @patch("vote.current_url", new_callable=AsyncMock, return_value="https://top.gg/bot/111/vote")
     @patch("vote.body_text", new_callable=AsyncMock)
     async def test_solves_turnstile_after_vote_verification_reload(
-        self, body_text, _evaluate, _ad, _mark, _click, present, solver, _sleep, _print
+        self, body_text, _current_url, _evaluate, _ad, _mark, _click, present, solver, _sleep, _print
     ):
         body_text.side_effect = [
             "ready to vote",
+            "You have already voted",
             "You have already voted",
         ]
         present.side_effect = [False, False, False, True]
@@ -591,9 +619,10 @@ class FalseSuccessRegressionTests(unittest.IsolatedAsyncioTestCase):
     ])
     @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
     @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
+    @patch("vote.current_url", new_callable=AsyncMock, return_value="https://top.gg/bot/111/vote")
     @patch("vote.body_text", new_callable=AsyncMock)
     async def test_same_dom_success_text_with_persisted_vote_button_is_uncertain(
-        self, body_text, _evaluate, _ad, _mark, _click, _present, _sleep, _print
+        self, body_text, _current_url, _evaluate, _ad, _mark, _click, _present, _sleep, _print
     ):
         body_text.side_effect = [
             "ready to vote",

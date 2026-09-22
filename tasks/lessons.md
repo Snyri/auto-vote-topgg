@@ -34,3 +34,6 @@
 
 - Never accept a vote as successful from the same DOM that received the click. Run #132 produced a false positive while the vote remained available. Require an independent reload, strong success/cooldown evidence, and no enabled Vote button before scheduling the next 12-hour success window.
 - A persistent scheduler must refresh its target while sleeping. A later manual run can supersede an earlier artifact; caching the old epoch until wake-up leaves the external scheduler offset even when GitHub has a newer correct schedule.
+
+- Treat vote confirmation as a high-integrity state transition: require repeated independent reload confirmations on the exact bot vote URL, reject enabled Vote controls/login redirects, and prefer false negatives (`uncertain`) over false positives (`success`).
+- An observed cooldown without a parseable remaining duration must not manufacture a new 12-hour schedule from observation time; recheck soon instead.
