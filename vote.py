@@ -1397,9 +1397,17 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         if verification_attempt < POST_VOTE_VERIFY_ATTEMPTS:
             await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 
-    path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_uncertain.png")
+    path = await browser_screenshot(
+        tab,
+        f"screenshots/vote_{account_id}_{bot_id}_unconfirmed.png",
+        required=True,
+    )
     if path:
-        await notify_error_screenshot(bot_id, path, "Vote did not persist after verification")
+        await notify_error_screenshot(
+            bot_id,
+            path,
+            "Vote did not persist after server-side verification",
+        )
     detail = (
         "Vote still available after post-click verification"
         if last_confirmation.get("vote_enabled")

@@ -556,7 +556,10 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True)
     @patch("vote.is_turnstile_present", new_callable=AsyncMock)
     @patch("vote._click_marked", new_callable=AsyncMock, return_value=True)
-    @patch("vote.mark_vote_button", new_callable=AsyncMock, return_value={"found": True, "disabled": False})
+    @patch("vote.mark_vote_button", new_callable=AsyncMock, side_effect=[
+        {"found": True, "disabled": False},
+        {"found": False, "disabled": True},
+    ])
     @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
     @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
     @patch("vote.body_text", new_callable=AsyncMock)
@@ -574,6 +577,34 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "success")
         solver.assert_awaited_once_with(tab)
+        tab.reload.assert_awaited_once()
+
+
+class FalseSuccessRegressionTests(unittest.IsolatedAsyncioTestCase):
+    @patch("builtins.print")
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
+    @patch("vote._click_marked", new_callable=AsyncMock, return_value=True)
+    @patch("vote.mark_vote_button", new_callable=AsyncMock, side_effect=[
+        {"found": True, "disabled": False},
+        {"found": True, "disabled": False},
+    ])
+    @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
+    @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
+    @patch("vote.body_text", new_callable=AsyncMock)
+    async def test_same_dom_success_text_with_persisted_vote_button_is_uncertain(
+        self, body_text, _evaluate, _ad, _mark, _click, _present, _sleep, _print
+    ):
+        body_text.side_effect = [
+            "ready to vote",
+            "Thanks for voting! You can vote again later.",
+        ]
+        tab = AsyncMock()
+
+        result = await vote.vote_for_bot(tab, "111", "account")
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertIn("still available", result["detail"])
         tab.reload.assert_awaited_once()
 
 

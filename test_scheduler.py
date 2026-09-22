@@ -121,6 +121,7 @@ class ScheduleRefreshTests(unittest.TestCase):
                 side_effect=[
                     2_000_000_000,
                     2_000_000_000,
+                    2_000_000_000,
                     2_000_001_101,
                 ],
             ),
