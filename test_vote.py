@@ -451,13 +451,56 @@ class VotePageReuseTests(unittest.IsolatedAsyncioTestCase):
         tab.get.assert_not_awaited()
 
 
+class VotePersistenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_generic_can_vote_again_text_is_not_success(self):
+        self.assertFalse(
+            vote.vote_text_confirms_success(
+                "You can vote again later. Voting helps this bot grow."
+            )
+        )
+
+    def test_parseable_vote_again_cooldown_is_strong_evidence(self):
+        self.assertTrue(
+            vote.vote_text_confirms_success(
+                "You can vote again in 11 hours."
+            )
+        )
+
+    @patch("vote.mark_vote_button", new_callable=AsyncMock)
+    @patch("vote.body_text", new_callable=AsyncMock)
+    async def test_enabled_vote_button_rejects_success_text(self, body_text, button):
+        body_text.return_value = "Thanks for voting!"
+        button.return_value = {"found": True, "disabled": False}
+
+        confirmation = await vote.persisted_vote_confirmation(AsyncMock())
+
+        self.assertFalse(confirmation["confirmed"])
+        self.assertTrue(confirmation["vote_enabled"])
+
+    @patch("vote.mark_vote_button", new_callable=AsyncMock)
+    @patch("vote.body_text", new_callable=AsyncMock)
+    async def test_reload_state_confirms_success_without_enabled_vote_button(
+        self, body_text, button
+    ):
+        body_text.return_value = "You can vote again in 11 hours."
+        button.return_value = {"found": False, "disabled": True}
+
+        confirmation = await vote.persisted_vote_confirmation(AsyncMock())
+
+        self.assertTrue(confirmation["confirmed"])
+        self.assertEqual(confirmation["evidence"], "bounded cooldown")
+
+
 class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True)
     @patch("vote.is_turnstile_present", new_callable=AsyncMock)
     @patch("vote._click_marked", new_callable=AsyncMock, return_value=True)
-    @patch("vote.mark_vote_button", new_callable=AsyncMock, return_value={"found": True, "disabled": False})
+    @patch("vote.mark_vote_button", new_callable=AsyncMock, side_effect=[
+        {"found": True, "disabled": False},
+        {"found": False, "disabled": True},
+    ])
     @patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None)
     @patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot")
     @patch("vote.body_text", new_callable=AsyncMock)
@@ -466,16 +509,16 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     ):
         body_text.side_effect = [
             "ready to vote",
-            "Please solve the captcha to continue",
-            "Thanks for voting",
+            "You can vote again in 11 hours",
         ]
-        present.side_effect = [False, False, True]
+        present.side_effect = [False, False, True, False]
         tab = AsyncMock()
 
         result = await vote.vote_for_bot(tab, "111", "account")
 
         self.assertEqual(result["status"], "success")
         solver.assert_awaited_once_with(tab)
+        tab.reload.assert_awaited_once()
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
@@ -522,8 +565,6 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
     ):
         body_text.side_effect = [
             "ready to vote",
-            "vote result unclear",
-            "Please solve the captcha to continue",
             "You have already voted",
         ]
         present.side_effect = [False, False, False, True]

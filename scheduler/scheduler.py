@@ -35,6 +35,7 @@ ERROR_RETRY_SECONDS = env_int("ERROR_RETRY_SECONDS", 300, 300)
 MAX_RUN_WAIT_SECONDS = env_int("MAX_RUN_WAIT_SECONDS", 2700, 300)
 MAX_SCHEDULE_AHEAD_SECONDS = 48 * 60 * 60
 MAX_SCHEDULE_PAST_SECONDS = 24 * 60 * 60
+SCHEDULE_REFRESH_SECONDS = env_int("SCHEDULE_REFRESH_SECONDS", 60, 15)
 
 API = "https://api.github.com"
 
@@ -358,24 +359,69 @@ def resolve_schedule():
             time.sleep(ERROR_RETRY_SECONDS)
 
 
+def latest_schedule_target():
+    run = latest_vote_run()
+    if not run or run.get("status") != "completed":
+        return None
+    next_at = next_vote_at_from_run(int(run["id"]))
+    if next_at is None:
+        return None
+    return int(run["id"]), next_at
+
+
 def wait_until(epoch):
+    """Wait for target while allowing newer workflow artifacts to supersede it."""
+    current_epoch = epoch
+    next_refresh = 0.0
+
     while True:
-        remaining = epoch - time.time()
+        now = time.time()
+        remaining = current_epoch - now
         if remaining <= 0:
-            return
+            return current_epoch
+
+        monotonic_now = time.monotonic()
+        if monotonic_now >= next_refresh:
+            try:
+                latest = latest_schedule_target()
+                if latest is not None:
+                    run_id, refreshed_epoch = latest
+                    if refreshed_epoch != current_epoch:
+                        old_target = datetime.fromtimestamp(
+                            current_epoch, timezone.utc
+                        ).isoformat(timespec="seconds")
+                        new_target = datetime.fromtimestamp(
+                            refreshed_epoch, timezone.utc
+                        ).isoformat(timespec="seconds")
+                        log(
+                            f"Schedule refreshed from run {run_id}: "
+                            f"{old_target} -> {new_target}"
+                        )
+                        current_epoch = refreshed_epoch
+                        continue
+            except Exception as exc:
+                log(
+                    f"Schedule refresh error: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            next_refresh = monotonic_now + SCHEDULE_REFRESH_SECONDS
 
         if remaining > 300:
             target = datetime.fromtimestamp(
-                epoch,
+                current_epoch,
                 timezone.utc,
             ).isoformat(timespec="seconds")
             log(
                 f"Next vote scheduled for {target}; "
                 f"{int(remaining)}s remaining"
             )
-            time.sleep(min(remaining, 300))
-        else:
-            time.sleep(remaining)
+
+        sleep_for = min(
+            max(current_epoch - time.time(), 0),
+            SCHEDULE_REFRESH_SECONDS,
+        )
+        if sleep_for > 0:
+            time.sleep(sleep_for)
 
 
 def main():
@@ -393,7 +439,7 @@ def main():
         ).isoformat(timespec="seconds")
         log(f"Next vote target: {target}")
 
-        wait_until(next_at)
+        next_at = wait_until(next_at)
 
         try:
             log(

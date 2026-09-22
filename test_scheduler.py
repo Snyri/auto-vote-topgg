@@ -107,6 +107,47 @@ class SchedulerValidationTests(unittest.TestCase):
             )
 
 
+class ScheduleRefreshTests(unittest.TestCase):
+    @patch.object(scheduler.time, "sleep")
+    @patch.object(scheduler, "latest_schedule_target")
+    def test_wait_until_refreshes_after_newer_manual_run(self, latest_target, sleep):
+        old_target = 2_000_000_600
+        new_target = 2_000_001_100
+        latest_target.side_effect = [(133, new_target), (133, new_target)]
+        with (
+            patch.object(
+                scheduler.time,
+                "time",
+                side_effect=[
+                    2_000_000_000,
+                    2_000_000_000,
+                    2_000_001_101,
+                ],
+            ),
+            patch.object(
+                scheduler.time,
+                "monotonic",
+                side_effect=[0.0, 61.0],
+            ),
+        ):
+            result = scheduler.wait_until(old_target)
+
+        self.assertEqual(result, new_target)
+
+    @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_000_500)
+    @patch.object(scheduler, "latest_vote_run")
+    def test_latest_schedule_target_uses_latest_completed_run(
+        self, latest_run, next_vote
+    ):
+        latest_run.return_value = {"id": 133, "status": "completed"}
+
+        self.assertEqual(
+            scheduler.latest_schedule_target(),
+            (133, 2_000_000_500),
+        )
+        next_vote.assert_called_once_with(133)
+
+
 class ArtifactValidationTests(unittest.TestCase):
     @patch.object(scheduler, "api")
     def test_next_vote_artifact_rejects_unexpected_json_fields(self, api):

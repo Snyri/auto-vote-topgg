@@ -63,13 +63,13 @@ COOLDOWN_UNITS_SEC = {
     "hour": 60 * 60,
     "day": 24 * 60 * 60,
 }
-POST_VOTE_SUCCESS_MARKERS = (
+POST_VOTE_STRONG_MARKERS = (
     "thanks for voting",
     "you have already voted",
     "already voted",
-    "vote again in",
-    "can vote again",
 )
+POST_VOTE_VERIFY_ATTEMPTS = 2
+POST_VOTE_VERIFY_DELAY_SEC = 3
 COOLDOWN_PATTERN = re.compile(
     r"(?:you\s+)?can\s+vote\s+again\s+in\s+"
     r"(?:about\s+|approximately\s+)?"
@@ -371,9 +371,35 @@ def cooldown_result(bot_id: str, text: str, now: datetime | None = None) -> dict
         result["detail"] = f"Cooldown active; retry after {format_retry_at(retry_at)}"
     return result
 
+def vote_success_evidence(text: str) -> str | None:
+    """Return a strong post-vote signal; reject generic instructional text."""
+    normalized = " ".join(text.casefold().split())
+    for marker in POST_VOTE_STRONG_MARKERS:
+        if marker in normalized:
+            return marker
+    cooldown_seconds = parse_cooldown_seconds(normalized)
+    if cooldown_seconds is not None and (
+        "vote again in" in normalized or "can vote again in" in normalized
+    ):
+        return "bounded cooldown"
+    return None
+
+
 def vote_text_confirms_success(text: str) -> bool:
-    normalized = text.casefold()
-    return any(marker in normalized for marker in POST_VOTE_SUCCESS_MARKERS)
+    return vote_success_evidence(text) is not None
+
+
+async def persisted_vote_confirmation(tab: Any) -> dict:
+    """Confirm server-persisted state after a fresh page load."""
+    text = (await body_text(tab)).lower()
+    button = await mark_vote_button(tab)
+    vote_enabled = bool(button.get("found") and not button.get("disabled"))
+    evidence = vote_success_evidence(text)
+    return {
+        "confirmed": bool(evidence) and not vote_enabled,
+        "evidence": evidence,
+        "vote_enabled": vote_enabled,
+    }
 
 
 def successful_vote_result(bot_id: str) -> dict:
@@ -1316,10 +1342,6 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         return {"bot_id": bot_id, "status": "error", "detail": "Vote button click failed"}
     await asyncio.sleep(5)
 
-    text = (await body_text(tab)).lower()
-    if vote_text_confirms_success(text):
-        print(f"  ✅ Successfully voted for {bot_id}")
-        return successful_vote_result(bot_id)
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
             return await captcha_result(
@@ -1328,37 +1350,62 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
                 "CAPTCHA still required after solver attempt following Vote click",
                 account_id,
             )
-        await asyncio.sleep(3)
-        text = (await body_text(tab)).lower()
-        if vote_text_confirms_success(text):
-            print(f"  ✅ Successfully voted for {bot_id}")
+        await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
+
+    # Never trust a success phrase from the same DOM that received the click.
+    # Run #132 showed that client-side text can look successful while the vote
+    # is still available server-side. Require a fresh page load and a state
+    # where strong success/cooldown evidence exists and an enabled Vote button
+    # does not.
+    last_confirmation = {"confirmed": False, "evidence": None, "vote_enabled": False}
+    for verification_attempt in range(1, POST_VOTE_VERIFY_ATTEMPTS + 1):
+        print(
+            f"  → Verifying persisted vote state "
+            f"({verification_attempt}/{POST_VOTE_VERIFY_ATTEMPTS})..."
+        )
+        await tab.reload()
+        await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
+        await settle_privacy_overlay(tab)
+
+        if await is_turnstile_present(tab):
+            if not await solve_turnstile(tab):
+                return await captcha_result(
+                    tab,
+                    bot_id,
+                    "CAPTCHA still required after solver attempt during vote verification",
+                    account_id,
+                )
+            await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
+            await settle_privacy_overlay(tab)
+
+        last_confirmation = await persisted_vote_confirmation(tab)
+        if last_confirmation.get("confirmed"):
+            evidence = str(last_confirmation.get("evidence") or "server state")
+            print(
+                f"  ✅ Successfully voted for {bot_id} "
+                f"(persisted confirmation: {evidence})"
+            )
             return successful_vote_result(bot_id)
 
-    await tab.reload()
-    await asyncio.sleep(3)
-    await settle_privacy_overlay(tab)
-    text = (await body_text(tab)).lower()
-    if vote_text_confirms_success(text):
-        print(f"  ✅ Successfully voted for {bot_id}")
-        return successful_vote_result(bot_id)
-    if await is_turnstile_present(tab):
-        if not await solve_turnstile(tab):
-            return await captcha_result(
-                tab,
-                bot_id,
-                "CAPTCHA still required after solver attempt during vote verification",
-                account_id,
+        if last_confirmation.get("vote_enabled"):
+            print(
+                f"  ⚠️  Vote is still available after verification "
+                f"for {bot_id}; treating click as unconfirmed"
             )
-        await asyncio.sleep(3)
-        text = (await body_text(tab)).lower()
-        if vote_text_confirms_success(text):
-            print(f"  ✅ Successfully voted for {bot_id}")
-            return successful_vote_result(bot_id)
+            break
+
+        if verification_attempt < POST_VOTE_VERIFY_ATTEMPTS:
+            await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 
     path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_uncertain.png")
     if path:
-        await notify_error_screenshot(bot_id, path, "Vote result unclear")
-    return {"bot_id": bot_id, "status": "uncertain", "detail": "Clicked, result unclear"}
+        await notify_error_screenshot(bot_id, path, "Vote did not persist after verification")
+    detail = (
+        "Vote still available after post-click verification"
+        if last_confirmation.get("vote_enabled")
+        else "Clicked, but server-side vote confirmation was not observed"
+    )
+    return {"bot_id": bot_id, "status": "uncertain", "detail": detail}
 
 
 def normalize_diagnostic(value: bytes | str) -> str:

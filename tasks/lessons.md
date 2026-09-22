@@ -31,3 +31,6 @@
 - Scheduler artifacts are control-plane inputs: validate archive size, exact filename, exact JSON shape, and timestamp bounds before acting on them.
 
 - Do not probe Auth.js through an active Turnstile/protection page. Clear the visible challenge first, re-check strong page state, and only call the session endpoint when the page remains ambiguous; this removes predictable 403s without weakening authentication checks.
+
+- Never accept a vote as successful from the same DOM that received the click. Run #132 produced a false positive while the vote remained available. Require an independent reload, strong success/cooldown evidence, and no enabled Vote button before scheduling the next 12-hour success window.
+- A persistent scheduler must refresh its target while sleeping. A later manual run can supersede an earlier artifact; caching the old epoch until wake-up leaves the external scheduler offset even when GitHub has a newer correct schedule.

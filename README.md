@@ -131,7 +131,7 @@ After every run, `vote.py` writes a private one-day `next-vote` artifact contain
 
 Confirmed success normally schedules the next attempt about 12 hours later. Parsed top.gg cooldowns use the reported duration plus the safety buffer. Protection blocks, CAPTCHA states, and other transient failures also receive bounded retry times, so a failed run does not cause the external scheduler to dispatch again every minute.
 
-The Northflank scheduler waits for an active vote workflow instead of dispatching a duplicate, validates schedule timestamps, retries transient GitHub API reads with backoff, waits at least five minutes after a failed run with no usable schedule, and imposes a maximum workflow wait. Required environment values are `GH_TOKEN`, `GH_REPOSITORY`, `GH_REF`, and `GH_WORKFLOW`; optional timing controls are `POLL_SECONDS`, `ERROR_RETRY_SECONDS`, and `MAX_RUN_WAIT_SECONDS`.
+The Northflank scheduler waits for an active vote workflow instead of dispatching a duplicate, validates schedule timestamps, retries transient GitHub API reads with backoff, waits at least five minutes after a failed run with no usable schedule, imposes a maximum workflow wait, and periodically refreshes the latest vote artifact while sleeping so a later manual run immediately supersedes an older schedule. Required environment values are `GH_TOKEN`, `GH_REPOSITORY`, `GH_REF`, and `GH_WORKFLOW`; optional timing controls are `POLL_SECONDS`, `ERROR_RETRY_SECONDS`, and `MAX_RUN_WAIT_SECONDS`.
 
 
 ### Fresh-Run Recovery
@@ -164,6 +164,8 @@ DEBUG=1 python vote.py
 ```
 
 Non-CAPTCHA error screenshots remain disabled unless `SEND_ERROR_SCREENSHOTS=1` is set, except final top.gg authentication failures which are captured automatically on the last retry.
+
+A Vote click is not considered successful from client-side text alone. Success requires a fresh page reload with server-persisted confirmation (strong success/cooldown evidence and no enabled Vote button). If the Vote button is still available after verification, the result becomes `uncertain` and is retried rather than falsely reported as success.
 
 CAPTCHA/Turnstile challenges are solved first with nodriver `verify_cf()` wherever they appear: top.gg cookie authentication, Discord OAuth, before voting, after clicking `Vote`, and after vote verification reload. During top.gg authentication the runtime clears an active Turnstile before probing the Auth.js session endpoint, avoiding predictable protection-page 403 requests while the challenge is still active. top.gg privacy-consent overlays are checked repeatedly after page open/reload, then dismissed before auth probes, every marked click, vote interaction, and solver clicks so they cannot cover the checkbox or `Vote` button. If privacy-modal dismissal fails while the modal is detected, one screenshot plus the dismiss error is sent to Telegram. If solver cannot clear the challenge, the current browser page is captured when possible and sent to the configured Telegram chat immediately after the text report. Final `auth_failed` results also capture the last browser state and send it after the text report. No `SEND_ERROR_SCREENSHOTS` secret is required for CAPTCHA or final auth-failure evidence.
 
