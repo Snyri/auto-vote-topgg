@@ -69,7 +69,7 @@ Added credential-free cooldown scheduling with timestamp-only one-day artifacts,
 
 Fixed browser credential inheritance, profile retention, weak cookie attributes, Requests CVE-2026-25645, transitive dependency integrity, and excess browser-job permissions.
 
-Repository protection uses pull requests and required CI. Independent human approval remains unavailable while repository has only one trusted collaborator; add second trusted collaborator before requiring one approval.
+Use pull requests and verified CI before merging. The September 24 repository API reported `master` as unprotected with no rulesets; source files alone do not enforce branch protection. Configure required checks and appropriate review rules in repository settings if enforcement is desired.
 
 
 ### 2026-09-20
@@ -79,3 +79,9 @@ Hardened authentication and scheduling after repeated protection-block failures:
 ### 2026-09-21
 
 Pinned GitHub-hosted jobs to Ubuntu 24.04, added bounded late attachment and startup/shutdown timeouts for Chrome, preserved valid D-Bus sessions, corrected __Host- cookie injection semantics, expanded cookie-value redaction, added bounded protection-block fresh-run recovery, hardened scheduler dispatch ambiguity handling, pinned scheduler runtime dependencies, added scheduler-image CI, and moved the Northflank scheduler container to a non-root user.
+
+### 2026-09-24
+
+Bounded session fetches in the browser and Python, rejected malformed authentication probe results, and stopped probing during unresolved post-challenge transitions. Preserved completed per-bot results across later failures. Browser teardown warnings cannot discard results, and profiles are still removed after successful forced termination. Optional error screenshots are deleted even when Telegram is unconfigured.
+
+Preserved scheduler source IDs across cycles, respected longer failed-run deferrals, and bounded artifact streaming. Recovery ZIPs now require exactly the expected filename and bounded contents without extraction. Workflow infrastructure failures propagate independently of voting status, and all branches share a concurrency group. OSV checks follow bounded pagination and fail closed on incomplete responses or unsupported lock entries.

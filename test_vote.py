@@ -70,6 +70,15 @@ class LoaderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected a 17-20 digit"):
                 vote.load_bot_ids()
 
+    def test_load_bot_ids_deduplicates_without_changing_order(self):
+        with patch.dict(os.environ, {"BOT_IDS": "830530156048285716\n12345678901234567\n830530156048285716"}):
+            self.assertEqual(vote.load_bot_ids(), ["830530156048285716", "12345678901234567"])
+
+    def test_load_bot_ids_rejects_non_ascii_digits(self):
+        with patch.dict(os.environ, {"BOT_IDS": "１" * 18}):
+            with self.assertRaises(ValueError):
+                vote.load_bot_ids()
+
 
 class CookieParamTests(unittest.TestCase):
     def test_host_prefixed_cookie_is_injected_without_domain(self):
@@ -1095,10 +1104,10 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
     @patch("vote.topgg_session_probe", new_callable=AsyncMock)
     @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock)
-    async def test_turnstile_is_cleared_before_session_probe(
+    async def test_widget_disappearance_without_application_skips_session_probe(
         self, page_hint, session_probe, _present, solver, _sleep, _settle, _print
     ):
-        page_hint.side_effect = ["unknown", "unknown"]
+        page_hint.return_value = "unknown"
         session_probe.return_value = {
             "authenticated": False,
             "status": 403,
@@ -1110,8 +1119,8 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
 
         solver.assert_awaited_once()
-        self.assertEqual(session_probe.await_count, 1)
-        self.assertEqual(page_hint.await_count, 2)
+        session_probe.assert_not_awaited()
+        self.assertEqual(page_hint.await_count, 1 + vote.AUTH_PAGE_SETTLE_POLLS)
 
     @patch("builtins.print")
     @patch("vote.settle_privacy_overlay", new_callable=AsyncMock)
@@ -1636,13 +1645,38 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
         process.kill = MagicMock()
         browser._process = process
         timeout_error = asyncio.TimeoutError()
-        with patch(
-            "vote.asyncio.wait_for",
-            new=AsyncMock(side_effect=[None, timeout_error, timeout_error]),
-        ):
+        outcomes = iter([None, timeout_error, timeout_error])
+
+        async def consume_then_timeout(coroutine, timeout):
+            await coroutine
+            outcome = next(outcomes)
+            if outcome is not None:
+                raise outcome
+
+        with patch("vote.asyncio.wait_for", side_effect=consume_then_timeout):
             with self.assertRaises(vote.BrowserCleanupError):
                 await vote.close_browser(browser)
         process.kill.assert_called_once()
+
+    async def test_forced_termination_still_deletes_profile(self):
+        browser = MagicMock()
+        browser.aclose = AsyncMock()
+        browser._process = MagicMock(returncode=None)
+        browser._process.wait = AsyncMock(side_effect=[asyncio.TimeoutError(), None])
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = os.path.join(directory, "profile")
+            os.mkdir(profile_path)
+            browser._security_profile_path = profile_path
+            with self.assertRaisesRegex(vote.BrowserCleanupError, "profile deleted"):
+                await vote.close_browser(browser)
+            self.assertFalse(os.path.exists(profile_path))
+        browser._process.kill.assert_called_once()
+
+    @patch("builtins.print")
+    @patch("vote.close_browser", new_callable=AsyncMock, side_effect=OSError("private-detail"))
+    async def test_unexpected_cleanup_error_cannot_discard_votes(self, _close, log):
+        self.assertFalse(await vote.close_browser_safely(MagicMock(), "account attempt"))
+        self.assertNotIn("private-detail", str(log.call_args_list))
 
     async def test_close_browser_deletes_explicit_profile(self):
         browser = MagicMock()
@@ -1746,6 +1780,18 @@ class FullOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ScreenshotPrivacyTests(unittest.IsolatedAsyncioTestCase):
+    @patch.object(vote, "TG_BOT_TOKEN", "")
+    @patch.object(vote, "TG_CHAT_ID", "")
+    @patch("vote.send_telegram_photo")
+    async def test_unconfigured_telegram_still_deletes_error_screenshot(self, send_photo):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "error.png")
+            with open(path, "wb") as file:
+                file.write(b"png")
+            await vote.notify_error_screenshot("111", path, "unconfirmed")
+            self.assertFalse(os.path.exists(path))
+        send_photo.assert_not_called()
+
     @patch.object(vote, "SEND_ERROR_SCREENSHOTS", False)
     async def test_error_screenshot_is_disabled_by_default(self):
         tab = AsyncMock()
