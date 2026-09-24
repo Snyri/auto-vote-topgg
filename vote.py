@@ -900,6 +900,14 @@ async def topgg_session_probe(tab: Any) -> dict:
                 jsonOk: false,
                 userPresent: false,
                 error: null,
+                cfMitigated: String(response.headers.get('cf-mitigated') || '')
+                    .slice(0, 40),
+                // Only the non-secret Cloudflare request correlation ID.
+                cfRay: String(response.headers.get('cf-ray') || '')
+                    .replace(/[^a-zA-Z0-9-]/g, '')
+                    .slice(0, 64),
+                server: String(response.headers.get('server') || '')
+                    .slice(0, 40),
             };
             if (!response.ok) return probe;
             try {
@@ -919,6 +927,9 @@ async def topgg_session_probe(tab: Any) -> dict:
                 jsonOk: false,
                 userPresent: false,
                 error: 'fetch:' + (error && error.name ? error.name : 'Error'),
+                cfMitigated: '',
+                cfRay: '',
+                server: '',
             };
         }
     })()""")
@@ -931,14 +942,34 @@ async def topgg_session_probe(tab: Any) -> dict:
             "jsonOk": isinstance(result, bool),
             "userPresent": bool(result),
             "error": "legacy-result",
+            "cfMitigated": "",
+            "cfRay": "",
+            "server": "",
         }
 
     raw_status = result.get("status")
     status = int(raw_status) if isinstance(raw_status, (int, float)) else None
     content_type = str(result.get("contentType") or "").lower()[:80]
     error = str(result.get("error") or "")[:80]
+    mitigated = str(result.get("cfMitigated") or "").lower()[:40]
+    cf_ray = re.sub(r"[^a-zA-Z0-9-]", "", str(result.get("cfRay") or ""))[:64]
+    server = str(result.get("server") or "").lower()[:40]
     json_ok = bool(result.get("jsonOk"))
     authenticated = bool(result.get("userPresent"))
+
+    if status in {403, 429}:
+        if mitigated == "challenge":
+            protection_reason = "cloudflare-challenge"
+        elif server == "cloudflare":
+            protection_reason = "cloudflare-server; actual blocking rule unknown"
+        else:
+            protection_reason = "unknown; could be application or edge"
+        # Never log response HTML, cookies, session data, or request headers.
+        print(
+            f"  🔍 Access denial diagnostic: status={status}, "
+            f"origin={protection_reason}, "
+            f"cf-ray={cf_ray or 'not-exposed'}"
+        )
 
     status_text = str(status) if status is not None else "?"
     content_text = content_type or "unknown"
@@ -969,6 +1000,9 @@ async def topgg_session_probe(tab: Any) -> dict:
         "content_type": content_type,
         "json_ok": json_ok,
         "error": error,
+        "cf_mitigated": mitigated,
+        "cf_ray": cf_ray,
+        "server": server,
     }
 
 

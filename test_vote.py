@@ -1040,13 +1040,42 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
             "jsonOk": False,
             "userPresent": False,
             "error": None,
+            "cfMitigated": "challenge",
+            "cfRay": "123abc-LHR",
+            "server": "cloudflare",
         }
 
         probe = await vote.topgg_session_probe(AsyncMock())
 
         self.assertEqual(probe["status"], 403)
         self.assertEqual(probe["content_type"], "text/html")
+        self.assertEqual(probe["cf_mitigated"], "challenge")
+        self.assertEqual(probe["cf_ray"], "123abc-LHR")
         self.assertTrue(vote.probe_looks_blocked(probe))
+
+    @patch("vote.evaluate", new_callable=AsyncMock)
+    @patch("builtins.print")
+    async def test_403_from_non_challenge_is_not_mislabeled_as_certain_waf(
+        self, log, evaluate
+    ):
+        evaluate.return_value = {
+            "ok": False,
+            "status": 403,
+            "contentType": "text/html",
+            "jsonOk": False,
+            "userPresent": False,
+            "error": None,
+            "server": "cloudflare",
+            "cfMitigated": "",
+            "cfRay": "not-a-secret",
+        }
+        probe = await vote.topgg_session_probe(AsyncMock())
+
+        self.assertEqual(probe["status"], 403)
+        message = "\\n".join(str(call) for call in log.call_args_list)
+        self.assertIn("actual blocking rule unknown", message)
+        self.assertNotIn("cloudflare-challenge", message)
+        self.assertNotIn("session token", message)
 
     @patch("builtins.print")
     @patch("vote.topgg_session_probe", new_callable=AsyncMock)
