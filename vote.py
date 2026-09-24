@@ -69,6 +69,8 @@ POST_VOTE_STRONG_MARKERS = (
 )
 POST_VOTE_VERIFY_ATTEMPTS = 2
 POST_VOTE_VERIFY_DELAY_SEC = 3
+POST_VOTE_CHALLENGE_SETTLE_POLLS = 2
+POST_VOTE_CHALLENGE_SETTLE_DELAY_SEC = 2
 COOLDOWN_PATTERN = re.compile(
     r"(?:you\s+)?can\s+vote\s+again\s+in\s+"
     r"(?:about\s+|approximately\s+)?"
@@ -1441,7 +1443,8 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
         await settle_privacy_overlay(tab)
 
-        if await is_turnstile_present(tab):
+        verification_challenged = await is_turnstile_present(tab)
+        if verification_challenged:
             if not await solve_turnstile(tab):
                 return await captcha_result(
                     tab,
@@ -1460,6 +1463,39 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
                 f"(persisted confirmation: {evidence})"
             )
             return successful_vote_result(bot_id)
+
+        if verification_challenged:
+            # Both #136 and #138 encountered a new challenge after each
+            # verification reload. Repeated navigation through protection
+            # creates more challenges without establishing whether the click
+            # persisted. Observe the *already reloaded* page briefly instead.
+            for settle_attempt in range(1, POST_VOTE_CHALLENGE_SETTLE_POLLS + 1):
+                print(
+                    f"  → Rechecking the verified page without another reload "
+                    f"({settle_attempt}/{POST_VOTE_CHALLENGE_SETTLE_POLLS})..."
+                )
+                await asyncio.sleep(POST_VOTE_CHALLENGE_SETTLE_DELAY_SEC)
+                await settle_privacy_overlay(tab)
+                if await is_turnstile_present(tab):
+                    print("  ⏳ Protection returned during vote verification")
+                    break
+                last_confirmation = await persisted_vote_confirmation(tab, bot_id)
+                if last_confirmation.get("confirmed"):
+                    evidence = str(last_confirmation.get("evidence") or "server state")
+                    print(
+                        f"  ✅ Successfully voted for {bot_id} "
+                        f"(persisted confirmation: {evidence})"
+                    )
+                    return successful_vote_result(bot_id)
+
+            # Do not trust the same DOM as the Vote click. The first reload
+            # already supplied independent evidence; if it remains ambiguous
+            # after a challenge, let the existing browser retry read cooldown.
+            print(
+                "  ⏳ Challenged verification remains inconclusive; "
+                "avoiding a second protection-triggering reload"
+            )
+            break
 
         if last_confirmation.get("vote_enabled"):
             print(
@@ -1495,7 +1531,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         await notify_error_screenshot(
             bot_id,
             path,
-            "Vote did not persist after server-side verification",
+            "Vote outcome unconfirmed after independent page verification",
         )
     detail = (
         "Vote still available after post-click verification"

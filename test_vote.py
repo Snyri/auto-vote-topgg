@@ -685,6 +685,62 @@ class AmbiguousVoteVerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tab.reload.await_count, 2)
 
 
+class ChallengedVoteVerificationTests(unittest.IsolatedAsyncioTestCase):
+    async def _run_challenged_verification(self, confirmations):
+        # There are two pre-vote checks, one post-click check, one reload
+        # check, and up to two read-only follow-up checks on the same page.
+        presence = [False, False, False, True, False, False]
+        with (
+            patch("builtins.print"),
+            patch("vote.asyncio.sleep", new_callable=AsyncMock),
+            patch("vote.settle_privacy_overlay", new_callable=AsyncMock),
+            patch("vote.is_turnstile_present", new_callable=AsyncMock, side_effect=presence),
+            patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True) as solver,
+            patch("vote._click_marked", new_callable=AsyncMock, return_value=True),
+            patch("vote.mark_vote_button", new_callable=AsyncMock, return_value={"found": True, "disabled": False}),
+            patch("vote.wait_for_ad", new_callable=AsyncMock, return_value=None),
+            patch("vote.evaluate", new_callable=AsyncMock, return_value="Voting for bot"),
+            patch("vote.current_url", new_callable=AsyncMock, return_value="https://top.gg/bot/111/vote"),
+            patch("vote.body_text", new_callable=AsyncMock, return_value="ready to vote"),
+            patch("vote.browser_screenshot", new_callable=AsyncMock, return_value=None),
+            patch("vote.persisted_vote_confirmation", new_callable=AsyncMock, side_effect=confirmations) as confirm,
+        ):
+            tab = AsyncMock()
+            result = await vote.vote_for_bot(tab, "111", "account")
+            self.assertEqual(tab.reload.await_count, 1)
+            solver.assert_awaited_once_with(tab)
+            return result, confirm.await_count
+
+    async def test_challenged_reload_can_confirm_after_same_page_settling(self):
+        ambiguous = {
+            "confirmed": False,
+            "evidence": None,
+            "vote_enabled": False,
+            "exact_vote_page": True,
+            "login_required": False,
+        }
+        confirmed = {**ambiguous, "confirmed": True, "evidence": "bounded cooldown"}
+        result, checks = await self._run_challenged_verification(
+            [ambiguous, confirmed]
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(checks, 2)
+
+    async def test_persistent_challenged_ambiguity_does_not_claim_success_or_reload(self):
+        ambiguous = {
+            "confirmed": False,
+            "evidence": None,
+            "vote_enabled": False,
+            "exact_vote_page": True,
+            "login_required": False,
+        }
+        result, checks = await self._run_challenged_verification(
+            [ambiguous, ambiguous, ambiguous]
+        )
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(checks, 3)
+
+
 class MainExitTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.consume_secret")
     @patch("builtins.print")

@@ -40,3 +40,5 @@
 
 - More verification is not automatically safer. After the #132 regression, require one independent persisted reload with exact-page/no-login/no-enabled-Vote checks; use a second reload only when the first result is ambiguous. This preserves false-positive protection without unnecessarily multiplying Cloudflare challenges.
 - Cooldown parsing must sum compound durations (for example `10 hours 59 minutes`); using only the first component can schedule the next attempt almost an hour early.
+
+- Runs #136 and #138 showed that verification reloads can trigger recurring protection challenges even after a real vote. After an independent reload encounters a challenge, briefly observe the same reloaded page without another reload; if still ambiguous, retain `uncertain` and let the existing retry check for cooldown. Never turn an unverified click into `success`.
