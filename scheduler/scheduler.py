@@ -90,8 +90,34 @@ def list_vote_runs(per_page=20):
 
 
 def latest_vote_run():
-    runs = list_vote_runs(1)
-    return runs[0] if runs else None
+    # Do not assume that a single API result is the newest run: a stale
+    # result once moved the schedule backwards from #138 to #136.
+    runs = list_vote_runs(20)
+    valid = [run for run in runs if type(run.get("id")) is int]
+    return max(valid, key=lambda run: run["id"]) if valid else None
+
+
+def latest_prior_success_schedule(run_id, now=None):
+    """Preserve a still-future confirmed schedule after a newer failed run.
+
+    A failed early workflow can produce a short retry artifact, but it must
+    not override a future schedule from the most recent successful run.
+    """
+    now = time.time() if now is None else now
+    successful = [
+        run for run in list_vote_runs(20)
+        if type(run.get("id")) is int
+        and run["id"] < run_id
+        and run.get("status") == "completed"
+        and run.get("conclusion") == "success"
+    ]
+    if not successful:
+        return None
+    newest_success = max(successful, key=lambda run: run["id"])
+    scheduled = next_vote_at_from_run(newest_success["id"])
+    if scheduled is not None and scheduled > now:
+        return newest_success["id"], scheduled
+    return None
 
 
 def get_run(run_id):
@@ -321,9 +347,19 @@ def resolve_schedule():
                 run = wait_for_run(int(run["id"]))
 
             if run:
+                if run.get("conclusion") not in {None, "success"}:
+                    guarded = latest_prior_success_schedule(int(run["id"]))
+                    if guarded is not None:
+                        log(
+                            f"Retaining future schedule from successful run "
+                            f"{guarded[0]}; failed run {run['id']} cannot "
+                            f"bring the next dispatch forward"
+                        )
+                        return guarded
+
                 next_at = next_vote_at_from_run(int(run["id"]))
                 if next_at is not None:
-                    return next_at
+                    return int(run["id"]), next_at
 
                 if run.get("conclusion") not in {"success", "neutral", "skipped"}:
                     log(
@@ -343,7 +379,7 @@ def resolve_schedule():
 
             next_at = next_vote_at_from_run(run_id)
             if next_at is not None:
-                return next_at
+                return int(run_id), next_at
 
             log(
                 f"No next-vote artifact; retrying in "
@@ -363,15 +399,20 @@ def latest_schedule_target():
     run = latest_vote_run()
     if not run or run.get("status") != "completed":
         return None
+    if run.get("conclusion") not in {None, "success"}:
+        guarded = latest_prior_success_schedule(int(run["id"]))
+        if guarded is not None:
+            return guarded
     next_at = next_vote_at_from_run(int(run["id"]))
     if next_at is None:
         return None
     return int(run["id"]), next_at
 
 
-def wait_until(epoch):
-    """Wait for target while allowing newer workflow artifacts to supersede it."""
+def wait_until(epoch, source_run_id=None):
+    """Never replace an accepted schedule with an artifact from an older run."""
     current_epoch = epoch
+    current_source = source_run_id
     next_refresh = 0.0
 
     while True:
@@ -386,19 +427,26 @@ def wait_until(epoch):
                 latest = latest_schedule_target()
                 if latest is not None:
                     run_id, refreshed_epoch = latest
-                    if refreshed_epoch != current_epoch:
-                        old_target = datetime.fromtimestamp(
-                            current_epoch, timezone.utc
-                        ).isoformat(timespec="seconds")
-                        new_target = datetime.fromtimestamp(
-                            refreshed_epoch, timezone.utc
-                        ).isoformat(timespec="seconds")
+                    if current_source is not None and run_id < current_source:
                         log(
-                            f"Schedule refreshed from run {run_id}: "
-                            f"{old_target} -> {new_target}"
+                            f"Ignoring stale schedule from run {run_id}; "
+                            f"current source is run {current_source}"
                         )
-                        current_epoch = refreshed_epoch
-                        continue
+                    else:
+                        current_source = run_id
+                        if refreshed_epoch != current_epoch:
+                            old_target = datetime.fromtimestamp(
+                                current_epoch, timezone.utc
+                            ).isoformat(timespec="seconds")
+                            new_target = datetime.fromtimestamp(
+                                refreshed_epoch, timezone.utc
+                            ).isoformat(timespec="seconds")
+                            log(
+                                f"Schedule refreshed from run {run_id}: "
+                                f"{old_target} -> {new_target}"
+                            )
+                            current_epoch = refreshed_epoch
+                            continue
             except Exception as exc:
                 log(
                     f"Schedule refresh error: "
@@ -432,16 +480,29 @@ def main():
     )
 
     while True:
-        next_at = resolve_schedule()
+        schedule_run_id, next_at = resolve_schedule()
         target = datetime.fromtimestamp(
             next_at,
             timezone.utc,
         ).isoformat(timespec="seconds")
-        log(f"Next vote target: {target}")
+        log(f"Next vote target: {target} (source run {schedule_run_id})")
 
-        next_at = wait_until(next_at)
+        next_at = wait_until(next_at, source_run_id=schedule_run_id)
 
         try:
+            # Close the race between the last refresh and the dispatch.
+            # An updated successful schedule must supersede a now-stale timer.
+            latest = latest_schedule_target()
+            if (
+                latest is not None
+                and latest[0] >= schedule_run_id
+                and latest[1] > time.time() + 1
+            ):
+                log(
+                    f"Skipping dispatch: run {latest[0]} has a newer "
+                    f"future target"
+                )
+                continue
             log(
                 "Vote target reached; "
                 "dispatching GitHub workflow"

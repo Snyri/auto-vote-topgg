@@ -42,3 +42,5 @@
 - Cooldown parsing must sum compound durations (for example `10 hours 59 minutes`); using only the first component can schedule the next attempt almost an hour early.
 
 - Runs #136 and #138 showed that verification reloads can trigger recurring protection challenges even after a real vote. After an independent reload encounters a challenge, briefly observe the same reloaded page without another reload; if still ambiguous, retain `uncertain` and let the existing retry check for cooldown. Never turn an unverified click into `success`.
+
+- 2026-09-24 Northflank logs identified a scheduler regression: while waiting for #138's 20:24:52 UTC target, the API unexpectedly surfaced older #136 with an expired 08:15:15 UTC target. The unguarded refresh immediately dispatched #139; its protection retry created #140. Track the source run ID and refuse older refreshes, sort fetched runs by ID, and prevent a new failed run's short retry artifact from advancing the last successful run's still-future target. Recheck before dispatch and test regression/restart/expiry; redeploy Northflank for changes to take effect.

@@ -149,6 +149,87 @@ class ScheduleRefreshTests(unittest.TestCase):
         next_vote.assert_called_once_with(133)
 
 
+    @patch.object(scheduler, "list_vote_runs")
+    def test_latest_run_uses_max_id_not_stale_first_result(self, list_runs):
+        list_runs.return_value = [
+            {"id": 136, "status": "completed"},
+            {"id": 138, "status": "completed"},
+            {"id": 137, "status": "completed"},
+        ]
+        self.assertEqual(scheduler.latest_vote_run()["id"], 138)
+        list_runs.assert_called_once_with(20)
+
+    @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_040_000)
+    @patch.object(scheduler, "list_vote_runs")
+    def test_failed_run_cannot_advance_still_future_success_schedule(
+        self, list_runs, artifact
+    ):
+        list_runs.return_value = [
+            {"id": 140, "status": "completed", "conclusion": "failure"},
+            {"id": 136, "status": "completed", "conclusion": "success"},
+            {"id": 138, "status": "completed", "conclusion": "success"},
+        ]
+        with patch.object(scheduler.time, "time", return_value=2_000_000_000):
+            target = scheduler.latest_prior_success_schedule(140)
+        self.assertEqual(target, (138, 2_000_040_000))
+        artifact.assert_called_once_with(138)
+
+    @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_000_000)
+    @patch.object(scheduler, "list_vote_runs")
+    def test_prior_success_guard_expires_at_original_target(self, list_runs, artifact):
+        list_runs.return_value = [
+            {"id": 138, "status": "completed", "conclusion": "success"},
+        ]
+        self.assertIsNone(scheduler.latest_prior_success_schedule(140, 2_000_000_001))
+        artifact.assert_called_once_with(138)
+
+    @patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 2_000_040_000))
+    @patch.object(scheduler, "latest_vote_run", return_value={
+        "id": 140, "status": "completed", "conclusion": "failure"
+    })
+    @patch.object(scheduler, "next_vote_at_from_run")
+    def test_refresh_ignores_failed_retry_before_prior_success_cooldown(
+        self, artifact, latest_run, prior_success
+    ):
+        self.assertEqual(scheduler.latest_schedule_target(), (138, 2_000_040_000))
+        artifact.assert_not_called()
+        prior_success.assert_called_once_with(140)
+
+    @patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 2_000_040_000))
+    @patch.object(scheduler, "latest_vote_run", return_value={
+        "id": 140, "status": "completed", "conclusion": "failure"
+    })
+    @patch.object(scheduler, "next_vote_at_from_run")
+    def test_restart_retains_success_target_after_short_failed_retry(
+        self, artifact, latest_run, prior_success
+    ):
+        with patch.object(scheduler, "log"):
+            self.assertEqual(scheduler.resolve_schedule(), (138, 2_000_040_000))
+        artifact.assert_not_called()
+        prior_success.assert_called_once_with(140)
+
+    @patch.object(scheduler, "latest_schedule_target", return_value=(136, 2_000_000_100))
+    def test_wait_ignores_older_run_even_if_its_target_is_past(self, refresh):
+        clock = [2_000_000_000]
+        target = 2_000_000_120
+        with (
+            patch.object(scheduler.time, "time", side_effect=lambda: clock[0]),
+            patch.object(scheduler.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(
+                scheduler.time, "sleep",
+                side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+            ),
+            patch.object(scheduler, "log") as logs,
+        ):
+            self.assertEqual(
+                scheduler.wait_until(target, source_run_id=138), target
+            )
+        self.assertGreaterEqual(clock[0], target)
+        self.assertTrue(
+            any("Ignoring stale schedule" in str(call) for call in logs.call_args_list)
+        )
+
+
 class ArtifactValidationTests(unittest.TestCase):
     @patch.object(scheduler, "api")
     def test_next_vote_artifact_rejects_unexpected_json_fields(self, api):
