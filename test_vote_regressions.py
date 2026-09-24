@@ -266,7 +266,7 @@ class AuthenticationEvidenceRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, vote.AUTHENTICATED)
         probe.assert_not_awaited()
 
-    async def test_post_challenge_unknown_page_defers_without_fetching_a_session(self):
+    async def test_post_challenge_unknown_page_can_authenticate_via_bounded_session_probe(self):
         with (
             patch("builtins.print"),
             patch("vote.asyncio.sleep", new_callable=AsyncMock),
@@ -275,11 +275,13 @@ class AuthenticationEvidenceRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch("vote.topgg_page_auth_hint", new=AsyncMock(return_value="unknown")),
             patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
             patch("vote.solve_turnstile", new=AsyncMock(return_value=True)),
-            patch("vote.topgg_session_probe", new_callable=AsyncMock) as probe,
+            patch("vote.topgg_session_probe", new=AsyncMock(return_value={
+                "authenticated": True, "status": 200, "json_ok": True,
+            })) as probe,
         ):
             state = await vote.topgg_auth_state(MagicMock())
-        self.assertEqual(state, vote.AUTH_BLOCKED)
-        probe.assert_not_awaited()
+        self.assertEqual(state, vote.AUTHENTICATED)
+        probe.assert_awaited_once()
 
 
 class PersistentChallengeClassificationTests(unittest.IsolatedAsyncioTestCase):
@@ -515,7 +517,7 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(expected=expected, fixture=fixture):
                     self.assertIs((await self.execute_expression(expression, fixture))["value"], expected)
 
-    async def test_managed_challenge_titles_dom_and_body_are_detected(self):
+    async def test_interstitial_shell_alone_does_not_claim_an_active_widget(self):
         expression = await self.capture_expression(vote.is_turnstile_present)
         fixtures = [
             {"title": "Just a moment..."},
@@ -525,14 +527,16 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
             {"selectors": ["#challenge-form"]},
             {"body": "Performing security verification"},
             {"body": "top.gg needs to review the security of your connection"},
-            {"selectors": ['iframe[src*="challenges.cloudflare.com"]']},
         ]
         for fixture in fixtures:
             with self.subTest(fixture=fixture):
-                self.assertTrue((await self.execute_expression(expression, fixture))["value"])
+                self.assertFalse((await self.execute_expression(expression, fixture))["value"])
         self.assertFalse((await self.execute_expression(expression, {"body": "Welcome to top.gg"}))["value"])
+        self.assertTrue((await self.execute_expression(expression, {
+            "selectors": ['iframe[src*="challenges.cloudflare.com"]'],
+        }))["value"])
 
-    async def test_vote_surface_on_challenge_loading_or_foreign_page_is_not_authenticated(self):
+    async def test_residual_challenge_markers_do_not_hide_a_usable_vote_surface(self):
         expression = await self.capture_expression(vote.topgg_page_auth_hint)
         vote_surface = {"controls": [{"text": "Vote"}]}
         fixtures = [
@@ -541,15 +545,22 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
             {"selectors": ["#challenge-form"]},
             {"body": "Performing security verification"},
             {"body": "top.gg needs to review the security of your connection"},
-            {"readyState": "loading"},
-            {"hostname": "top.gg.example.com"},
-            {"hostname": "other.top.gg"},
-            {"protocol": "http:"},
         ]
         for fixture in fixtures:
             with self.subTest(fixture=fixture):
                 result = (await self.execute_expression(expression, {**vote_surface, **fixture}))["value"]
-                self.assertEqual(result, "unknown")
+                self.assertEqual(result, vote.AUTHENTICATED)
+                # The same title or shell without a usable application control
+                # cannot establish authentication on its own.
+                self.assertEqual((await self.execute_expression(expression, fixture))["value"], "unknown")
+        for fixture in (
+            {"readyState": "loading"}, {"hostname": "top.gg.example.com"},
+            {"hostname": "other.top.gg"}, {"protocol": "http:"},
+        ):
+            with self.subTest(fixture=fixture):
+                self.assertEqual((await self.execute_expression(expression, {
+                    **vote_surface, **fixture,
+                }))["value"], "unknown")
         self.assertEqual((await self.execute_expression(expression, vote_surface))["value"], vote.AUTHENTICATED)
         self.assertEqual((await self.execute_expression(expression, {
             "controls": [{"text": "Vote", "visible": False}],

@@ -1104,7 +1104,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
     @patch("vote.topgg_session_probe", new_callable=AsyncMock)
     @patch("vote.topgg_page_auth_hint", new_callable=AsyncMock)
-    async def test_widget_disappearance_without_application_skips_session_probe(
+    async def test_widget_disappearance_with_403_session_remains_blocked(
         self, page_hint, session_probe, _present, solver, _sleep, _settle, _print
     ):
         page_hint.return_value = "unknown"
@@ -1119,7 +1119,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await vote.topgg_auth_state(AsyncMock()), vote.AUTH_BLOCKED)
 
         solver.assert_awaited_once()
-        session_probe.assert_not_awaited()
+        session_probe.assert_awaited_once()
         self.assertEqual(page_hint.await_count, 1 + vote.AUTH_PAGE_SETTLE_POLLS)
 
     @patch("builtins.print")
