@@ -1590,20 +1590,41 @@ async def mark_vote_button(tab: Any) -> dict:
         const visible = (el) => Boolean(
             el && (el.getClientRects().length || el.offsetWidth || el.offsetHeight)
         );
-        const controls = [...document.querySelectorAll('button, [role="button"], a')];
-        const button = controls.find(el =>
+        // Plain anchors navigate to the public vote page; they do not submit
+        // a vote. Prefer an enabled action when disabled copies precede it.
+        const controls = [...document.querySelectorAll('button, [role="button"]')];
+        const candidates = controls.filter(el =>
             visible(el) &&
-            (el.textContent || '').trim().toLowerCase() === 'vote'
+            (el.textContent || '').trim().toLowerCase() === 'vote' &&
+            (el.tagName.toLowerCase() !== 'a' || !(el.getAttribute('href') || '').trim() ||
+                (el.getAttribute('href') || '').trim().startsWith('#'))
         );
-        if (!button) return {found: false, disabled: true, visible: false};
-        const disabled = Boolean(
-            button.disabled ||
-            button.getAttribute('aria-disabled') === 'true' ||
-            button.hasAttribute('disabled')
+        const isDisabled = el => Boolean(
+            el.disabled || el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled')
         );
+        const button = candidates.find(el => !isDisabled(el)) || candidates[0];
+        if (!button) return {
+            found: false, disabled: true, visible: false,
+            target_kind: 'unknown', candidate_count: 0,
+        };
+        const disabled = isDisabled(button);
         button.setAttribute('data-auto-vote', '1');
-        return {found: true, disabled, visible: true};
+        return {
+            found: true, disabled, visible: true,
+            target_kind: button.tagName.toLowerCase() === 'button' ? 'native_button' : 'role_button',
+            candidate_count: Math.min(candidates.length, 20),
+        };
     })()""") or {})
+
+
+def vote_target_diagnostic(state: dict) -> str:
+    """Expose only fixed control categories and a bounded count from the DOM."""
+    target_kind = state.get("target_kind")
+    if not isinstance(target_kind, str) or target_kind not in {"native_button", "role_button"}:
+        target_kind = "unknown"
+    count = state.get("candidate_count")
+    count = min(max(count, 0), 20) if type(count) is int else "unknown"
+    return f"Vote target selected: kind={target_kind}, candidates={count}"
 
 
 async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> dict:
@@ -1702,6 +1723,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         return {"bot_id": bot_id, "status": "error", "detail": detail}
 
     before_click = await vote_page_confirmation(tab, bot_id)
+    print(f"  → {vote_target_diagnostic(state)}")
     print("  → Clicking Vote...")
     try:
         if not await _click_marked(tab, "data-auto-vote"):

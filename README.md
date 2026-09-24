@@ -210,11 +210,21 @@ Completed per-bot results survive later browser failures and authentication fail
 
 `error`, `auth_failed`, `uncertain`, or `captcha_required` sends its report first, then exits non-zero so GitHub Actions shows failure.
 
+### Inspect the page without voting
+
+In GitHub **Actions**, select **Inspect vote page (no submission)**, choose **Run workflow**, and run it on `master`. This manual diagnostic needs only the existing `BOT_IDS` and `TOPGG_COOKIES_JSON` secrets. It uses the first configured cookie session and the first bot, opens that vote page once, and records three observations before one bounded session check. It shares the voting workflow's concurrency group, so the two do not run simultaneously.
+
+The diagnostic does not click Vote, start OAuth, solve a CAPTCHA, send Telegram messages, capture screenshots, or write the scheduler's `next-vote` artifact. It may dismiss the cookie-consent overlay. Logs contain fixed page/control categories, boolean signals, bounded counts and cooldown durations, and the existing credential-free HTTP denial metadata. They do not include cookie values, raw page text, account identifiers, or control URLs.
+
+A green inspection means that observation completed; it does not mean that voting or authentication succeeded. A challenge page and a `403` session response confirm an access block during that inspection, but do not establish why another run failed or whether a cookie was revoked. The expired-cookie flag checks explicit expiry timestamps only; a false value does not validate the session. Because this workflow intentionally leaves CAPTCHA verification untouched, its result also cannot predict whether the regular voting workflow will clear a challenge.
+
 ## Project Structure
 
 ```text
 auto-vote-topgg/
 ├── vote.py                          # Auth, vote, cooldown state, report, browser lifecycle
+├── inspect_vote_page.py             # Manual page/session observation without submitting votes
+├── test_inspect_vote_page.py        # Inspection privacy and no-submission checks
 ├── test_vote.py                     # Vote/auth/browser unit and regression tests
 ├── test_vote_regressions.py         # Partial results, bounded probes, browser-script regressions
 ├── test_scheduler.py                # Scheduler validation and dispatch regression tests
@@ -232,6 +242,7 @@ auto-vote-topgg/
 │   ├── CODEOWNERS                   # Sensitive-file ownership
 │   ├── dependabot.yml               # Weekly pip/Actions updates
 │   └── workflows/
+│       ├── inspect-vote.yml         # Manual diagnostic; no vote or scheduler artifacts
 │       ├── security.yml             # Tests, syntax checks, dependency audit
 │       └── vote.yml                 # Secret handoff, vote, artifacts, cleanup
 └── .gitignore

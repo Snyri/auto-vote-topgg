@@ -2,10 +2,6 @@ name: Inspect vote page (no submission)
 
 on:
   workflow_dispatch:
-  # Temporary diagnostic trigger; remove after collecting the first live result.
-  push:
-    branches: [master]
-    paths: ['.github/workflows/inspect-vote.yml']
 
 permissions: {}
 
