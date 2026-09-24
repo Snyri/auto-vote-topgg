@@ -1106,7 +1106,7 @@ async def topgg_auth_state(tab: Any) -> str:
     if await is_turnstile_present(tab):
         print("  → top.gg protection is active; clearing it before session validation")
         if not await solve_turnstile(tab):
-            return AUTH_CAPTCHA_REQUIRED
+            return await unresolved_challenge_auth_state(tab)
         await asyncio.sleep(2)
         await settle_privacy_overlay(tab)
 
@@ -1185,7 +1185,7 @@ async def _handle_discord_oauth(tab: Any) -> str:
         if url_has_domain(await current_url(tab), "top.gg"):
             return AUTHENTICATED
         if await is_turnstile_present(tab) and not await solve_turnstile(tab):
-            return AUTH_CAPTCHA_REQUIRED
+            return await unresolved_challenge_auth_state(tab)
         marker = "data-auto-oauth"
         if await _mark_exact_element(tab, "button", ["Authorize", "Authorise"], marker):
             if await _click_marked(tab, marker):
@@ -1256,7 +1256,7 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
         return AUTH_INVALID
     if not await wait_for_domain(tab, "discord.com", TIMEOUT_OAUTH_SEC):
         if await is_turnstile_present(tab) and not await solve_turnstile(tab):
-            return AUTH_CAPTCHA_REQUIRED
+            return await unresolved_challenge_auth_state(tab)
         print("  ❌ Discord OAuth page did not open")
         return AUTH_INVALID
     if "/oauth2/authorize" not in urlparse(await current_url(tab)).path:
@@ -1264,14 +1264,14 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
         return AUTH_INVALID
 
     oauth_state = await _handle_discord_oauth(tab)
-    if oauth_state == AUTH_CAPTCHA_REQUIRED:
+    if oauth_state in {AUTH_CAPTCHA_REQUIRED, AUTH_BLOCKED}:
         return oauth_state
     if oauth_state != AUTHENTICATED:
         print("  ❌ Could not authorize top.gg")
         return AUTH_INVALID
     if not await wait_for_domain(tab, "top.gg", TIMEOUT_OAUTH_SEC):
         if await is_turnstile_present(tab) and not await solve_turnstile(tab):
-            return AUTH_CAPTCHA_REQUIRED
+            return await unresolved_challenge_auth_state(tab)
         print("  ❌ OAuth redirect failed")
         return AUTH_INVALID
 
@@ -1280,6 +1280,31 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
     state = await topgg_auth_state(tab)
     print("  ✅ Logged into top.gg" if state == AUTHENTICATED else "  ❌ top.gg session not established")
     return state
+
+
+async def is_cloudflare_challenge_page(tab: Any) -> bool:
+    """Recognize a full-page access gate, independently of embedded widgets."""
+    result = await evaluate(tab, """(() => {
+        const body = document.body ? document.body.innerText.toLowerCase() : '';
+        const title = (document.title || '').trim().toLowerCase();
+        return Boolean(
+            title.startsWith('just a moment') ||
+            title.startsWith('attention required') ||
+            document.querySelector('#challenge-running, #challenge-stage, #challenge-form') ||
+            body.includes('performing security verification') ||
+            body.includes('needs to review the security of your connection')
+        );
+    })()""")
+    return result is True
+
+
+async def unresolved_challenge_auth_state(tab: Any) -> str:
+    # The broad challenge detector also recognizes Cloudflare interstitials.
+    # A timeout there does not establish that a manual CAPTCHA is required.
+    if await is_cloudflare_challenge_page(tab):
+        print("  ⏳ Cloudflare challenge page remains active; access is blocked")
+        return AUTH_BLOCKED
+    return AUTH_CAPTCHA_REQUIRED
 
 
 async def is_turnstile_present(tab: Any) -> bool:
@@ -1363,6 +1388,26 @@ async def captcha_result(
     return result
 
 
+async def unresolved_challenge_result(
+    tab: Any,
+    bot_id: str,
+    detail: str,
+    account_id: str = "unknown",
+    *,
+    after_vote: bool = False,
+) -> dict:
+    """Keep persistent interstitials separate from standalone CAPTCHA outcomes."""
+    if await unresolved_challenge_auth_state(tab) == AUTH_BLOCKED:
+        blocked_detail = (
+            "Cloudflare security challenge persisted; vote outcome remains unverified"
+            if after_vote
+            else "Cloudflare security challenge persisted; access denied before Vote"
+        )
+        print(f"  ⏳ {blocked_detail} for {bot_id}")
+        return {"bot_id": bot_id, "status": "blocked", "detail": blocked_detail}
+    return await captcha_result(tab, bot_id, detail, account_id)
+
+
 async def wait_for_ad(tab: Any, bot_id: str) -> dict | None:
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     while asyncio.get_running_loop().time() < deadline:
@@ -1431,7 +1476,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     if await is_turnstile_present(tab):
         turnstile_cycles += 1
         if not await solve_turnstile(tab):
-            return await captcha_result(
+            return await unresolved_challenge_result(
                 tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
             )
         await asyncio.sleep(2)
@@ -1453,7 +1498,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
                 "detail": "Repeated protection challenge before Vote became available",
             }
         if not await solve_turnstile(tab):
-            return await captcha_result(
+            return await unresolved_challenge_result(
                 tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
             )
         await asyncio.sleep(2)
@@ -1477,7 +1522,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
                     "detail": "Repeated protection challenge before Vote became available",
                 }
             if not await solve_turnstile(tab):
-                return await captcha_result(
+                return await unresolved_challenge_result(
                     tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
                 )
             await asyncio.sleep(2)
@@ -1503,11 +1548,12 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
 
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
-            return await captcha_result(
+            return await unresolved_challenge_result(
                 tab,
                 bot_id,
                 "CAPTCHA still required after solver attempt following Vote click",
                 account_id,
+                after_vote=True,
             )
         await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 
@@ -1529,11 +1575,12 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         verification_challenged = await is_turnstile_present(tab)
         if verification_challenged:
             if not await solve_turnstile(tab):
-                return await captcha_result(
+                return await unresolved_challenge_result(
                     tab,
                     bot_id,
                     "CAPTCHA still required after solver attempt during vote verification",
                     account_id,
+                    after_vote=True,
                 )
             await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
             await settle_privacy_overlay(tab)
