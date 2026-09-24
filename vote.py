@@ -342,7 +342,10 @@ def is_captcha_related_result(result: dict) -> bool:
 
 
 def is_retryable_result(result: dict) -> bool:
-    return result.get("status") in TRANSIENT_STATUSES
+    return (
+        result.get("vote_submitted") is not True
+        and result.get("status") in TRANSIENT_STATUSES
+    )
 
 
 def retryable_bot_ids(results: list[dict]) -> list[str]:
@@ -462,6 +465,83 @@ async def persisted_vote_confirmation(tab: Any, bot_id: str) -> dict:
     }
 
 
+async def vote_page_confirmation(tab: Any, bot_id: str) -> dict:
+    """Observe application acknowledgement without navigation or extra requests."""
+    unknown = {"observed": False, "confirmed": False, "evidence": None}
+    script = """(() => {
+        const text = document.body ? document.body.innerText : '';
+        const body = text.toLowerCase();
+        const title = (document.title || '').trim().toLowerCase();
+        const visible = node => {
+            if (!node || !(node.getClientRects().length || node.offsetWidth || node.offsetHeight)) return false;
+            const style = getComputedStyle(node);
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+                style.visibility !== 'collapse' && style.opacity !== '0';
+        };
+        const controls = [...document.querySelectorAll('button, [role="button"]')];
+        const gates = [...document.querySelectorAll(
+            '#challenge-running, #challenge-stage, #challenge-form'
+        )];
+        const widgets = [...document.querySelectorAll([
+            'iframe[src*="challenges.cloudflare.com"]', 'iframe[src*="hcaptcha.com"]',
+            'iframe[src*="recaptcha"]', '.cf-turnstile', '.h-captcha', '.g-recaptcha'
+        ].join(','))];
+        return {
+            text: text.slice(0, 250000),
+            exact_vote_page: location.protocol === 'https:' &&
+                ['top.gg', 'www.top.gg'].includes(location.hostname) &&
+                location.pathname.replace(/\\/+$/, '') === '/bot/' + __BOT_ID__ + '/vote',
+            ready: document.readyState === 'complete' || document.readyState === 'interactive',
+            vote_enabled: controls.some(node => visible(node) &&
+                (node.textContent || '').trim().toLowerCase() === 'vote' &&
+                !node.disabled && !node.hasAttribute('disabled') &&
+                node.getAttribute('aria-disabled') !== 'true'),
+            challenge: title.startsWith('just a moment') || title.startsWith('attention required') ||
+                body.includes('performing security verification') ||
+                body.includes('needs to review the security of your connection') ||
+                body.includes('verify you are human') || body.includes('complete the captcha') ||
+                body.includes('please solve the captcha to continue') ||
+                widgets.some(visible) || gates.some(visible),
+            login_required: body.includes('must be logged in') ||
+                body.includes('login to vote') || body.includes('log in to vote'),
+            error_present: body.includes('failed to vote') || body.includes('vote failed') ||
+                body.includes('something went wrong') || body.includes('please try again')
+        };
+    })()""".replace("__BOT_ID__", json.dumps(bot_id))
+    try:
+        result = await asyncio.wait_for(evaluate(tab, script), timeout=2)
+    except Exception:
+        return unknown
+    flags = ("exact_vote_page", "ready", "vote_enabled", "challenge", "login_required", "error_present")
+    if (not isinstance(result, dict) or not isinstance(result.get("text"), str)
+            or not all(isinstance(result.get(key), bool) for key in flags)):
+        return unknown
+    evidence = vote_success_evidence(result["text"])
+    return {
+        "observed": result["exact_vote_page"] and result["ready"],
+        "evidence": evidence,
+        "confirmed": bool(evidence) and result["exact_vote_page"] and result["ready"]
+        and not any(result[key] for key in ("vote_enabled", "challenge", "login_required", "error_present")),
+    }
+
+
+async def confirm_vote_without_reload(tab: Any, bot_id: str, before: dict) -> bool:
+    """Require a new, stable acknowledgement after the specific Vote click."""
+    if before.get("observed") is not True or before.get("evidence") is not None:
+        return False
+    previous_evidence = None
+    for attempt in range(4):
+        snapshot = await vote_page_confirmation(tab, bot_id)
+        evidence = snapshot.get("evidence") if snapshot.get("confirmed") is True else None
+        if evidence is not None and evidence == previous_evidence:
+            print(f"  ✅ Vote acknowledged on the current page for {bot_id} ({evidence})")
+            return True
+        previous_evidence = evidence
+        if attempt < 3:
+            await asyncio.sleep(2)
+    return False
+
+
 def successful_vote_result(bot_id: str) -> dict:
     confirmed_at = int(datetime.now(timezone.utc).timestamp())
     return {
@@ -558,11 +638,17 @@ def write_browser_startup_retry_state(
 
 
 def should_request_protection_retry(all_results: list[list[dict]]) -> bool:
-    return any(
-        result.get("status") == "blocked"
-        for account_results in all_results
-        for result in account_results
-    )
+    results = [result for account_results in all_results for result in account_results]
+    # A fresh workflow processes every configured account/bot. Without a
+    # cross-run submission ledger it must not repeat an unconfirmed submission,
+    # even when another bot was blocked before its own Vote click.
+    if any(
+        result.get("vote_submitted") is True
+        and result.get("status") not in COMPLETED_STATUSES
+        for result in results
+    ):
+        return False
+    return any(result.get("status") == "blocked" for result in results)
 
 
 def write_protection_retry_state(
@@ -1615,10 +1701,35 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
         detail = "Vote button disabled" if state.get("found") else "Vote button not found"
         return {"bot_id": bot_id, "status": "error", "detail": detail}
 
+    before_click = await vote_page_confirmation(tab, bot_id)
     print("  → Clicking Vote...")
-    if not await _click_marked(tab, "data-auto-vote"):
-        return {"bot_id": bot_id, "status": "error", "detail": "Vote button click failed"}
+    try:
+        if not await _click_marked(tab, "data-auto-vote"):
+            return {
+                "bot_id": bot_id, "status": "uncertain", "vote_submitted": True,
+                "detail": "Vote click outcome unavailable; automatic resubmission suppressed",
+            }
+        result = await verify_submitted_vote(tab, bot_id, account_id, before_click)
+    except Exception as exc:
+        # The click may have reached the server even if its browser command or
+        # the subsequent confirmation failed. Never blindly submit it again.
+        dbg(f"Post-click confirmation failed: {type(exc).__name__}")
+        result = {
+            "bot_id": bot_id, "status": "uncertain",
+            "detail": "Vote submitted; browser confirmation unavailable",
+        }
+    if result.get("status") not in COMPLETED_STATUSES:
+        result["vote_submitted"] = True
+    return result
+
+
+async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_click: dict) -> dict:
     await asyncio.sleep(5)
+
+    if await confirm_vote_without_reload(tab, bot_id, before_click):
+        result = successful_vote_result(bot_id)
+        result["detail"] = "Vote acknowledged on page"
+        return result
 
     if await is_turnstile_present(tab):
         if not await solve_turnstile(tab):
@@ -1631,11 +1742,15 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             )
         await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 
-    # Never trust a success phrase from the same DOM that received the click.
-    # Run #132 showed that client-side text can look successful while the vote
-    # is still available server-side. Require a fresh page load and a state
-    # where strong success/cooldown evidence exists and an enabled Vote button
-    # does not.
+        if await confirm_vote_without_reload(tab, bot_id, before_click):
+            result = successful_vote_result(bot_id)
+            result["detail"] = "Vote acknowledged on page after verification"
+            return result
+
+    # No fresh, stable acknowledgement was observed. Keep independent page
+    # verification as a fallback; a click or generic success text alone cannot
+    # establish completion. Runs #144/#145 show why reload must not be mandatory
+    # after the application has already acknowledged the vote.
     last_confirmation = {"confirmed": False, "evidence": None, "vote_enabled": False}
     for verification_attempt in range(1, POST_VOTE_VERIFY_ATTEMPTS + 1):
         print(
@@ -1694,7 +1809,8 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
 
             # Do not trust the same DOM as the Vote click. The first reload
             # already supplied independent evidence; if it remains ambiguous
-            # after a challenge, let the existing browser retry read cooldown.
+            # after a challenge, retain the unconfirmed submission for a later
+            # scheduled/manual run instead of immediately submitting again.
             print(
                 "  ⏳ Challenged verification remains inconclusive; "
                 "avoiding a second protection-triggering reload"
@@ -2188,6 +2304,7 @@ async def process_account(
             str(result["bot_id"])
             for result in attempt_results
             if result.get("status") == "blocked"
+            and result.get("vote_submitted") is not True
             and result.get("bot_id") not in {None, "all"}
         ]
         transient_bot_ids = retryable_bot_ids(attempt_results)
