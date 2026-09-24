@@ -1,0 +1,58 @@
+name: Inspect vote page (no submission)
+
+on:
+  workflow_dispatch:
+  # Temporary diagnostic trigger; remove after collecting the first live result.
+  push:
+    branches: [master]
+    paths: ['.github/workflows/inspect-vote.yml']
+
+permissions: {}
+
+concurrency:
+  group: topgg-vote
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb
+          fi
+          CHROME_BIN="$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+          test -n "$CHROME_BIN" || { echo "No supported browser found"; exit 1; }
+          echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+          echo "Browser: $("$CHROME_BIN" --version)"
+      - name: Observe page without submitting a vote
+        env:
+          BOT_IDS: ${{ secrets.BOT_IDS }}
+          TOPGG_COOKIES_JSON: ${{ secrets.TOPGG_COOKIES_JSON }}
+        run: |
+          secret_dir="$(mktemp -d)"
+          chmod 700 "$secret_dir"
+          trap 'rm -rf "$secret_dir"' EXIT
+          export TOPGG_COOKIES_JSON_FILE="$secret_dir/cookies"
+          printf '%s' "$TOPGG_COOKIES_JSON" > "$TOPGG_COOKIES_JSON_FILE"
+          chmod 600 "$TOPGG_COOKIES_JSON_FILE"
+          unset TOPGG_COOKIES_JSON
+          if command -v dbus-run-session >/dev/null 2>&1; then
+            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x720x24" python -u inspect_vote_page.py
+          else
+            xvfb-run -a -s "-screen 0 1280x720x24" python -u inspect_vote_page.py
+          fi
