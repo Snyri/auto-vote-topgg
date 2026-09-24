@@ -282,6 +282,109 @@ class AuthenticationEvidenceRegressionTests(unittest.IsolatedAsyncioTestCase):
         probe.assert_not_awaited()
 
 
+class PersistentChallengeClassificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interstitial_detector_requires_a_boolean_signal(self):
+        for result in (None, "true", "Just a moment...", {}, {"value": True}, 1):
+            with (
+                self.subTest(result=result),
+                patch("vote.evaluate", new=AsyncMock(return_value=result)),
+            ):
+                self.assertFalse(await vote.is_cloudflare_challenge_page(MagicMock()))
+
+    async def test_auth_timeout_distinguishes_interstitial_from_standalone_captcha(self):
+        for managed, expected in ((True, vote.AUTH_BLOCKED), (False, vote.AUTH_CAPTCHA_REQUIRED)):
+            with (
+                self.subTest(managed=managed),
+                patch("builtins.print"),
+                patch("vote.dismiss_privacy_overlay", new_callable=AsyncMock),
+                patch("vote.topgg_page_auth_hint", new=AsyncMock(return_value="unknown")),
+                patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
+                patch("vote.solve_turnstile", new=AsyncMock(return_value=False)) as solver,
+                patch("vote.is_cloudflare_challenge_page", new=AsyncMock(return_value=managed), create=True),
+                patch("vote.topgg_session_probe", new_callable=AsyncMock) as probe,
+            ):
+                self.assertEqual(await vote.topgg_auth_state(MagicMock()), expected)
+                solver.assert_awaited_once()
+                probe.assert_not_awaited()
+
+    async def test_classification_preserves_existing_recovery_limits(self):
+        async def run_account(*args, **kwargs):
+            return [{"bot_id": "all", "status": await vote.topgg_auth_state(MagicMock())}]
+
+        for managed, expected, attempts in (
+            (True, vote.AUTH_BLOCKED, vote.MAX_BLOCKED_ATTEMPTS),
+            (False, vote.AUTH_CAPTCHA_REQUIRED, 1),
+        ):
+            with (
+                self.subTest(managed=managed),
+                patch("builtins.print"),
+                patch("vote.asyncio.sleep", new_callable=AsyncMock),
+                patch("vote.dismiss_privacy_overlay", new_callable=AsyncMock),
+                patch("vote.topgg_page_auth_hint", new=AsyncMock(return_value="unknown")),
+                patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
+                patch("vote.solve_turnstile", new=AsyncMock(return_value=False)),
+                patch("vote.is_cloudflare_challenge_page", new=AsyncMock(return_value=managed), create=True),
+                patch("vote._run_account", new=AsyncMock(side_effect=run_account)) as account,
+            ):
+                results = await vote.process_account("test-token", ["111"], 1, 1)
+                self.assertEqual(results[0]["status"], expected)
+                self.assertEqual(account.await_count, attempts)
+                self.assertEqual(vote.should_request_protection_retry([results]), managed)
+                self.assertTrue(vote.has_business_failure([results]))
+
+    async def test_oauth_dialog_propagates_interstitial_timeout(self):
+        with (
+            patch("builtins.print"),
+            patch("vote.current_url", new=AsyncMock(return_value="https://discord.com/oauth2/authorize")),
+            patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
+            patch("vote.solve_turnstile", new=AsyncMock(return_value=False)),
+            patch("vote.is_cloudflare_challenge_page", new=AsyncMock(return_value=True), create=True),
+        ):
+            self.assertEqual(await vote._handle_discord_oauth(MagicMock()), vote.AUTH_BLOCKED)
+
+    async def test_oauth_login_preserves_blocked_dialog_result(self):
+        tab = AsyncMock()
+        with (
+            patch("builtins.print"),
+            patch("vote.asyncio.sleep", new_callable=AsyncMock),
+            patch("vote.settle_privacy_overlay", new_callable=AsyncMock),
+            patch("vote.topgg_auth_state", new=AsyncMock(return_value=vote.AUTH_INVALID)),
+            patch("vote.current_url", new=AsyncMock(side_effect=[
+                "https://discord.com/login", "https://discord.com/oauth2/authorize",
+            ])),
+            patch("vote.evaluate", new_callable=AsyncMock),
+            patch("vote._mark_exact_element", new=AsyncMock(return_value=True)),
+            patch("vote._click_marked", new=AsyncMock(return_value=True)),
+            patch("vote.wait_for_domain", new=AsyncMock(return_value=True)) as wait,
+            patch("vote._handle_discord_oauth", new=AsyncMock(return_value=vote.AUTH_BLOCKED)),
+        ):
+            self.assertEqual(await vote.discord_oauth_login(tab, "test-token", ["111"]), vote.AUTH_BLOCKED)
+            self.assertEqual(wait.await_count, 1)
+
+    async def test_oauth_redirect_timeouts_distinguish_persistent_challenge(self):
+        for waits in ([False], [True, False]):
+            with (
+                self.subTest(waits=waits),
+                patch("builtins.print"),
+                patch("vote.asyncio.sleep", new_callable=AsyncMock),
+                patch("vote.settle_privacy_overlay", new_callable=AsyncMock),
+                patch("vote.topgg_auth_state", new=AsyncMock(return_value=vote.AUTH_INVALID)),
+                patch("vote.current_url", new=AsyncMock(side_effect=[
+                    "https://discord.com/login", "https://discord.com/oauth2/authorize",
+                ])),
+                patch("vote.evaluate", new_callable=AsyncMock),
+                patch("vote._mark_exact_element", new=AsyncMock(return_value=True)),
+                patch("vote._click_marked", new=AsyncMock(return_value=True)),
+                patch("vote.wait_for_domain", new=AsyncMock(side_effect=waits)),
+                patch("vote._handle_discord_oauth", new=AsyncMock(return_value=vote.AUTHENTICATED)),
+                patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
+                patch("vote.solve_turnstile", new=AsyncMock(return_value=False)),
+                patch("vote.is_cloudflare_challenge_page", new=AsyncMock(return_value=True), create=True),
+            ):
+                result = await vote.discord_oauth_login(AsyncMock(), "test-token", ["111"])
+                self.assertEqual(result, vote.AUTH_BLOCKED)
+
+
 NODE = shutil.which("node")
 NODE_HARNESS = r"""
 const fs = require('node:fs');
@@ -384,6 +487,33 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(process.returncode, 0, process.stderr)
         return json.loads(process.stdout)
+
+    async def test_full_page_challenge_is_distinct_from_embedded_captcha(self):
+        expression = await self.capture_expression(vote.is_cloudflare_challenge_page)
+        managed = [
+            {"title": "Just a moment..."},
+            {"title": "Attention Required! | Cloudflare"},
+            {"selectors": ["#challenge-running"]},
+            {"selectors": ["#challenge-stage"]},
+            {"selectors": ["#challenge-form"]},
+            {"body": "Performing security verification"},
+            {"body": "top.gg needs to review the security of your connection"},
+            {"title": "Just a moment...", "selectors": ['iframe[src*="challenges.cloudflare.com"]']},
+        ]
+        standalone = [
+            {},
+            {"body": "Please solve the captcha to continue"},
+            {"selectors": ['iframe[src*="challenges.cloudflare.com"]']},
+            {"selectors": ['iframe[src*="hcaptcha.com"]']},
+            {"selectors": ['iframe[src*="recaptcha"]']},
+            {"selectors": [".cf-turnstile"]},
+            {"selectors": [".h-captcha"]},
+            {"selectors": [".g-recaptcha"]},
+        ]
+        for expected, fixtures in ((True, managed), (False, standalone)):
+            for fixture in fixtures:
+                with self.subTest(expected=expected, fixture=fixture):
+                    self.assertIs((await self.execute_expression(expression, fixture))["value"], expected)
 
     async def test_managed_challenge_titles_dom_and_body_are_detected(self):
         expression = await self.capture_expression(vote.is_turnstile_present)
