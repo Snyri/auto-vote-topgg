@@ -20,8 +20,11 @@ on:
         default: '0'
         type: string
 
+permissions: {}
+
 concurrency:
-  group: topgg-vote-${{ github.ref }}
+  # All branches use the same accounts and must share the same voting lock.
+  group: topgg-vote
   cancel-in-progress: false
 
 jobs:
@@ -114,7 +117,7 @@ jobs:
           echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload cooldown schedule
-        if: steps.cooldown.outputs.available == 'true'
+        if: always() && steps.cooldown.outputs.available == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: next-vote
@@ -136,7 +139,7 @@ jobs:
           echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload browser startup retry
-        if: steps.browser-retry.outputs.available == 'true'
+        if: always() && steps.browser-retry.outputs.available == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: browser-startup-retry
@@ -158,7 +161,7 @@ jobs:
           echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload protection retry
-        if: steps.protection-retry-state.outputs.available == 'true'
+        if: always() && steps.protection-retry-state.outputs.available == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: protection-retry
@@ -172,8 +175,6 @@ jobs:
           STATUS: ${{ steps.run_vote.outputs.status }}
         run: exit "${STATUS:-1}"
 
-    continue-on-error: true
-
   verify-vote:
     needs: vote
     if: always()
@@ -184,7 +185,10 @@ jobs:
       - name: Apply vote result
         env:
           VOTE_STATUS: ${{ needs.vote.outputs.vote_status }}
-        run: test "$VOTE_STATUS" = "0"
+          VOTE_JOB_RESULT: ${{ needs.vote.result }}
+        run: |
+          test "$VOTE_STATUS" = "0"
+          test "$VOTE_JOB_RESULT" = "success"
 
   browser-startup-retry:
     needs: vote
@@ -203,18 +207,15 @@ jobs:
           RECOVERY_DEPTH: ${{ github.event.inputs.recovery_depth || '0' }}
         run: |
           set -euo pipefail
-          case "$RECOVERY_DEPTH" in
-            ''|*[!0-9]*) RECOVERY_DEPTH=0 ;;
-          esac
           if [ "$SOURCE" = "browser-startup-retry" ]; then
             echo "Browser-startup fresh-run retry already consumed."
             exit 0
           fi
-          if [ "$RECOVERY_DEPTH" -ge 2 ]; then
-            echo "Fresh-run recovery depth limit reached."
-            exit 0
-          fi
-          NEXT_DEPTH=$((RECOVERY_DEPTH + 1))
+          case "$RECOVERY_DEPTH" in
+            0) NEXT_DEPTH=1 ;;
+            1) NEXT_DEPTH=2 ;;
+            *) echo "Fresh-run recovery depth is invalid or exhausted."; exit 0 ;;
+          esac
 
           artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "browser-startup-retry" and .expired == false)] | first // empty')"
           artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
@@ -226,9 +227,25 @@ jobs:
           state_dir="$(mktemp -d)"
           trap 'rm -rf "$state_dir"' EXIT
           gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$state_dir/state.zip"
-          unzip -qq "$state_dir/state.zip" -d "$state_dir/unpacked"
-          state_file="$state_dir/unpacked/browser-startup-retry.json"
-          STATE_FILE="$state_file" python -c 'import json, os; data=json.load(open(os.environ["STATE_FILE"], encoding="utf-8")); assert data == {"reason":"browser_startup_failed"}'
+          python - "$state_dir/state.zip" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive_path = Path(sys.argv[1])
+          if archive_path.stat().st_size > 65536:
+              raise ValueError("Retry archive is too large")
+          with zipfile.ZipFile(archive_path) as archive:
+              entries = archive.infolist()
+              if len(entries) != 1 or entries[0].filename != "browser-startup-retry.json":
+                  raise ValueError("Retry archive must contain only the expected marker")
+              if entries[0].file_size > 1024:
+                  raise ValueError("Retry marker is too large")
+              data = json.loads(archive.read(entries[0]))
+          if data != {"reason": "browser_startup_failed"}:
+              raise ValueError("Invalid browser startup retry marker")
+          PY
 
           gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
             -f "ref=$GITHUB_REF_NAME" \
@@ -254,18 +271,15 @@ jobs:
           RECOVERY_DEPTH: ${{ github.event.inputs.recovery_depth || '0' }}
         run: |
           set -euo pipefail
-          case "$RECOVERY_DEPTH" in
-            ''|*[!0-9]*) RECOVERY_DEPTH=0 ;;
-          esac
           if [ "$SOURCE" = "protection-retry" ]; then
             echo "Protection fresh-run retry already consumed."
             exit 0
           fi
-          if [ "$RECOVERY_DEPTH" -ge 2 ]; then
-            echo "Fresh-run recovery depth limit reached."
-            exit 0
-          fi
-          NEXT_DEPTH=$((RECOVERY_DEPTH + 1))
+          case "$RECOVERY_DEPTH" in
+            0) NEXT_DEPTH=1 ;;
+            1) NEXT_DEPTH=2 ;;
+            *) echo "Fresh-run recovery depth is invalid or exhausted."; exit 0 ;;
+          esac
 
           artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "protection-retry" and .expired == false)] | first // empty')"
           artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
@@ -277,9 +291,25 @@ jobs:
           state_dir="$(mktemp -d)"
           trap 'rm -rf "$state_dir"' EXIT
           gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$state_dir/state.zip"
-          unzip -qq "$state_dir/state.zip" -d "$state_dir/unpacked"
-          state_file="$state_dir/unpacked/protection-retry.json"
-          STATE_FILE="$state_file" python -c 'import json, os; data=json.load(open(os.environ["STATE_FILE"], encoding="utf-8")); assert data == {"reason":"protection_blocked"}'
+          python - "$state_dir/state.zip" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive_path = Path(sys.argv[1])
+          if archive_path.stat().st_size > 65536:
+              raise ValueError("Retry archive is too large")
+          with zipfile.ZipFile(archive_path) as archive:
+              entries = archive.infolist()
+              if len(entries) != 1 or entries[0].filename != "protection-retry.json":
+                  raise ValueError("Retry archive must contain only the expected marker")
+              if entries[0].file_size > 1024:
+                  raise ValueError("Retry marker is too large")
+              data = json.loads(archive.read(entries[0]))
+          if data != {"reason": "protection_blocked"}:
+              raise ValueError("Invalid protection retry marker")
+          PY
 
           gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
             -f "ref=$GITHUB_REF_NAME" \
@@ -296,7 +326,7 @@ jobs:
     permissions:
       actions: write
     steps:
-      - name: Clear old repository workflow runs
+      - name: Clear old vote workflow runs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -35,6 +35,7 @@ ERROR_RETRY_SECONDS = env_int("ERROR_RETRY_SECONDS", 300, 300)
 MAX_RUN_WAIT_SECONDS = env_int("MAX_RUN_WAIT_SECONDS", 2700, 300)
 MAX_SCHEDULE_AHEAD_SECONDS = 48 * 60 * 60
 MAX_SCHEDULE_PAST_SECONDS = 24 * 60 * 60
+MAX_ARTIFACT_BYTES = 1024 * 1024
 SCHEDULE_REFRESH_SECONDS = env_int("SCHEDULE_REFRESH_SECONDS", 60, 15)
 
 API = "https://api.github.com"
@@ -89,12 +90,21 @@ def list_vote_runs(per_page=20):
     return response.json().get("workflow_runs", [])
 
 
-def latest_vote_run():
+def latest_vote_run(minimum_run_id=None):
     # Do not assume that a single API result is the newest run: a stale
     # result once moved the schedule backwards from #138 to #136.
     runs = list_vote_runs(20)
     valid = [run for run in runs if type(run.get("id")) is int]
-    return max(valid, key=lambda run: run["id"]) if valid else None
+    latest = max(valid, key=lambda run: run["id"]) if valid else None
+    if minimum_run_id is not None and (
+        latest is None or latest["id"] < minimum_run_id
+    ):
+        # A stale list response must not erase a run already observed by this
+        # process, including one dispatched during the previous cycle.
+        latest = get_run(minimum_run_id)
+        if latest.get("id") != minimum_run_id:
+            raise RuntimeError("GitHub returned an unexpected workflow run")
+    return latest
 
 
 def latest_prior_success_schedule(run_id, now=None):
@@ -105,7 +115,7 @@ def latest_prior_success_schedule(run_id, now=None):
     """
     now = time.time() if now is None else now
     successful = [
-        run for run in list_vote_runs(20)
+        run for run in list_vote_runs(100)
         if type(run.get("id")) is int
         and run["id"] < run_id
         and run.get("status") == "completed"
@@ -189,21 +199,31 @@ def next_vote_at_from_run(run_id):
     )[-1]
     artifact_size = artifact.get("size_in_bytes")
     if (
-        not isinstance(artifact_size, int)
+        type(artifact_size) is not int
         or artifact_size < 1
-        or artifact_size > 1024 * 1024
+        or artifact_size > MAX_ARTIFACT_BYTES
     ):
         raise RuntimeError("next-vote artifact has an invalid size")
+    if type(artifact.get("id")) is not int or artifact["id"] < 1:
+        raise RuntimeError("next-vote artifact has an invalid id")
 
     archive = api(
         "GET",
         f"/repos/{GH_REPOSITORY}/actions/artifacts/"
         f"{artifact['id']}/zip",
+        stream=True,
     )
+    content = bytearray()
+    try:
+        for chunk in archive.iter_content(chunk_size=65536):
+            if len(content) + len(chunk) > MAX_ARTIFACT_BYTES:
+                raise RuntimeError("next-vote artifact download is too large")
+            content.extend(chunk)
+    finally:
+        archive.close()
 
-    with zipfile.ZipFile(io.BytesIO(archive.content)) as zf:
-        names = [name for name in zf.namelist() if name == "next-vote.json"]
-        if names != ["next-vote.json"]:
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        if zf.namelist() != ["next-vote.json"]:
             raise RuntimeError(
                 "next-vote artifact must contain exactly next-vote.json"
             )
@@ -338,28 +358,20 @@ def dispatch_vote():
     )
 
 
-def resolve_schedule():
+def resolve_schedule(minimum_run_id=None):
     while True:
         try:
-            run = latest_vote_run()
+            run = latest_vote_run(minimum_run_id=minimum_run_id)
+            if run:
+                minimum_run_id = max(minimum_run_id or 0, int(run["id"]))
 
             if run and run.get("status") != "completed":
                 run = wait_for_run(int(run["id"]))
 
             if run:
-                if run.get("conclusion") not in {None, "success"}:
-                    guarded = latest_prior_success_schedule(int(run["id"]))
-                    if guarded is not None:
-                        log(
-                            f"Retaining future schedule from successful run "
-                            f"{guarded[0]}; failed run {run['id']} cannot "
-                            f"bring the next dispatch forward"
-                        )
-                        return guarded
-
-                next_at = next_vote_at_from_run(int(run["id"]))
-                if next_at is not None:
-                    return int(run["id"]), next_at
+                target = schedule_from_completed_run(run)
+                if target is not None:
+                    return target
 
                 if run.get("conclusion") not in {"success", "neutral", "skipped"}:
                     log(
@@ -375,11 +387,12 @@ def resolve_schedule():
             )
 
             run_id = dispatch_vote()
-            wait_for_run(run_id)
+            minimum_run_id = max(minimum_run_id or 0, run_id)
+            completed_run = wait_for_run(run_id)
 
-            next_at = next_vote_at_from_run(run_id)
-            if next_at is not None:
-                return int(run_id), next_at
+            target = schedule_from_completed_run(completed_run)
+            if target is not None:
+                return target
 
             log(
                 f"No next-vote artifact; retrying in "
@@ -395,22 +408,33 @@ def resolve_schedule():
             time.sleep(ERROR_RETRY_SECONDS)
 
 
-def latest_schedule_target():
-    run = latest_vote_run()
-    if not run or run.get("status") != "completed":
-        return None
+def schedule_from_completed_run(run):
+    next_at = next_vote_at_from_run(int(run["id"]))
     if run.get("conclusion") not in {None, "success"}:
         guarded = latest_prior_success_schedule(int(run["id"]))
-        if guarded is not None:
-            return guarded
-    next_at = next_vote_at_from_run(int(run["id"]))
+        if guarded is not None and (next_at is None or guarded[1] > next_at):
+            log(
+                f"Retaining future schedule from successful run "
+                f"{guarded[0]}; failed run {run['id']} cannot "
+                f"bring the next dispatch forward"
+            )
+            # This decision has observed the newer failed run. Retain its ID
+            # so subsequent stale lists cannot undo the successful-run guard.
+            return int(run["id"]), guarded[1]
     if next_at is None:
         return None
     return int(run["id"]), next_at
 
 
+def latest_schedule_target(minimum_run_id=None):
+    run = latest_vote_run(minimum_run_id=minimum_run_id)
+    if not run or run.get("status") != "completed":
+        return None
+    return schedule_from_completed_run(run)
+
+
 def wait_until(epoch, source_run_id=None):
-    """Never replace an accepted schedule with an artifact from an older run."""
+    """Return the accepted source and target, refusing older run artifacts."""
     current_epoch = epoch
     current_source = source_run_id
     next_refresh = 0.0
@@ -419,12 +443,13 @@ def wait_until(epoch, source_run_id=None):
         now = time.time()
         remaining = current_epoch - now
         if remaining <= 0:
-            return current_epoch
+            return current_source, current_epoch
 
         monotonic_now = time.monotonic()
         if monotonic_now >= next_refresh:
+            next_refresh = monotonic_now + SCHEDULE_REFRESH_SECONDS
             try:
-                latest = latest_schedule_target()
+                latest = latest_schedule_target(minimum_run_id=current_source)
                 if latest is not None:
                     run_id, refreshed_epoch = latest
                     if current_source is not None and run_id < current_source:
@@ -452,7 +477,6 @@ def wait_until(epoch, source_run_id=None):
                     f"Schedule refresh error: "
                     f"{type(exc).__name__}: {exc}"
                 )
-            next_refresh = monotonic_now + SCHEDULE_REFRESH_SECONDS
 
         if remaining > 300:
             target = datetime.fromtimestamp(
@@ -479,20 +503,27 @@ def main():
         f"on {GH_REF}"
     )
 
+    schedule = None
+    minimum_run_id = None
     while True:
-        schedule_run_id, next_at = resolve_schedule()
+        if schedule is None:
+            schedule = resolve_schedule(minimum_run_id=minimum_run_id)
+        schedule_run_id, next_at = schedule
         target = datetime.fromtimestamp(
             next_at,
             timezone.utc,
         ).isoformat(timespec="seconds")
         log(f"Next vote target: {target} (source run {schedule_run_id})")
 
-        next_at = wait_until(next_at, source_run_id=schedule_run_id)
+        schedule_run_id, next_at = wait_until(
+            next_at, source_run_id=schedule_run_id
+        )
+        minimum_run_id = max(minimum_run_id or 0, schedule_run_id)
 
         try:
             # Close the race between the last refresh and the dispatch.
             # An updated successful schedule must supersede a now-stale timer.
-            latest = latest_schedule_target()
+            latest = latest_schedule_target(minimum_run_id=minimum_run_id)
             if (
                 latest is not None
                 and latest[0] >= schedule_run_id
@@ -502,29 +533,37 @@ def main():
                     f"Skipping dispatch: run {latest[0]} has a newer "
                     f"future target"
                 )
+                schedule = latest
                 continue
             log(
                 "Vote target reached; "
                 "dispatching GitHub workflow"
             )
             run_id = dispatch_vote()
-            wait_for_run(run_id)
+            minimum_run_id = max(minimum_run_id, run_id)
+            completed_run = wait_for_run(run_id)
 
-            new_next_at = next_vote_at_from_run(run_id)
-            if new_next_at is None:
+            new_schedule = schedule_from_completed_run(completed_run)
+            if new_schedule is None:
                 log(
                     f"No next-vote artifact; "
                     f"re-resolving in {ERROR_RETRY_SECONDS}s"
                 )
                 time.sleep(ERROR_RETRY_SECONDS)
+                schedule = None
             else:
                 target = datetime.fromtimestamp(
-                    new_next_at,
+                    new_schedule[1],
                     timezone.utc,
                 ).isoformat(timespec="seconds")
                 log(
                     f"New next-vote artifact received: "
                     f"{target}"
+                )
+                # Carry this verified target directly into the next cycle.
+                # Re-reading a stale list here used to cause duplicate votes.
+                schedule = (
+                    new_schedule if run_id >= schedule_run_id else None
                 )
 
         except Exception as exc:
@@ -533,6 +572,7 @@ def main():
                 f"{type(exc).__name__}: {exc}"
             )
             time.sleep(ERROR_RETRY_SECONDS)
+            schedule = None
 
 
 if __name__ == "__main__":

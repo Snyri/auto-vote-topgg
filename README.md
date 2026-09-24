@@ -4,9 +4,20 @@ Automated daily voting bot for [top.gg](https://top.gg) using nodriver (visible 
 
 ## Architecture at a Glance
 
-[![auto-vote-topgg repository architecture](assets/repo_infographic.png)](assets/repo_infographic.svg)
+```mermaid
+flowchart LR
+    Scheduler[Northflank scheduler] -->|workflow dispatch| Actions[GitHub Actions]
+    Actions --> Browser[Ephemeral browser]
+    Browser --> Auth[Cookies and verified application state]
+    Auth --> Vote[Vote and independent confirmation]
+    Vote --> Result[Success, cooldown, or explicit failure]
+    Result --> Schedule[Validated next-vote artifact]
+    Schedule --> Scheduler
+    Result --> Report[Private Telegram report]
+    Result --> CI[Workflow exit status]
+```
 
-> Cookie-first session verification leads into Discord OAuth fallback, terminal CAPTCHA handling, truthful CI outcomes, Telegram reporting, and isolated security controls. Click image for scalable SVG.
+The scheduler follows observed eligibility and bounded retry deadlines. A disappearing challenge widget alone never proves authentication or a completed vote.
 
 ## Features
 
@@ -133,6 +144,8 @@ Confirmed success normally schedules the next attempt about 12 hours later. Pars
 
 The Northflank scheduler waits for an active vote workflow instead of dispatching a duplicate, validates schedule timestamps, retries transient GitHub API reads with backoff, waits at least five minutes after a failed run with no usable schedule, imposes a maximum workflow wait, and periodically refreshes the latest vote artifact while sleeping. Refreshes never accept an older run ID, and short retries from newer failed runs cannot advance a still-future schedule from the most recent successful run. A final schedule check also runs before dispatch. Required environment values are `GH_TOKEN`, `GH_REPOSITORY`, `GH_REF`, and `GH_WORKFLOW`; optional timing controls are `POLL_SECONDS`, `ERROR_RETRY_SECONDS`, and `MAX_RUN_WAIT_SECONDS`.
 
+Accepted run IDs and deadlines are retained across dispatch cycles. When the run list is stale, the scheduler queries the known run directly. A failed run's longer backoff is also respected: the later of its deadline and a previous successful future deadline wins. `SCHEDULE_REFRESH_SECONDS` controls refresh frequency (default 60 seconds). Changes under `scheduler/` take effect after rebuilding and redeploying the Northflank service; merging this repository alone does not prove that the running service uses the new image.
+
 
 ### Fresh-Run Recovery
 
@@ -152,6 +165,14 @@ Guards:
 - Original failed run remains a truthful failure; Telegram error report is sent before retry starts.
 
 ## Debugging
+
+### Cloudflare 403 diagnosis
+
+The retained September 24 runs returned `403`, `text/html`, and `cf-mitigated: challenge` from `/api/auth/session`. This identifies a Cloudflare Challenge Page, not an expired Auth.js cookie. The exact WAF rule and IP reputation are not exposed by those logs. See the [full review and run evidence](docs/audit-2026-09-24.md).
+
+After a detected challenge, authentication waits for recognizable application UI before requesting the session endpoint. Managed challenge titles and DOM containers also count as protection; a transiently missing widget is not logged as verified access. Session requests have a 12-second browser timeout plus a bounded outer wait, so a hanging fetch cannot consume the entire workflow run.
+
+[Cloudflare documents](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/) `cf-mitigated: challenge` as the response marker. Its [supported-browser guidance](https://developers.cloudflare.com/cloudflare-challenges/reference/supported-browsers/) does not support automated browsers for production challenges. These changes reduce avoidable requests and report denial accurately; they cannot guarantee that top.gg will authorize an automated browser. Persistent denial requires resolution with the site operator or normal interactive access.
 
 To enable verbose diagnostic logging locally, set `DEBUG=1`:
 
@@ -176,6 +197,8 @@ For other GitHub Actions diagnostics, add repository secret `SEND_ERROR_SCREENSH
 
 Transient authentication/browser failures retry up to 3 times. Protection-blocked authentication uses at most two browser attempts before deferring to the external scheduler. In multi-bot runs, only bots with `error` or `uncertain` results retry; `success`, `cooldown`, and `captcha_required` are final for the current run. Interactive CAPTCHA is intentionally not retried on the same runner/IP. Telegram reports identify accounts using a short SHA-256 fingerprint, never token fragments, and split automatically below Telegram's message limit.
 
+Completed per-bot results survive later browser failures and authentication failures on a retry. Missing results become explicit errors. Duplicate bot IDs are collapsed while preserving order. All branches share one workflow concurrency group, and artifact validation/upload failures fail the workflow even when the voting process exits successfully.
+
 - `success`, `cooldown`: final on the current runner/IP.
 - A cooldown with a valid duration schedules an isolated dispatcher instead of sleeping/retrying on the same runner.
 - `captcha_required`: final on the current runner/IP.
@@ -190,6 +213,7 @@ Transient authentication/browser failures retry up to 3 times. Protection-blocke
 auto-vote-topgg/
 ├── vote.py                          # Auth, vote, cooldown state, report, browser lifecycle
 ├── test_vote.py                     # Vote/auth/browser unit and regression tests
+├── test_vote_regressions.py         # Partial results, bounded probes, browser-script regressions
 ├── test_scheduler.py                # Scheduler validation and dispatch regression tests
 ├── scheduler/
 │   ├── Dockerfile                   # Northflank scheduler image
@@ -199,9 +223,8 @@ auto-vote-topgg/
 ├── requirements.lock                # Linux/Python 3.11 hashes and transitive pins
 ├── README.md                        # Setup and operating guide
 ├── SECURITY.md                      # Disclosure and credential policy
-├── assets/
-│   ├── repo_infographic.png         # README preview
-│   └── repo_infographic.svg         # Scalable architecture source
+├── docs/
+│   └── audit-2026-09-24.md           # Review findings, run evidence, and deployment limits
 ├── .github/
 │   ├── CODEOWNERS                   # Sensitive-file ownership
 │   ├── dependabot.yml               # Weekly pip/Actions updates
@@ -248,7 +271,7 @@ python audit_dependencies.py requirements.lock
 
 Dependabot checks pip and GitHub Actions weekly. Regenerate lock by downloading CPython 3.11 Linux x86_64 wheels for `requirements.txt`, recording exact transitive versions, and adding each wheel SHA-256. Verify resulting install on GitHub Actions before merging.
 
-`master` accepts changes through pull requests. Required `test` and `dependency-audit` checks must pass; branches must be current, conversations resolved, and history linear. Admins follow same policy. Force pushes and branch deletion are blocked. Human approvals remain `0` while repository has only one trusted collaborator.
+Use pull requests and wait for `test`, `dependency-audit`, and `scheduler-image` to pass before merging. Repository settings are separate from this code: the September 24 review found `master` unprotected and no repository rulesets, so these checks were not enforced by branch protection at that time.
 
 ## ⚠️ Disclaimer
 

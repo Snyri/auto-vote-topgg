@@ -23,6 +23,9 @@ WIB = timezone(timedelta(hours=7))
 DISCORD_LOGIN_URL = "https://discord.com/login"
 TIMEOUT_OAUTH_SEC = 25
 TIMEOUT_VOTE_SEC = 30
+SESSION_PROBE_TIMEOUT_SEC = 12
+AUTH_PAGE_SETTLE_POLLS = 4
+AUTH_PAGE_SETTLE_DELAY_SEC = 2
 DELAY_BETWEEN_BOTS_SEC = 3
 DELAY_BETWEEN_ACCOUNTS_SEC = 5
 MAX_RETRIES = 3
@@ -204,10 +207,10 @@ def send_telegram_photo(path: str, caption: str = "") -> bool:
 
 
 async def notify_error_screenshot(bot_id: str, path: str, detail: str) -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
     caption = f"❌ Vote failed for {escape(str(bot_id))}\n{escape(str(detail))}"
     try:
+        if not TG_BOT_TOKEN or not TG_CHAT_ID:
+            return
         sent = await asyncio.to_thread(send_telegram_photo, path, caption)
         print("  📸 Error screenshot sent to Telegram" if sent else "  ⚠️  Could not send error screenshot to Telegram")
     finally:
@@ -321,10 +324,10 @@ def load_bot_ids() -> list[str]:
     if not raw:
         raise ValueError("BOT_IDS is required; configure at least one Discord bot ID")
     ids = [line.strip() for line in raw.splitlines() if line.strip()]
-    invalid = [bot_id for bot_id in ids if not (bot_id.isdigit() and 17 <= len(bot_id) <= 20)]
+    invalid = [bot_id for bot_id in ids if not re.fullmatch(r"[0-9]{17,20}", bot_id)]
     if invalid:
         raise ValueError(f"Invalid BOT_IDS value: {invalid[0]!r}; expected a 17-20 digit Discord ID")
-    return ids
+    return list(dict.fromkeys(ids))
 
 
 def account_fingerprint(token: str) -> str:
@@ -885,11 +888,14 @@ async def inject_topgg_cookies(browser: Any, cookies: list[dict]) -> None:
 
 async def topgg_session_probe(tab: Any) -> dict:
     """Return a credential-free Auth.js probe result for diagnostics and decisions."""
-    result = await evaluate(tab, """(async () => {
+    script = """(async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), __PROBE_TIMEOUT_MS__);
         try {
             const response = await fetch('/api/auth/session', {
                 credentials: 'include',
                 cache: 'no-store',
+                signal: controller.signal,
             });
             const probe = {
                 ok: Boolean(response.ok),
@@ -931,17 +937,25 @@ async def topgg_session_probe(tab: Any) -> dict:
                 cfRay: '',
                 server: '',
             };
+        } finally {
+            clearTimeout(timer);
         }
-    })()""")
+    })()""".replace("__PROBE_TIMEOUT_MS__", str(int(SESSION_PROBE_TIMEOUT_SEC * 1000)))
+    try:
+        result = await asyncio.wait_for(
+            evaluate(tab, script), timeout=SESSION_PROBE_TIMEOUT_SEC + 2
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        result = {"status": 0, "error": "session-probe-timeout"}
 
     if not isinstance(result, dict):
         result = {
-            "ok": bool(result),
+            "ok": False,
             "status": None,
             "contentType": "",
-            "jsonOk": isinstance(result, bool),
-            "userPresent": bool(result),
-            "error": "legacy-result",
+            "jsonOk": False,
+            "userPresent": False,
+            "error": "invalid-probe-result",
             "cfMitigated": "",
             "cfRay": "",
             "server": "",
@@ -954,8 +968,14 @@ async def topgg_session_probe(tab: Any) -> dict:
     mitigated = str(result.get("cfMitigated") or "").lower()[:40]
     cf_ray = re.sub(r"[^a-zA-Z0-9-]", "", str(result.get("cfRay") or ""))[:64]
     server = str(result.get("server") or "").lower()[:40]
-    json_ok = bool(result.get("jsonOk"))
-    authenticated = bool(result.get("userPresent"))
+    json_ok = result.get("jsonOk") is True
+    authenticated = (
+        status == 200
+        and result.get("ok") is True
+        and json_ok
+        and result.get("userPresent") is True
+        and mitigated != "challenge"
+    )
 
     if status in {403, 429}:
         if mitigated == "challenge":
@@ -1014,8 +1034,19 @@ async def topgg_page_auth_hint(tab: Any) -> str:
     """Infer auth only from strong vote-page UI signals; otherwise return unknown."""
     result = await evaluate(tab, """(() => {
         const body = (document.body ? document.body.innerText : '').toLowerCase();
+        const title = (document.title || '').trim().toLowerCase();
+        if (location.protocol !== 'https:' ||
+            !['top.gg', 'www.top.gg'].includes(location.hostname) ||
+            document.readyState === 'loading' ||
+            title.startsWith('just a moment') ||
+            title.startsWith('attention required') ||
+            body.includes('performing security verification') ||
+            body.includes('needs to review the security of your connection') ||
+            document.querySelector('#challenge-running, #challenge-stage, #challenge-form')) {
+            return 'unknown';
+        }
         const controls = [...document.querySelectorAll('button, a, [role="button"]')];
-        const voteButtons = [...document.querySelectorAll('button')];
+        const voteButtons = [...document.querySelectorAll('button, [role="button"]')];
         const exactText = (node) => (node.textContent || '').trim().toLowerCase();
         const isVisible = (node) => Boolean(
             node && (node.getClientRects().length || node.offsetWidth || node.offsetHeight)
@@ -1052,7 +1083,8 @@ def probe_looks_blocked(probe: dict) -> bool:
     status = probe.get("status")
     content_type = str(probe.get("content_type") or "")
     return (
-        status in {403, 429}
+        probe.get("cf_mitigated") == "challenge"
+        or status in {403, 429}
         or (isinstance(status, int) and status >= 500)
         or content_type == "text/html"
         or bool(probe.get("error"))
@@ -1078,19 +1110,30 @@ async def topgg_auth_state(tab: Any) -> str:
         await asyncio.sleep(2)
         await settle_privacy_overlay(tab)
 
-        page_hint = await topgg_page_auth_hint(tab)
+        # Widget disappearance or a response token does not establish that the
+        # application has loaded. Runs #139/#140 repeatedly probed between
+        # challenges. Observe DOM state only; do not add requests/reloads here.
+        for settle_attempt in range(AUTH_PAGE_SETTLE_POLLS):
+            page_hint = await topgg_page_auth_hint(tab)
+            if page_hint in {AUTHENTICATED, AUTH_INVALID}:
+                break
+            if settle_attempt < AUTH_PAGE_SETTLE_POLLS - 1:
+                await asyncio.sleep(AUTH_PAGE_SETTLE_DELAY_SEC)
         if page_hint == AUTHENTICATED:
             print("  ✅ top.gg vote page became usable after verification")
             return AUTHENTICATED
+        if page_hint == "unknown" or await is_turnstile_present(tab):
+            print("  ⏳ Application not ready after challenge; deferring session probe")
+            return AUTH_BLOCKED
 
     probe = await topgg_session_probe(tab)
     if probe.get("authenticated"):
         return AUTHENTICATED
 
-    if probe.get("status") == 200 and probe.get("json_ok"):
-        return AUTH_INVALID
     if probe_looks_blocked(probe):
         return AUTH_BLOCKED
+    if probe.get("status") == 200 and probe.get("json_ok"):
+        return AUTH_INVALID
     if page_hint == AUTH_INVALID:
         return AUTH_INVALID
     return AUTH_BLOCKED
@@ -1242,6 +1285,12 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
 async def is_turnstile_present(tab: Any) -> bool:
     return bool(await evaluate(tab, """(() => {
         const body = document.body ? document.body.innerText.toLowerCase() : '';
+        const title = (document.title || '').trim().toLowerCase();
+        if (title.startsWith('just a moment') ||
+            title.startsWith('attention required') ||
+            document.querySelector('#challenge-running, #challenge-stage, #challenge-form') ||
+            body.includes('performing security verification') ||
+            body.includes('needs to review the security of your connection')) return true;
         if (body.includes('verify you are human') ||
             body.includes('please solve the captcha to continue') ||
             body.includes('complete the captcha') ||
@@ -1289,7 +1338,7 @@ async def solve_turnstile(tab: Any) -> bool:
             print("  ✅ Turnstile response received")
             return True
         if not await is_turnstile_present(tab):
-            print("  ✅ Turnstile security page cleared")
+            print("  → Challenge widget disappeared; application access still needs verification")
             return True
         await asyncio.sleep(2)
     print("  ⚠️  Turnstile remained active after checkbox click")
@@ -1738,6 +1787,7 @@ async def close_browser(browser: Any) -> None:
         )
     with suppress(Exception):
         browser.stop()
+    forced_shutdown = False
     if process is not None and getattr(process, "returncode", None) is None:
         try:
             await asyncio.wait_for(
@@ -1745,6 +1795,7 @@ async def close_browser(browser: Any) -> None:
                 timeout=BROWSER_CLOSE_TIMEOUT_SEC,
             )
         except (TimeoutError, asyncio.TimeoutError) as exc:
+            forced_shutdown = True
             with suppress(Exception):
                 process.kill()
             try:
@@ -1753,8 +1804,7 @@ async def close_browser(browser: Any) -> None:
                     timeout=BROWSER_CLOSE_TIMEOUT_SEC,
                 )
             except (TimeoutError, asyncio.TimeoutError):
-                pass
-            raise BrowserCleanupError("Chrome process did not terminate cleanly") from exc
+                raise BrowserCleanupError("Chrome process did not terminate cleanly") from exc
     profile_path = getattr(browser, "_security_profile_path", None)
     if isinstance(profile_path, (str, os.PathLike)):
         try:
@@ -1763,6 +1813,8 @@ async def close_browser(browser: Any) -> None:
             pass
         except Exception as exc:
             raise BrowserCleanupError("Sensitive browser profile could not be deleted") from exc
+    if forced_shutdown:
+        raise BrowserCleanupError("Chrome required forced termination; profile deleted")
 
 
 async def close_browser_safely(browser: Any, context: str) -> bool:
@@ -1775,6 +1827,9 @@ async def close_browser_safely(browser: Any, context: str) -> bool:
             f"  ⚠️  Browser cleanup warning after {context}: "
             f"{safe_exception_detail(exc)}"
         )
+        return False
+    except Exception as exc:
+        print(f"  ⚠️  Browser cleanup warning after {context}: {type(exc).__name__}")
         return False
 
 
@@ -1845,9 +1900,9 @@ async def _run_account(
     capture_auth_failure: bool = False,
 ) -> list[dict]:
     browser = await start_browser()
-    tab = next(iter(browser))
     results = []
     try:
+        tab = next(iter(browser))
         auth_state = AUTH_INVALID
         if account_cookies:
             auth_state = await login_with_cookies(tab, account_cookies, bot_ids)
@@ -1896,7 +1951,17 @@ async def _run_account(
             return [result]
 
         for position, bot_id in enumerate(bot_ids):
-            result = await vote_for_bot(tab, bot_id, account_id)
+            try:
+                result = await vote_for_bot(tab, bot_id, account_id)
+            except Exception as exc:
+                # A later browser/navigation failure must not discard earlier
+                # votes and cause the next attempt to submit them again.
+                detail = f"{type(exc).__name__}: transient browser failure"
+                results.extend({
+                    "bot_id": remaining, "status": "error",
+                    "detail": detail, "account_id": account_id,
+                } for remaining in bot_ids[position:])
+                return results
             result["account_id"] = account_id
             if is_captcha_related_result(result) and not result.get("screenshot_path"):
                 path = await browser_screenshot(
@@ -1931,6 +1996,13 @@ async def process_account(
     print(f"\n{'─' * 45}")
     print(f"{prefix} Processing account...")
 
+    def apply_account_error(error: dict) -> list[dict]:
+        if not results_by_bot:
+            return [error]
+        for bot_id in pending:
+            results_by_bot[bot_id] = {**error, "bot_id": bot_id}
+        return [results_by_bot[bot_id] for bot_id in bot_ids]
+
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1:
             print(f"{prefix} ↺ Retry {attempt}/{MAX_RETRIES} (waiting {RETRY_DELAY_SEC}s)...")
@@ -1954,6 +2026,8 @@ async def process_account(
                 "bot_id": "all", "status": "error",
                 "detail": detail, "account_id": account_id,
             }
+            if results_by_bot:
+                apply_account_error(last_account_error)
             dbg(f"Account attempt failed: {type(exc).__name__}")
             print(f"{prefix} ❌ Attempt {attempt} failed: {detail}")
             if isinstance(exc, BrowserStartupError):
@@ -1969,14 +2043,25 @@ async def process_account(
                     print(f"{prefix} ↺ Protection block detected; trying one fresh browser")
                     continue
                 print(f"{prefix} ⏳ Protection block persists; deferring to scheduled retry")
-                return attempt_results
+                return apply_account_error(last_account_error)
             if not is_retryable_result(last_account_error):
                 print(f"{prefix} 🔒 Authentication requires manual CAPTCHA")
-                return attempt_results
+                return apply_account_error(last_account_error)
             print(f"{prefix} ❌ Authentication attempt {attempt} failed")
+            if results_by_bot:
+                apply_account_error(last_account_error)
             continue
+        last_account_error = None
+        # An incomplete browser response is not successful completion. Keep a
+        # result for every requested bot, including any missing from a response.
+        returned_ids = {str(result.get("bot_id")) for result in attempt_results}
+        attempt_results = list(attempt_results) + [{
+            "bot_id": bot_id, "status": "error",
+            "detail": "Browser returned no result for this bot", "account_id": account_id,
+        } for bot_id in pending if bot_id not in returned_ids]
         for result in attempt_results:
-            results_by_bot[str(result["bot_id"])] = result
+            if str(result["bot_id"]) in pending:
+                results_by_bot[str(result["bot_id"])] = result
 
         blocked_bot_ids = [
             str(result["bot_id"])
