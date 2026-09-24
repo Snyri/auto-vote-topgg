@@ -1034,15 +1034,9 @@ async def topgg_page_auth_hint(tab: Any) -> str:
     """Infer auth only from strong vote-page UI signals; otherwise return unknown."""
     result = await evaluate(tab, """(() => {
         const body = (document.body ? document.body.innerText : '').toLowerCase();
-        const title = (document.title || '').trim().toLowerCase();
         if (location.protocol !== 'https:' ||
             !['top.gg', 'www.top.gg'].includes(location.hostname) ||
-            document.readyState === 'loading' ||
-            title.startsWith('just a moment') ||
-            title.startsWith('attention required') ||
-            body.includes('performing security verification') ||
-            body.includes('needs to review the security of your connection') ||
-            document.querySelector('#challenge-running, #challenge-stage, #challenge-form')) {
+            document.readyState === 'loading') {
             return 'unknown';
         }
         const controls = [...document.querySelectorAll('button, a, [role="button"]')];
@@ -1110,9 +1104,9 @@ async def topgg_auth_state(tab: Any) -> str:
         await asyncio.sleep(2)
         await settle_privacy_overlay(tab)
 
-        # Widget disappearance or a response token does not establish that the
-        # application has loaded. Runs #139/#140 repeatedly probed between
-        # challenges. Observe DOM state only; do not add requests/reloads here.
+        # Prefer an application control if it appears while the page settles.
+        # An unknown DOM hint is not an authentication failure: preserve the
+        # bounded session-probe fallback used before the audit.
         for settle_attempt in range(AUTH_PAGE_SETTLE_POLLS):
             page_hint = await topgg_page_auth_hint(tab)
             if page_hint in {AUTHENTICATED, AUTH_INVALID}:
@@ -1122,9 +1116,6 @@ async def topgg_auth_state(tab: Any) -> str:
         if page_hint == AUTHENTICATED:
             print("  ✅ top.gg vote page became usable after verification")
             return AUTHENTICATED
-        if page_hint == "unknown" or await is_turnstile_present(tab):
-            print("  ⏳ Application not ready after challenge; deferring session probe")
-            return AUTH_BLOCKED
 
     probe = await topgg_session_probe(tab)
     if probe.get("authenticated"):
@@ -1308,14 +1299,10 @@ async def unresolved_challenge_auth_state(tab: Any) -> str:
 
 
 async def is_turnstile_present(tab: Any) -> bool:
+    # Keep widget detection separate from the full-page error classifier.
+    # A residual title/container must not keep this click/wait loop active.
     return bool(await evaluate(tab, """(() => {
         const body = document.body ? document.body.innerText.toLowerCase() : '';
-        const title = (document.title || '').trim().toLowerCase();
-        if (title.startsWith('just a moment') ||
-            title.startsWith('attention required') ||
-            document.querySelector('#challenge-running, #challenge-stage, #challenge-form') ||
-            body.includes('performing security verification') ||
-            body.includes('needs to review the security of your connection')) return true;
         if (body.includes('verify you are human') ||
             body.includes('please solve the captcha to continue') ||
             body.includes('complete the captcha') ||
@@ -1343,19 +1330,105 @@ async def is_turnstile_solved(tab: Any) -> bool:
     })()"""))
 
 
+async def challenge_diagnostic(tab: Any) -> dict:
+    """Read fixed page signals without returning page text, URLs or tokens."""
+    return await evaluate(tab, """(() => {
+        const body = (document.body ? document.body.innerText : '').toLowerCase();
+        const title = (document.title || '').trim().toLowerCase();
+        const visible = node => {
+            if (!node || !(node.getClientRects().length || node.offsetWidth || node.offsetHeight)) {
+                return false;
+            }
+            const style = getComputedStyle(node);
+            return style.visibility !== 'hidden' && style.visibility !== 'collapse' &&
+                style.display !== 'none' && style.opacity !== '0';
+        };
+        const gates = [...document.querySelectorAll(
+            '#challenge-running, #challenge-stage, #challenge-form'
+        )];
+        const widgets = [...document.querySelectorAll([
+            'iframe[src*="challenges.cloudflare.com"]',
+            'iframe[src*="hcaptcha.com"]', 'iframe[src*="recaptcha"]',
+            '.cf-turnstile', '.h-captcha', '.g-recaptcha'
+        ].join(','))];
+        const fields = [...document.querySelectorAll([
+            'input[name="cf-turnstile-response"]',
+            'textarea[name="cf-turnstile-response"]',
+            'input[name="cf_challenge_response"]',
+            'input[name="g-recaptcha-response"]',
+            'textarea[name="g-recaptcha-response"]'
+        ].join(','))];
+        const controls = [...document.querySelectorAll('button, a, [role="button"]')];
+        const voteButtons = [...document.querySelectorAll('button, [role="button"]')]
+            .filter(node => (node.textContent || '').trim().toLowerCase() === 'vote');
+        return {
+            ready_state: ['loading', 'interactive', 'complete'].includes(document.readyState)
+                ? document.readyState : 'unknown',
+            title_just_moment: title.startsWith('just a moment'),
+            title_attention: title.startsWith('attention required'),
+            body_security: body.includes('performing security verification') ||
+                body.includes('needs to review the security of your connection'),
+            body_human: body.includes('verify you are human') ||
+                body.includes('please solve the captcha to continue') ||
+                body.includes('complete the captcha'),
+            gate_present: gates.length > 0,
+            gate_visible: gates.some(visible),
+            widget_present: widgets.length > 0,
+            response_present: fields.some(field => Boolean(field.value && field.value.length > 10)) ||
+                widgets.some(node => Boolean(node.dataset && node.dataset.response &&
+                    node.dataset.response.length > 10)),
+            vote_visible: voteButtons.some(visible),
+            vote_enabled: voteButtons.some(node => visible(node) && !node.disabled &&
+                !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true'),
+            login_visible: controls.some(node => visible(node) &&
+                ['login', 'log in', 'sign in'].includes((node.textContent || '').trim().toLowerCase()))
+        };
+    })()""")
+
+
+async def log_challenge_diagnostic(tab: Any, phase: str) -> None:
+    """Best-effort, bounded diagnostics safe for public Actions logs."""
+    safe_phase = phase if phase in ("detected", "click_error", "timeout") else "unknown"
+    try:
+        result = await asyncio.wait_for(challenge_diagnostic(tab), timeout=2)
+        if not isinstance(result, dict):
+            raise ValueError("invalid diagnostic")
+        ready = result.get("ready_state")
+        diagnostic = {
+            "phase": safe_phase,
+            "ready_state": ready if isinstance(ready, str) and ready in (
+                "loading", "interactive", "complete"
+            ) else "unknown",
+        }
+        for key in (
+            "title_just_moment", "title_attention", "body_security", "body_human",
+            "gate_present", "gate_visible", "widget_present", "response_present",
+            "vote_visible", "vote_enabled", "login_visible",
+        ):
+            value = result.get(key)
+            diagnostic[key] = value if isinstance(value, bool) else None
+        print("  Challenge diagnostic: " + json.dumps(diagnostic, sort_keys=True))
+    except Exception:
+        # A disconnected browser must not change the original outcome; never
+        # print exception details or an unexpected browser response here.
+        print(f"  Challenge diagnostic unavailable (phase={safe_phase})")
+
+
 async def solve_turnstile(tab: Any) -> bool:
     await dismiss_privacy_overlay(tab)
     if await is_turnstile_solved(tab):
         return True
     if not await is_turnstile_present(tab):
         return True
-    print("  → Turnstile detected, clicking verification checkbox...")
+    await log_challenge_diagnostic(tab, "detected")
+    print("  → Challenge detected; attempting library verification click...")
     try:
         await tab.verify_cf()
-        print("  → Turnstile checkbox click dispatched")
+        print("  → Verification click dispatched; target match and acceptance unconfirmed")
     except Exception as exc:
         dbg(f"verify_cf failed: {type(exc).__name__}")
         print(f"  ⚠️  Turnstile checkbox click failed ({type(exc).__name__})")
+        await log_challenge_diagnostic(tab, "click_error")
         return False
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     while asyncio.get_running_loop().time() < deadline:
@@ -1366,7 +1439,8 @@ async def solve_turnstile(tab: Any) -> bool:
             print("  → Challenge widget disappeared; application access still needs verification")
             return True
         await asyncio.sleep(2)
-    print("  ⚠️  Turnstile remained active after checkbox click")
+    await log_challenge_diagnostic(tab, "timeout")
+    print("  ⚠️  Challenge signals remained active after verification attempt")
     return False
 
 
