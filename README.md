@@ -166,6 +166,22 @@ Guards:
 
 ## Debugging
 
+### Vote mouse input after ads
+
+The Vote action waits for an enabled, visible control with stable geometry for
+500 ms. It checks that the control is under the pointer (not covered by an ad or
+consent layer), reacquires it after page updates, and checks again after hover.
+It then sends Chrome mouse press/release events instead of nodriver's JavaScript
+`element.click()` shortcut. Logs report whether trusted pointer/click events
+reached that specific control; a received click still requires the existing vote
+acknowledgement checks before reporting success.
+
+If the control never becomes actionable, the result explicitly states that no
+mouse press was sent. Once a press may have been sent, an uncertain outcome does
+not trigger another click. `test_vote_pointer.py` exercises this behavior against
+local HTML fixtures using Chrome, without contacting top.gg; set `CHROME_BIN` if
+Chrome is not on `PATH`.
+
 ### Cloudflare 403 diagnosis
 
 The retained September 24 runs returned `403`, `text/html`, and `cf-mitigated: challenge` from `/api/auth/session`. This identifies a Cloudflare Challenge Page, not an expired Auth.js cookie. The exact WAF rule and IP reputation are not exposed by those logs. See the [full review and run evidence](docs/audit-2026-09-24.md).
