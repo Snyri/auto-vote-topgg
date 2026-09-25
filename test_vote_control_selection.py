@@ -110,6 +110,15 @@ class VoteControlSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(observed["result"]["disabled"])
         self.assertEqual(observed["marked"], [])
 
+    async def test_css_hidden_control_does_not_hide_the_actual_vote_button(self):
+        for style in ({"visibility": "hidden"}, {"visibility": "collapse"}, {"opacity": "0"}):
+            with self.subTest(style=style):
+                observed = await self.select([
+                    {"tag": "button", "style": style},
+                    {"tag": "button"},
+                ])
+                self.assertEqual(observed["marked"], [{"index": 1, "tag": "button"}])
+
     async def test_role_button_with_a_navigation_href_is_not_a_vote_action(self):
         observed = await self.select([
             {"tag": "a", "attributes": {"role": "button", "href": "/bot/111/vote"}},

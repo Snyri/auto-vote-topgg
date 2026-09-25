@@ -74,6 +74,8 @@ POST_VOTE_VERIFY_ATTEMPTS = 2
 POST_VOTE_VERIFY_DELAY_SEC = 3
 POST_VOTE_CHALLENGE_SETTLE_POLLS = 2
 POST_VOTE_CHALLENGE_SETTLE_DELAY_SEC = 2
+VOTE_TARGET_STABLE_MS = 500
+VOTE_TARGET_POLL_SEC = 0.25
 COOLDOWN_PATTERN = re.compile(
     r"(?:you\s+)?can\s+vote\s+again\s+in\s+"
     r"(?:about\s+|approximately\s+)?"
@@ -97,6 +99,10 @@ class BrowserStartupError(RuntimeError):
 
 class BrowserCleanupError(RuntimeError):
     """Browser process or sensitive profile cleanup failed."""
+
+
+class VoteClickNotReady(RuntimeError):
+    """No Vote mouse press was sent; the control never became actionable."""
 
 
 TG_BOT_TOKEN = ""
@@ -879,6 +885,8 @@ async def _mark_exact_element(tab: Any, selector: str, texts: list[str], marker:
 
 
 async def _click_marked(tab: Any, marker: str) -> bool:
+    if marker == "data-auto-vote":
+        return await _click_vote_control(tab)
     await dismiss_privacy_overlay(tab)
     try:
         element = await tab.select(f'[{marker}="1"]', timeout=2)
@@ -888,6 +896,131 @@ async def _click_marked(tab: Any, marker: str) -> bool:
     except Exception as exc:
         dbg(f"Marked click failed: {type(exc).__name__}")
         return False
+
+
+async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
+    """Wait for a stable, unobstructed control and observe trusted target events."""
+    script = """(() => {
+        const state = window.__autoVotePointer || (window.__autoVotePointer = {});
+        const blocked = reason => { state.since = null; return {ready: false, reason}; };
+        const el = document.querySelector('[data-auto-vote="1"]');
+        if (!el || !el.isConnected) return blocked('missing');
+        const body = (document.body?.innerText || '').toLowerCase();
+        const title = (document.title || '').trim().toLowerCase();
+        if (body.includes('you will be able to vote after this ad')) return blocked('ad_active');
+        if (title.startsWith('just a moment') || title.startsWith('attention required') ||
+            body.includes('performing security verification') ||
+            body.includes('verify you are human')) return blocked('protection_active');
+        if ((el.textContent || '').trim().toLowerCase() !== 'vote' ||
+            !el.matches('button, [role="button"]')) return blocked('changed');
+        if (el.matches(':disabled') || el.hasAttribute('disabled') ||
+            el.closest('[inert], [aria-disabled="true"]')) return blocked('disabled');
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility !== 'visible' ||
+            Number(style.opacity) === 0 || style.pointerEvents === 'none' ||
+            !el.getClientRects().length) return blocked('hidden');
+        el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+        const rect = el.getBoundingClientRect();
+        const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
+        const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
+        if (right <= left || bottom <= top) return blocked('offscreen');
+        const x = (left + right) / 2, y = (top + bottom) / 2;
+        const hit = document.elementFromPoint(x, y);
+        if (!hit || !el.contains(hit)) return blocked('covered');
+        const geometry = [rect.left, rect.top, rect.width, rect.height];
+        const same = state.element === el && state.geometry &&
+            geometry.every((value, i) => Math.abs(value - state.geometry[i]) <= 1);
+        if (!same || state.since === null || state.since === undefined) {
+            state.since = performance.now();
+        }
+        state.element = el;
+        state.geometry = geometry;
+        if (performance.now() - state.since < __STABLE_MS__) return {ready: false, reason: 'settling'};
+        if (__ARM__) {
+            state.receipt = {pressed: false, released: false, clicked: false};
+            state.listeners = ['pointerdown', 'pointerup', 'click'].map(type => {
+                const handler = event => {
+                    if (event.isTrusted && event.composedPath().includes(el)) {
+                        const key = {pointerdown: 'pressed', pointerup: 'released', click: 'clicked'}[type];
+                        state.receipt[key] = true;
+                    }
+                };
+                window.addEventListener(type, handler, true);
+                return [type, handler];
+            });
+        }
+        return {ready: true, x, y};
+    })()""".replace("__STABLE_MS__", str(VOTE_TARGET_STABLE_MS)).replace("__ARM__", json.dumps(arm))
+    result = await asyncio.wait_for(evaluate(tab, script), timeout=2)
+    return result if isinstance(result, dict) else {"ready": False, "reason": "unavailable"}
+
+
+async def _click_vote_control(tab: Any) -> bool:
+    """Send one native mouse click; a target event still does not prove a vote."""
+    pressed = False
+    last_reason = None
+    deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            await dismiss_privacy_overlay(tab)
+            # Reacquire after the ad/React transition; do not retain an old node.
+            await mark_vote_button(tab)
+            target = await _vote_pointer_target(tab)
+            if target.get("ready") is True:
+                await asyncio.wait_for(tab.send(uc.cdp.input_.dispatch_mouse_event(
+                    "mouseMoved", x=target["x"], y=target["y"], buttons=0,
+                )), timeout=2)
+                await asyncio.sleep(VOTE_TARGET_POLL_SEC)
+                # Hover can change layout or reveal an overlay. Check again
+                # immediately before pressing and attach a target event observer.
+                target = await _vote_pointer_target(tab, arm=True)
+                if target.get("ready") is True:
+                    break
+            reason = target.get("reason")
+            if reason not in {
+                "missing", "ad_active", "protection_active", "changed", "disabled",
+                "hidden", "offscreen", "covered", "settling", "unavailable",
+            }:
+                reason = "unavailable"
+            if reason != last_reason:
+                print(f"  → Waiting for actionable Vote control: {reason}")
+                last_reason = reason
+            await asyncio.sleep(VOTE_TARGET_POLL_SEC)
+        else:
+            raise VoteClickNotReady(last_reason or "unavailable")
+
+        print("  → Sending native mouse press/release to Vote...")
+        # From this point a submission may have happened, even if CDP times out.
+        pressed = True
+        try:
+            await asyncio.wait_for(tab.send(uc.cdp.input_.dispatch_mouse_event(
+                "mousePressed", x=target["x"], y=target["y"],
+                button=uc.cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,
+            )), timeout=2)
+        finally:
+            await asyncio.wait_for(tab.send(uc.cdp.input_.dispatch_mouse_event(
+                "mouseReleased", x=target["x"], y=target["y"],
+                button=uc.cdp.input_.MouseButton.LEFT, buttons=0, click_count=1,
+            )), timeout=2)
+        receipt = await asyncio.wait_for(evaluate(tab,
+            "(() => window.__autoVotePointer?.receipt || {})()"), timeout=2)
+        receipt = receipt if isinstance(receipt, dict) else {}
+        flags = {key: receipt.get(key) is True for key in ("pressed", "released", "clicked")}
+        print("  → Vote target received trusted events: " + json.dumps(flags, sort_keys=True))
+        return flags["clicked"]
+    except Exception as exc:
+        if not pressed and not isinstance(exc, VoteClickNotReady):
+            raise VoteClickNotReady("browser_unavailable") from exc
+        raise
+    finally:
+        with suppress(Exception):
+            await asyncio.wait_for(evaluate(tab, """(() => {
+                const state = window.__autoVotePointer;
+                for (const [type, handler] of state?.listeners || []) {
+                    window.removeEventListener(type, handler, true);
+                }
+                delete window.__autoVotePointer;
+            })()"""), timeout=2)
 
 
 async def dismiss_privacy_overlay(tab: Any) -> bool:
@@ -1587,9 +1720,11 @@ async def mark_vote_button(tab: Any) -> dict:
         document.querySelectorAll('[data-auto-vote]').forEach(
             el => el.removeAttribute('data-auto-vote')
         );
-        const visible = (el) => Boolean(
-            el && (el.getClientRects().length || el.offsetWidth || el.offsetHeight)
-        );
+        const visible = el => {
+            if (!el || !(el.getClientRects().length || el.offsetWidth || el.offsetHeight)) return false;
+            const style = getComputedStyle(el);
+            return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
+        };
         // Plain anchors navigate to the public vote page; they do not submit
         // a vote. Prefer an enabled action when disabled copies precede it.
         const controls = [...document.querySelectorAll('button, [role="button"]')];
@@ -1724,14 +1859,20 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
 
     before_click = await vote_page_confirmation(tab, bot_id)
     print(f"  → {vote_target_diagnostic(state)}")
-    print("  → Clicking Vote...")
+    print("  → Preparing Vote mouse interaction...")
     try:
         if not await _click_marked(tab, "data-auto-vote"):
             return {
                 "bot_id": bot_id, "status": "uncertain", "vote_submitted": True,
-                "detail": "Vote click outcome unavailable; automatic resubmission suppressed",
+                "detail": "Vote mouse input sent; target click unconfirmed; automatic resubmission suppressed",
             }
         result = await verify_submitted_vote(tab, bot_id, account_id, before_click)
+    except VoteClickNotReady as exc:
+        print(f"  ⚠️ Vote control not actionable; no mouse press sent ({exc})")
+        return {
+            "bot_id": bot_id, "status": "error", "vote_submitted": False,
+            "detail": "Vote control not actionable; no mouse press sent",
+        }
     except Exception as exc:
         # The click may have reached the server even if its browser command or
         # the subsequent confirmation failed. Never blindly submit it again.

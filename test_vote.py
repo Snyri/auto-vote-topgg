@@ -1395,9 +1395,9 @@ class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
         tab = AsyncMock()
         tab.select.return_value = element
 
-        self.assertTrue(await vote._click_marked(tab, "data-auto-vote"))
+        self.assertTrue(await vote._click_marked(tab, "data-login"))
         dismiss.assert_awaited_once_with(tab)
-        tab.select.assert_awaited_once_with('[data-auto-vote="1"]', timeout=2)
+        tab.select.assert_awaited_once_with('[data-login="1"]', timeout=2)
         element.scroll_into_view.assert_awaited_once()
         element.click.assert_awaited_once()
 

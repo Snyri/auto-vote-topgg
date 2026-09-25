@@ -26,7 +26,10 @@ class VoteConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
             patch("vote.solve_turnstile", new=AsyncMock(return_value=True)) as solver,
             patch("vote.wait_for_ad", new=AsyncMock(return_value=None)),
             patch("vote.mark_vote_button", new=AsyncMock(return_value={"found": True, "disabled": False})),
-            patch("vote._click_marked", new=AsyncMock(return_value=click)) as clicked,
+            patch("vote._click_marked", new=AsyncMock(
+                side_effect=click if isinstance(click, Exception) else None,
+                return_value=click,
+            )) as clicked,
             patch("vote.vote_page_confirmation", new=AsyncMock(side_effect=snapshots)),
             patch("vote.persisted_vote_confirmation", new=AsyncMock(return_value={
                 "confirmed": True, "evidence": "bounded cooldown",
@@ -82,6 +85,17 @@ class VoteConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "uncertain")
         self.assertIs(result["vote_submitted"], True)
         self.assertFalse(vote.is_retryable_result(result))
+        clicked.assert_awaited_once()
+        tab.reload.assert_not_awaited()
+        persisted.assert_not_awaited()
+
+    async def test_unactionable_control_is_not_misreported_as_a_submission(self):
+        result, tab, clicked, _, persisted = await self.exercise(
+            [BEFORE], click=vote.VoteClickNotReady("covered"),
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIs(result["vote_submitted"], False)
+        self.assertTrue(vote.is_retryable_result(result))
         clicked.assert_awaited_once()
         tab.reload.assert_not_awaited()
         persisted.assert_not_awaited()
