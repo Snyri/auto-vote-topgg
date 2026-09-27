@@ -15,7 +15,7 @@ on:
         default: ''
         type: string
       recovery_depth:
-        description: Internal bounded fresh-run recovery depth
+        description: Legacy recovery depth (accepted for compatibility; no limit)
         required: false
         default: '0'
         type: string
@@ -190,133 +190,28 @@ jobs:
           test "$VOTE_STATUS" = "0"
           test "$VOTE_JOB_RESULT" = "success"
 
-  browser-startup-retry:
-    needs: vote
-    if: always() && github.ref == 'refs/heads/master' && github.run_attempt == 1
+  failure-retry:
+    # Wait for all result/cleanup jobs; the concurrency lock queues the next run
+    # until this one has finished. Cancelled runs intentionally stop the chain.
+    needs: [vote, verify-vote, cleanup]
+    if: ${{ !cancelled() && failure() && github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write
     steps:
-      - name: Dispatch one fresh-run retry when browser startup failed
+      - name: Dispatch a new run after failure
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-          SOURCE: ${{ github.event.inputs.source }}
-          RECOVERY_DEPTH: ${{ github.event.inputs.recovery_depth || '0' }}
         run: |
           set -euo pipefail
-          if [ "$SOURCE" = "browser-startup-retry" ]; then
-            echo "Browser-startup fresh-run retry already consumed."
-            exit 0
-          fi
-          case "$RECOVERY_DEPTH" in
-            0) NEXT_DEPTH=1 ;;
-            1) NEXT_DEPTH=2 ;;
-            *) echo "Fresh-run recovery depth is invalid or exhausted."; exit 0 ;;
-          esac
-
-          artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "browser-startup-retry" and .expired == false)] | first // empty')"
-          artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
-          if [ -z "$artifact_id" ]; then
-            echo "No browser startup retry marker; no dispatch."
-            exit 0
-          fi
-
-          state_dir="$(mktemp -d)"
-          trap 'rm -rf "$state_dir"' EXIT
-          gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$state_dir/state.zip"
-          python - "$state_dir/state.zip" <<'PY'
-          import json
-          import sys
-          import zipfile
-          from pathlib import Path
-
-          archive_path = Path(sys.argv[1])
-          if archive_path.stat().st_size > 65536:
-              raise ValueError("Retry archive is too large")
-          with zipfile.ZipFile(archive_path) as archive:
-              entries = archive.infolist()
-              if len(entries) != 1 or entries[0].filename != "browser-startup-retry.json":
-                  raise ValueError("Retry archive must contain only the expected marker")
-              if entries[0].file_size > 1024:
-                  raise ValueError("Retry marker is too large")
-              data = json.loads(archive.read(entries[0]))
-          if data != {"reason": "browser_startup_failed"}:
-              raise ValueError("Invalid browser startup retry marker")
-          PY
-
           gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
-            -f "ref=$GITHUB_REF_NAME" \
-            -f 'inputs[source]=browser-startup-retry' \
-            -f "inputs[origin_run_id]=$RUN_ID" \
-            -f "inputs[recovery_depth]=$NEXT_DEPTH"
-          echo "Dispatched one fresh-run retry for browser startup failure from run $RUN_ID"
-
-  protection-retry:
-    needs: vote
-    if: always() && github.ref == 'refs/heads/master' && github.run_attempt == 1
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Dispatch one fresh-run retry when protection persists
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          SOURCE: ${{ github.event.inputs.source }}
-          RECOVERY_DEPTH: ${{ github.event.inputs.recovery_depth || '0' }}
-        run: |
-          set -euo pipefail
-          if [ "$SOURCE" = "protection-retry" ]; then
-            echo "Protection fresh-run retry already consumed."
-            exit 0
-          fi
-          case "$RECOVERY_DEPTH" in
-            0) NEXT_DEPTH=1 ;;
-            1) NEXT_DEPTH=2 ;;
-            *) echo "Fresh-run recovery depth is invalid or exhausted."; exit 0 ;;
-          esac
-
-          artifact="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "protection-retry" and .expired == false)] | first // empty')"
-          artifact_id="$(jq -r '.id // empty' <<<"$artifact")"
-          if [ -z "$artifact_id" ]; then
-            echo "No protection retry marker; no dispatch."
-            exit 0
-          fi
-
-          state_dir="$(mktemp -d)"
-          trap 'rm -rf "$state_dir"' EXIT
-          gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$state_dir/state.zip"
-          python - "$state_dir/state.zip" <<'PY'
-          import json
-          import sys
-          import zipfile
-          from pathlib import Path
-
-          archive_path = Path(sys.argv[1])
-          if archive_path.stat().st_size > 65536:
-              raise ValueError("Retry archive is too large")
-          with zipfile.ZipFile(archive_path) as archive:
-              entries = archive.infolist()
-              if len(entries) != 1 or entries[0].filename != "protection-retry.json":
-                  raise ValueError("Retry archive must contain only the expected marker")
-              if entries[0].file_size > 1024:
-                  raise ValueError("Retry marker is too large")
-              data = json.loads(archive.read(entries[0]))
-          if data != {"reason": "protection_blocked"}:
-              raise ValueError("Invalid protection retry marker")
-          PY
-
-          gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
-            -f "ref=$GITHUB_REF_NAME" \
-            -f 'inputs[source]=protection-retry' \
-            -f "inputs[origin_run_id]=$RUN_ID" \
-            -f "inputs[recovery_depth]=$NEXT_DEPTH"
-          echo "Dispatched one fresh-run retry for persistent protection block from run $RUN_ID"
+            -f 'ref=master' \
+            -f 'inputs[source]=failure-retry' \
+            -f "inputs[origin_run_id]=$RUN_ID"
+          echo "Requested a fresh run after failed run $RUN_ID (no recovery-chain limit)."
 
   cleanup:
     needs: vote

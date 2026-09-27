@@ -87,9 +87,9 @@ class PartialProgressRegressionTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     patch("builtins.print"),
                     patch("vote.asyncio.sleep", new_callable=AsyncMock),
-                    patch("vote._run_account", new=AsyncMock(side_effect=[
-                        initial, [terminal], [terminal],
-                    ])) as run_account,
+                    patch("vote._run_account", new=AsyncMock(
+                        side_effect=[initial] + [[terminal]] * (vote.MAX_RETRIES - 1)
+                    )) as run_account,
                 ):
                     results = await vote.process_account("token", BOT_IDS, 1, 1)
 

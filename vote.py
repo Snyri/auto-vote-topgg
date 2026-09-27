@@ -28,8 +28,8 @@ AUTH_PAGE_SETTLE_POLLS = 4
 AUTH_PAGE_SETTLE_DELAY_SEC = 2
 DELAY_BETWEEN_BOTS_SEC = 3
 DELAY_BETWEEN_ACCOUNTS_SEC = 5
-MAX_RETRIES = 3
-MAX_BLOCKED_ATTEMPTS = 2
+MAX_RETRIES = 5
+MAX_BLOCKED_ATTEMPTS = 5
 MAX_TURNSTILE_CYCLES_PER_PHASE = 3
 RETRY_DELAY_SEC = 10
 FINAL_STATUSES = frozenset({"success", "cooldown", "captcha_required", "blocked"})
@@ -645,9 +645,9 @@ def write_browser_startup_retry_state(
 
 def should_request_protection_retry(all_results: list[list[dict]]) -> bool:
     results = [result for account_results in all_results for result in account_results]
-    # A fresh workflow processes every configured account/bot. Without a
-    # cross-run submission ledger it must not repeat an unconfirmed submission,
-    # even when another bot was blocked before its own Vote click.
+    # Preserve the legacy marker's meaning: a protection failure without any
+    # outstanding submission. It is diagnostic only; workflow failure recovery
+    # now runs independently of these markers, with no chain limit.
     if any(
         result.get("vote_submitted") is True
         and result.get("status") not in COMPLETED_STATUSES
@@ -2442,7 +2442,7 @@ async def process_account(
                 if blocked_attempts < MAX_BLOCKED_ATTEMPTS and attempt < MAX_RETRIES:
                     print(f"{prefix} ↺ Protection block detected; trying one fresh browser")
                     continue
-                print(f"{prefix} ⏳ Protection block persists; deferring to scheduled retry")
+                print(f"{prefix} ⏳ Protection block persists; ending this run")
                 return apply_account_error(last_account_error)
             if not is_retryable_result(last_account_error):
                 print(f"{prefix} 🔒 Authentication requires manual CAPTCHA")
@@ -2560,7 +2560,7 @@ async def main() -> int:
     if run_origin_id:
         print(f"   Origin  : {run_origin_id}")
     if run_recovery_depth:
-        print(f"   Recovery: {run_recovery_depth}/2")
+        print(f"   Legacy recovery depth: {run_recovery_depth} (no chain limit)")
     print(f"   Tokens  : {total}")
     print(f"   Cookies : {sum(bool(cookies) for cookies in all_cookies)}/{total} account(s)")
     print(f"   Bots    : {len(bot_ids)}")
@@ -2580,9 +2580,9 @@ async def main() -> int:
     if retry_at is not None:
         print(f"⏰ Next scheduled vote: {format_retry_at(retry_at)}")
     if write_browser_startup_retry_state(all_results):
-        print("↺ Browser startup fresh-run retry requested")
+        print("↺ Browser startup failure marker recorded")
     if write_protection_retry_state(all_results):
-        print("↺ Protection-block fresh-run retry requested")
+        print("↺ Protection-block failure marker recorded")
     report = build_notification(all_results, now)
     send_notification(report)
     await send_captcha_screenshots(all_results)

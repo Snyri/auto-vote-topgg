@@ -983,7 +983,7 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote._run_account", new_callable=AsyncMock)
-    async def test_blocked_auth_uses_only_one_fresh_browser_retry(
+    async def test_blocked_auth_stops_after_five_attempts(
         self, run_account, _sleep, _print
     ):
         run_account.return_value = [
@@ -993,23 +993,24 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         results = await vote.process_account("token", ["111"], 1, 1)
 
         self.assertEqual(results[0]["status"], "blocked")
-        self.assertEqual(run_account.await_count, vote.MAX_BLOCKED_ATTEMPTS)
+        self.assertEqual(run_account.await_count, 5)
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote._run_account", new_callable=AsyncMock)
-    async def test_vote_page_block_gets_only_one_fresh_browser_retry(
+    async def test_vote_page_block_can_succeed_on_fifth_attempt(
         self, run_account, _sleep, _print
     ):
-        run_account.side_effect = [
-            [{"bot_id": "111", "status": "blocked", "detail": "protection", "account_id": "id"}],
-            [{"bot_id": "111", "status": "success", "detail": "ok", "account_id": "id"}],
-        ]
+        run_account.side_effect = [[
+            {"bot_id": "111", "status": "blocked", "detail": "protection", "account_id": "id"}
+        ]] * 4 + [[
+            {"bot_id": "111", "status": "success", "detail": "ok", "account_id": "id"}
+        ]]
 
         results = await vote.process_account("token", ["111"], 1, 1)
 
         self.assertEqual(results[0]["status"], "success")
-        self.assertEqual(run_account.await_count, 2)
+        self.assertEqual(run_account.await_count, 5)
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
