@@ -477,7 +477,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
         root = pathlib.Path(__file__).parent
         vote_workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
         security_workflow = (root / ".github/workflows/security.yml").read_text(encoding="utf-8")
-        self.assertGreaterEqual(vote_workflow.count("timeout-minutes:"), 5)
+        self.assertGreaterEqual(vote_workflow.count("timeout-minutes:"), 4)
         self.assertEqual(security_workflow.count("timeout-minutes: 10"), 3)
 
 
@@ -527,16 +527,18 @@ class WorkflowConfigurationTests(unittest.TestCase):
         api.assert_not_called()
 
 
-    def test_vote_workflow_bounds_cross_category_recovery(self):
+    def test_vote_workflow_retries_failures_without_a_chain_limit(self):
         root = pathlib.Path(__file__).parent
         workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
-        self.assertIn("recovery_depth:", workflow)
-        self.assertIn('0) NEXT_DEPTH=1 ;;', workflow)
-        self.assertIn('1) NEXT_DEPTH=2 ;;', workflow)
-        self.assertIn('*) echo "Fresh-run recovery depth is invalid or exhausted."; exit 0 ;;', workflow)
-        self.assertIn('inputs[recovery_depth]=$NEXT_DEPTH', workflow)
-        self.assertIn('if [ "$SOURCE" = "browser-startup-retry" ]', workflow)
-        self.assertIn('if [ "$SOURCE" = "protection-retry" ]', workflow)
+        retry = workflow.split("  failure-retry:\n", 1)[1].split("  cleanup:\n", 1)[0]
+        self.assertIn("needs: [vote, verify-vote, cleanup]", retry)
+        self.assertIn("!cancelled() && failure() && github.ref == 'refs/heads/master'", retry)
+        self.assertEqual(workflow.count("/dispatches"), 1)
+        self.assertIn("inputs[source]=failure-retry", retry)
+        self.assertNotIn("recovery_depth", retry)
+        self.assertNotIn("run_attempt", retry)
+        self.assertNotIn("sleep", retry)
+        self.assertIn("cancel-in-progress: false", workflow)
 
     def test_scheduler_image_pins_runtime_dependencies_and_non_root_user(self):
         root = pathlib.Path(__file__).parent

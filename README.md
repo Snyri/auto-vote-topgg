@@ -29,7 +29,7 @@ The scheduler follows observed eligibility and bounded retry deadlines. A disapp
 - 🔐 **OAuth fallback** — uses Discord OAuth when cookies are missing or expired
 - ⚡ **Turnstile verification** — dismisses top.gg privacy overlay, then nodriver clicks Cloudflare checkbox during cookie auth, OAuth, pre-vote, post-vote, and verification reload
 - 🔒 **Explicit CAPTCHA fallback** — unresolved interactive CAPTCHA is reported and not retried on the same runner
-- 🔄 **Fresh-run recovery** — browser-startup failures and persistent protection blocks can dispatch one bounded fresh GitHub runner retry
+- 🔄 **Fresh-run recovery** — every failed master run dispatches a fresh GitHub runner, with no recovery-chain limit
 - 📨 **Telegram notifications** — chunked per-account reports with privacy-safe account fingerprints
 - 🔁 **Scoped retry** — retries transient authentication and bot failures without repeating final results
 - 📸 **Failure evidence** — always captures CAPTCHA pages and final auth failures for private Telegram; other error screenshots remain opt-in
@@ -45,7 +45,7 @@ TOPGG_COOKIES_JSON (same line order as TOKENS)
     ↓ inspect vote-page UI + verify /api/auth/session
     ├── vote surface visible → authenticated even if the session endpoint is temporarily blocked
     ├── explicit unauthenticated state → Discord-origin token injection → OAuth Authorize
-    └── protection block → one fresh-browser retry, then scheduled backoff
+    └── protection block → up to five browser attempts, then a fresh workflow run
 top.gg authenticated
     ↓ navigate to vote page → wait ad → nodriver verify_cf()
     ├── library verification click → observe response/page state; target and acceptance are not guaranteed
@@ -140,7 +140,7 @@ After every run, `vote.py` writes a private one-day `next-vote` artifact contain
 {"next_vote_at": 1786334400}
 ```
 
-Confirmed success normally schedules the next attempt about 12 hours later. Parsed top.gg cooldowns use the reported duration plus the safety buffer. Protection blocks, CAPTCHA states, and other transient failures also receive bounded retry times, so a failed run does not cause the external scheduler to dispatch again every minute.
+Confirmed success normally schedules the next attempt about 12 hours later. Parsed top.gg cooldowns use the reported duration plus the safety buffer. Protection blocks, CAPTCHA states, and other transient failures also receive bounded retry times, so the external scheduler retains a next-attempt timestamp. Independently, failed master workflow runs now request an immediate fresh run without waiting for that timestamp.
 
 The Northflank scheduler waits for an active vote workflow instead of dispatching a duplicate, validates schedule timestamps, retries transient GitHub API reads with backoff, waits at least five minutes after a failed run with no usable schedule, imposes a maximum workflow wait, and periodically refreshes the latest vote artifact while sleeping. Refreshes never accept an older run ID, and short retries from newer failed runs cannot advance a still-future schedule from the most recent successful run. A final schedule check also runs before dispatch. Required environment values are `GH_TOKEN`, `GH_REPOSITORY`, `GH_REF`, and `GH_WORKFLOW`; optional timing controls are `POLL_SECONDS`, `ERROR_RETRY_SECONDS`, and `MAX_RUN_WAIT_SECONDS`.
 
@@ -155,14 +155,9 @@ Chrome startup may occasionally outlive nodriver's short initial DevTools pollin
 {"reason":"browser_startup_failed"}
 ```
 
-The workflow reads this artifact and may dispatch a fresh `vote.yml` run on a new runner. Persistent top.gg protection blocks use the same bounded pattern with a separate `protection-retry` marker. Retry runs are identified by `source=browser-startup-retry` or `source=protection-retry`, `origin_run_id=<original-run-id>`, and an internal recovery depth.
+The browser-startup and protection-retry artifacts remain diagnostic markers. Fresh-run recovery no longer depends on them: after the vote, verification, and cleanup jobs finish, any failed master run dispatches a new `vote.yml` run with `source=failure-retry` and `origin_run_id=<failed-run-id>`. This also covers setup failures and job timeouts.
 
-Guards:
-- At most two fresh runs are allowed across one recovery chain.
-- The same failure category cannot dispatch itself twice; a cross-category recovery (for example protection block followed by browser-startup failure) is still allowed within the depth limit.
-- Only first attempt (`run_attempt == 1`) may dispatch.
-- Marker artifact contains no tokens, cookies, account IDs, bot IDs, or screenshots.
-- Original failed run remains a truthful failure; Telegram error report is sent before retry starts.
+There is no delay or maximum number of fresh runs, including after a manually rerun failure. Each new run can try up to five account/browser attempts. The shared concurrency group lets the next run start after the previous run finishes, subject to GitHub runner availability. The original run remains failed. Success stops automatic recovery; cancelling the current run stops this chain (the independent external scheduler remains enabled). The legacy `recovery_depth` input is accepted for compatibility but imposes no limit. GitHub service, API and usage limits still apply, and a dispatch API failure is reported as a failed retry job.
 
 ## Debugging
 
@@ -204,7 +199,7 @@ Non-CAPTCHA error screenshots remain disabled unless `SEND_ERROR_SCREENSHOTS=1` 
 
 A Vote click alone is not success. The browser first looks for a **new acknowledgement on the current bot page**: strong success/cooldown text absent before the click, observed in two consecutive checks, with no enabled Vote button, active challenge, login requirement, or explicit error. This records application acknowledgement without a navigation that could trigger Cloudflare. It does not claim an independently queried server receipt. A pre-existing phrase or a still-enabled Vote button cannot confirm the vote.
 
-If no such acknowledgement appears, the existing independent page-reload check remains a fallback. A post-click result that cannot be confirmed retains `vote_submitted` and its original outcome. It is not clicked again during that run, and no automatic fresh-workflow recovery is dispatched while any submission remains unconfirmed. Other bots can still retry within the current run. Unconfirmed outcomes remain failures, rather than being silently turned green; normal scheduled/manual runs are not deduplicated across runs by this in-memory flag.
+If no such acknowledgement appears, the existing independent page-reload check remains a fallback. A post-click result that cannot be confirmed retains `vote_submitted` and its original outcome. It is not clicked again during that run. An unconfirmed submission still fails the workflow and therefore starts a fresh run under the unlimited recovery policy; the new run checks the page for cooldown before attempting another vote. Other bots can still retry within the current run. Unconfirmed outcomes remain failures, rather than being silently turned green; normal scheduled/manual runs are not deduplicated across runs by this in-memory flag.
 
 CAPTCHA/Turnstile challenges are solved first with nodriver `verify_cf()` wherever they appear: top.gg cookie authentication, Discord OAuth, before voting, after clicking `Vote`, and after vote verification reload. During top.gg authentication the runtime clears an active Turnstile before probing the Auth.js session endpoint, avoiding predictable protection-page 403 requests while the challenge is still active. For a denied session request, logs record only HTTP status and safe Cloudflare classification metadata (`cf-mitigated`, `cf-ray` if exposed), never response HTML or credentials. A 403 with server=cloudflare alone does not prove that a WAF rule blocked the request; an explicit `cf-mitigated: challenge` header is more specific. This improves diagnosis; it does not override a denial. top.gg privacy-consent overlays are checked repeatedly after page open/reload, then dismissed before auth probes, every marked click, vote interaction, and solver clicks so they cannot cover the checkbox or `Vote` button. If privacy-modal dismissal fails while the modal is detected, one screenshot plus the dismiss error is sent to Telegram. If solver cannot clear the challenge, the current browser page is captured when possible and sent to the configured Telegram chat immediately after the text report. Final `auth_failed` results also capture the last browser state and send it after the text report. No `SEND_ERROR_SCREENSHOTS` secret is required for CAPTCHA or final auth-failure evidence.
 
@@ -213,16 +208,16 @@ For other GitHub Actions diagnostics, add repository secret `SEND_ERROR_SCREENSH
 > [!WARNING]
 > Use ephemeral, single-tenant GitHub-hosted runners only. Do not run this project on persistent/shared self-hosted runners: browser processes handle live account credentials and temporary profiles.
 
-Transient authentication/browser failures before submission retry up to 3 times. Protection-blocked authentication uses at most two browser attempts before deferring to the external scheduler. In multi-bot runs, `error` or `uncertain` results retry only if no Vote submission may have occurred; `success`, `cooldown`, and `captcha_required` are final for the current run. Interactive CAPTCHA is intentionally not retried on the same runner/IP. Telegram reports identify accounts using a short SHA-256 fingerprint, never token fragments, and split automatically below Telegram's message limit.
+Transient authentication/browser failures and protection-blocked authentication allow up to five total attempts per account (the first attempt plus four retries). In multi-bot runs, `error` or `uncertain` results retry only if no Vote submission may have occurred; `success`, `cooldown`, and `captcha_required` are final for the current run. Interactive CAPTCHA is intentionally not retried on the same runner/IP. Telegram reports identify accounts using a short SHA-256 fingerprint, never token fragments, and split automatically below Telegram's message limit.
 
 Completed per-bot results survive later browser failures and authentication failures on a retry. Missing results become explicit errors. Duplicate bot IDs are collapsed while preserving order. All branches share one workflow concurrency group, and artifact validation/upload failures fail the workflow even when the voting process exits successfully.
 
 - `success`, `cooldown`: final on the current runner/IP.
 - A cooldown with a valid duration schedules an isolated dispatcher instead of sleeping/retrying on the same runner.
 - `captcha_required`: final on the current runner/IP.
-- `error`, `auth_failed`, `uncertain` before submission: retry up to 3 times.
-- `blocked` before submission: one fresh-browser retry, then a scheduled backoff.
-- Unconfirmed post-click outcomes: preserve the result and defer; no immediate resubmission or fresh-workflow recovery.
+- `error`, `auth_failed`, `uncertain` before submission: up to five total attempts.
+- `blocked` before submission: up to five browser attempts, then a fresh workflow run.
+- Unconfirmed post-click outcomes: no resubmission within the current run; workflow failure starts a fresh run that checks for cooldown.
 
 `error`, `auth_failed`, `uncertain`, or `captcha_required` sends its report first, then exits non-zero so GitHub Actions shows failure.
 

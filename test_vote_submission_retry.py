@@ -121,9 +121,7 @@ class SubmissionRetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 latest = result("all", status, detail="Later authentication failed")
                 results, attempts = await self.process([
                     [submitted, result("222", "error", detail="Original pending error")],
-                    [latest],
-                    [latest],
-                ], ["111", "222"])
+                ] + [[latest]] * (vote.MAX_RETRIES - 1), ["111", "222"])
                 self.assertEqual(results[0], submitted)
                 self.assertEqual(results[1], {**latest, "bot_id": "222"})
                 self.assertEqual(attempts[0], ["111", "222"])
@@ -154,16 +152,15 @@ class SubmissionRetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, [["111", "222"], ["222"]])
         self.assertFalse(vote.should_request_protection_retry([results]))
 
-    async def test_independent_persistent_block_keeps_its_existing_retry_bound(self):
+    async def test_independent_persistent_block_retries_five_times_without_resubmitting(self):
         submitted = result("111", "uncertain", submitted=True, detail="Vote clicked; outcome unknown")
         blocked = result("222", "blocked")
         results, attempts = await self.process([
             [submitted, blocked],
-            [blocked],
-        ], ["111", "222"])
+        ] + [[blocked]] * 4, ["111", "222"])
         self.assertEqual(results, [submitted, blocked])
-        self.assertEqual(len(attempts), vote.MAX_BLOCKED_ATTEMPTS)
-        self.assertEqual(attempts, [["111", "222"], ["222"]])
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(attempts, [["111", "222"]] + [["222"]] * 4)
         self.assertFalse(vote.should_request_protection_retry([results]))
 
 
