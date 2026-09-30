@@ -1526,9 +1526,19 @@ async def is_turnstile_present(tab: Any) -> bool:
     return bool(await evaluate(tab, """(() => {
         const body = document.body ? document.body.innerText.toLowerCase() : '';
         const title = (document.title || '').trim().toLowerCase();
-        if (title.startsWith('just a moment') ||
+        const managed = title.startsWith('just a moment') ||
             body.includes('performing security verification') ||
-            body.includes('needs to review the security of your connection')) return true;
+            body.includes('needs to review the security of your connection');
+        const usableVote = [...document.querySelectorAll('button, [role="button"]')].some(node => {
+            if ((node.textContent || '').trim().toLowerCase() !== 'vote' || node.disabled ||
+                node.getAttribute('aria-disabled') === 'true' ||
+                !(node.getClientRects().length || node.offsetWidth || node.offsetHeight)) return false;
+            const style = getComputedStyle(node);
+            return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
+        });
+        const usableCooldown = body.includes('vote again in') || body.includes('already voted') ||
+            body.includes('can vote again');
+        if (managed && !usableVote && !usableCooldown) return true;
         if (body.includes('verify you are human') ||
             body.includes('please solve the captcha to continue') ||
             body.includes('complete the captcha') ||
