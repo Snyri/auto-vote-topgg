@@ -12,6 +12,7 @@ from unittest.mock import patch
 import nodriver as uc
 
 import vote
+import request_diagnostics
 
 
 CHROME = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
@@ -110,6 +111,18 @@ class VotePointerBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await vote.evaluate(self.tab, "window.votes"), 1)
         self.assertTrue(await vote.evaluate(self.tab,
             "events.every(event => event.time >= window.adFinishedAt)"))
+
+    async def test_native_receipt_has_browser_epoch_time_for_network_correlation(self):
+        tracker = request_diagnostics.RequestDiagnostics(self.tab)
+        self.tab._topgg_diagnostics = tracker
+        tracker.vote_network.select_bot("111")
+        before = await vote.evaluate(self.tab, "Date.now() / 1000")
+        self.assertTrue(await vote._click_marked(self.tab, "data-auto-vote"))
+        after = await vote.evaluate(self.tab, "Date.now() / 1000")
+        self.assertTrue(tracker.vote_network.trusted)
+        self.assertGreaterEqual(tracker.vote_network.pressed_at, before)
+        self.assertLessEqual(tracker.vote_network.pressed_at, after + 0.001)
+        self.assertTrue(await vote.evaluate(self.tab, "window.__autoVotePointer === undefined"))
 
     async def test_hover_overlay_prevents_press_and_is_not_called_a_submission(self):
         await vote.evaluate(self.tab, """(() => {

@@ -203,6 +203,32 @@ submissions are not clicked again in that run. The profile is closed and deleted
 when that account ends, including cancellation; no profile crosses accounts or
 workflow runs. Unlimited fresh-workflow recovery remains as configured.
 
+Vote responses also guide recovery. Passive CDP tracking recognizes exact
+bot-specific vote API routes and single known vote RPC operations with an
+explicit matching bot identifier. It records the actual trusted mouse press
+time, rather than treating an arbitrary POST near the click as a submission.
+Public diagnostics add `vote_operation` (`vote_submission`, `vote_state`, or
+`unrelated`) and a fixed-vocabulary API route template, with identifiers and
+unknown segments replaced and query strings removed. Raw URLs, request payloads
+and credentials are never retained or printed; bounded RPC input is inspected
+only for explicit bot identifiers.
+
+Recent Cloudflare challenges on recognized vote/state operations cause a short
+pre-click wait. A fresh JSON vote-state response can clear that wait; a persistent
+challenge returns a protection block before any mouse press. The existing retry
+then opens a fresh browser and checks authentication, cooldown and the ad again.
+
+After a trusted click, a completed exact vote request with HTTP 403 and
+`cf-mitigated: challenge`/HTML can establish that the submission was rejected.
+Only when all tracked submissions have that outcome does the result become
+retryable `blocked` with `submission_rejected=true` and `vote_submitted=false`.
+This skips unnecessary confirmation reloads and uses the existing five-attempt
+fresh-browser recovery. A missing response, redirect, unknown endpoint, mixed
+success/denial, unknown same-site write, unfinished request or incomplete tracking keeps the original
+uncertain-submission protection. HTTP 200 alone never confirms a vote; page
+acknowledgement/cooldown checks still determine success. Unlimited fresh-workflow
+recovery remains unchanged.
+
 Passive CDP diagnostics classify failed requests and top.gg API write responses
 around the Vote interaction. Logs contain fixed request/phase categories,
 HTTP status, content category and safe Cloudflare indicators, without URLs,
