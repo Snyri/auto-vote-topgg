@@ -78,11 +78,14 @@ async def _on_node(tab, object_id, function):
 
 
 CONTROL_FUNCTION = """function () {
-    const el = this.matches?.('input[type="checkbox"], [role="checkbox"]') ? this :
-        this.closest?.('label')?.control || this.closest?.('[role="checkbox"]');
-    if (!el || !el.isConnected) return {control: false};
-    const style = el.ownerDocument.defaultView.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
+    const hit = this.nodeType === 1 ? this : this.parentElement;
+    const el = hit?.matches('input[type="checkbox"], [role="checkbox"]') ? hit :
+        hit?.closest('label')?.control || hit?.closest('[role="checkbox"]');
+    if (!el?.matches('input[type="checkbox"], [role="checkbox"]') || !el.isConnected) return {control: false};
+    // A styled checkbox can hide its input and expose a clickable label/span.
+    // Validate the visible hit element while checking the associated control.
+    const style = hit.ownerDocument.defaultView.getComputedStyle(hit);
+    const rect = hit.getBoundingClientRect();
     const enabled = !el.matches(':disabled') && !el.closest('[inert], [aria-disabled="true"]') &&
         !el.checked && el.getAttribute('aria-checked') !== 'true';
     return {control: true, enabled,
@@ -167,9 +170,10 @@ async def checkbox_target(tab, evaluate) -> dict:
 
 
 ARM_FUNCTION = """function () {
-    const el = this.matches?.('input[type="checkbox"], [role="checkbox"]') ? this :
-        this.closest?.('label')?.control || this.closest?.('[role="checkbox"]');
-    if (!el || !el.isConnected) return false;
+    const hit = this.nodeType === 1 ? this : this.parentElement;
+    const el = hit?.matches('input[type="checkbox"], [role="checkbox"]') ? hit :
+        hit?.closest('label')?.control || hit?.closest('[role="checkbox"]');
+    if (!el?.matches('input[type="checkbox"], [role="checkbox"]') || !el.isConnected) return false;
     const win = el.ownerDocument.defaultView;
     const receipt = {pressed: false, released: false, clicked: false};
     const listeners = ['pointerdown', 'pointerup', 'click'].map(type => {

@@ -239,6 +239,21 @@ class CheckboxBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False)), "sent")
         self.assertEqual(await vote.evaluate(self.tab, "fixtureFrame.contentWindow.received"), [True])
 
+    async def test_visible_label_activates_its_hidden_checkbox_input(self):
+        await vote.evaluate(self.tab, """(() => {
+            const label = document.createElement('label');
+            label.style.cssText = 'position:absolute;left:143px;top:125px;width:24px;height:24px';
+            checkbox.style.display = 'none';
+            document.body.append(label); label.append(checkbox);
+        })()""")
+        with patch('builtins.print') as output:
+            self.assertEqual(await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False)), 'sent')
+        self.assertEqual(await vote.evaluate(self.tab, 'window.received'), [True])
+        self.assertTrue(await vote.evaluate(self.tab, 'checkbox.checked'))
+        payloads = [str(c.args[0]) for c in output.call_args_list if 'Cloudflare mouse input:' in str(c.args[0])]
+        receipt = json.loads(payloads[0].split(': ', 1)[1])['trusted_events']
+        self.assertTrue(all(receipt.values()))
+
     async def test_overlay_created_on_hover_blocks_the_click(self):
         await vote.evaluate(self.tab, """checkbox.addEventListener('pointerenter', () => {
             const cover = document.createElement('div');
