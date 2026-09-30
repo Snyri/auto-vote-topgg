@@ -1736,8 +1736,12 @@ class FullOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     async def test_cookie_fallback_captcha_reports_failure_without_retry(self, _print):
         browser = MagicMock()
-        browser.__iter__.return_value = iter([AsyncMock()])
+        tab = AsyncMock()
+        tab.add_handler = MagicMock()
+        tab.remove_handler = MagicMock()
+        browser.__iter__.return_value = iter([tab])
         browser.cookies.clear = AsyncMock()
+        browser.cookies.get_all = AsyncMock(return_value=[])
         browser.aclose = AsyncMock()
         account_cookies = [[{"name": "__Secure-authjs.session-token"}]]
         captcha = {
