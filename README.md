@@ -213,10 +213,15 @@ unknown segments replaced and query strings removed. Raw URLs, request payloads
 and credentials are never retained or printed; bounded RPC input is inspected
 only for explicit bot identifiers.
 
-Recent Cloudflare challenges on recognized vote/state operations cause a short
-pre-click wait. A fresh JSON vote-state response can clear that wait; a persistent
-challenge returns a protection block before any mouse press. The existing retry
-then opens a fresh browser and checks authentication, cooldown and the ad again.
+Cloudflare challenges on recognized vote/state operations cause a short
+pre-click wait. Elapsed time never clears a denial: a fresh, completed JSON
+vote-state response must establish recovery, without a redirect, transport
+failure or conflicting status. A new bot/browser starts a separate context.
+The check runs during control preparation, after hover and immediately before
+the native mouse press, so a denial arriving after page preflight still prevents
+input. Recovery during hover restarts the control checks; a persistent challenge
+returns a protection block before any mouse press. The existing retry then opens
+a fresh browser and checks authentication, cooldown and the ad again.
 
 After a trusted click, a completed exact vote request with HTTP 403 and
 `cf-mitigated: challenge`/HTML can establish that the submission was rejected.
