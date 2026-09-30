@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace as NS
 from urllib.parse import quote
 
-from vote_network import MAX_VOTE_REQUESTS, PROTECTION_WINDOW_SEC, VoteNetworkState, safe_api_route, vote_operation
+from vote_network import MAX_VOTE_REQUESTS, VoteNetworkState, safe_api_route, vote_operation
 
 
 PAGE = "https://top.gg/bot/111/vote"
@@ -84,7 +84,8 @@ class VoteResponseEvidenceTests(unittest.TestCase):
     def response(self, request=None, status=403, headers=CHALLENGE, finished=True):
         info = self.state.on_request(request or event())
         self.state.response(info, status, headers)
-        info["finished"] = finished
+        if finished:
+            self.state.finish(info)
         return info
 
     def test_completed_exact_challenge_establishes_rejection_not_success(self):
@@ -180,13 +181,68 @@ class VoteResponseEvidenceTests(unittest.TestCase):
         self.response(event(STATE, "GET", "fresh", started=103), 200, JSON)
         self.assertFalse(self.state.protection_pending())
 
-    def test_readiness_denial_ages_out_and_storage_is_bounded(self):
+    def test_elapsed_time_does_not_clear_denial_and_storage_is_bounded(self):
         self.response()
-        self.now += PROTECTION_WINDOW_SEC + 1
-        self.assertFalse(self.state.protection_pending())
+        self.now += 3600
+        self.assertTrue(self.state.protection_pending())
         for n in range(MAX_VOTE_REQUESTS + 1): self.response(event(request_id=str(n)))
         self.assertEqual(len(self.state.candidates), MAX_VOTE_REQUESTS)
         self.assertFalse(self.state.definitely_rejected())
+
+    def test_vote_state_headers_do_not_clear_a_denial_before_completion(self):
+        self.response()
+        ready = self.response(event(STATE, "GET", "ready", started=102), 200, JSON, finished=False)
+        self.assertTrue(self.state.protection_pending())
+        self.state.finish(ready)
+        self.assertFalse(self.state.protection_pending())
+
+    def test_redirect_failed_or_conflicting_state_response_cannot_clear_denial(self):
+        for problem in ("redirect", "failed", "conflicting"):
+            with self.subTest(problem=problem):
+                self.response(event(request_id="denied", started=101))
+                ready = self.response(event(STATE, "GET", "ready", started=102), 200, JSON, finished=False)
+                if problem == "redirect": ready["redirected"] = True
+                if problem == "conflicting": self.state.response(ready, 403, JSON)
+                self.state.finish(ready, failed=problem == "failed")
+                self.assertTrue(self.state.protection_pending())
+
+    def test_late_old_denial_cannot_weaken_the_newest_recovery_boundary(self):
+        self.response(event(request_id="new-denial", started=105))
+        self.response(event(request_id="old-denial", started=101))
+        self.response(event(STATE, "GET", "stale-ready", started=103), 200, JSON)
+        self.assertTrue(self.state.protection_pending())
+        self.response(event(STATE, "GET", "new-ready", started=106), 200, JSON)
+        self.assertFalse(self.state.protection_pending())
+
+    def test_late_cloudflare_headers_restore_the_denial_after_apparent_recovery(self):
+        self.response()
+        ready = self.response(event(STATE, "GET", "ready", started=102), 200, JSON)
+        self.assertFalse(self.state.protection_pending())
+        self.state.response(ready, 403, CHALLENGE)
+        self.assertTrue(self.state.protection_pending())
+
+    def test_late_conflicting_status_or_html_revokes_this_response_recovery(self):
+        for status, headers in ((403, JSON), (200, {"cloudflare_challenge": False, "content_kind": "html"})):
+            with self.subTest(status=status, headers=headers):
+                self.response(event(request_id="denied", started=101))
+                ready = self.response(event(STATE, "GET", "ready", started=102), 200, JSON)
+                self.assertFalse(self.state.protection_pending())
+                self.state.response(ready, status, headers)
+                self.assertTrue(self.state.protection_pending())
+
+    def test_challenge_header_with_json_does_not_establish_recovery(self):
+        self.response()
+        self.response(event(STATE, "GET", "ready", started=102), 200,
+                      {"cloudflare_challenge": True, "content_kind": "json"})
+        self.assertTrue(self.state.protection_pending())
+
+    def test_unknown_denial_timestamp_requires_a_fresh_context(self):
+        self.response(event(started=None))
+        self.response(event(STATE, "GET", "ready", started=102), 200, JSON)
+        self.assertTrue(self.state.protection_pending())
+        fresh = VoteNetworkState()
+        fresh.select_bot("111")
+        self.assertFalse(fresh.protection_pending())
 
     def test_no_urls_or_payload_credentials_are_retained(self):
         data = json.dumps({"botId": "111", "token": "PAYLOAD_SECRET"})

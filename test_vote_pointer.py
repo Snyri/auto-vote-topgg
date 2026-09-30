@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 from contextlib import suppress
+from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import nodriver as uc
@@ -123,6 +124,41 @@ class VotePointerBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(tracker.vote_network.pressed_at, before)
         self.assertLessEqual(tracker.vote_network.pressed_at, after + 0.001)
         self.assertTrue(await vote.evaluate(self.tab, "window.__autoVotePointer === undefined"))
+
+    async def test_api_denial_during_the_final_target_check_prevents_real_mouse_press(self):
+        tracker = request_diagnostics.RequestDiagnostics(self.tab)
+        self.tab._topgg_diagnostics = tracker
+        tracker.vote_network.select_bot("111")
+        original = vote._vote_pointer_target
+
+        async def target(tab, *, arm=False):
+            result = await original(tab, arm=arm)
+            if arm and result.get("ready"):
+                info = tracker.vote_network.on_request(NS(request_id="denied", document_url="https://top.gg/bot/111/vote",
+                    wall_time=101, redirect_response=None,
+                    request=NS(url="https://top.gg/api/bots/111/vote/status", method="GET")))
+                tracker.vote_network.response(info, 403, {"cloudflare_challenge": True, "content_kind": "html"})
+                tracker.vote_network.finish(info)
+            return result
+
+        with patch("vote._vote_pointer_target", side_effect=target):
+            with self.assertRaises(vote.VoteAPIBlocked):
+                await vote._click_marked(self.tab, "data-auto-vote")
+        self.assertEqual(await vote.evaluate(self.tab, "window.events"), [])
+        self.assertEqual(await vote.evaluate(self.tab, "window.votes"), 0)
+        self.assertFalse(tracker.vote_network.armed)
+        self.assertTrue(await vote.evaluate(self.tab, "window.__autoVotePointer === undefined"))
+
+    async def test_logged_out_anigame_layout_with_ads_is_not_a_vote_control(self):
+        await vote.evaluate(self.tab, """(() => {
+            document.body.innerHTML = '<header><button>Login</button></header>' +
+                '<h1>Voting for AniGame</h1>' +
+                '<section>You must be logged in to vote.<button>Login</button></section>' +
+                '<aside>Start Voting Automatically. Rewards without manually voting.' +
+                '<button>Get Top.gg Plus</button></aside>' +
+                '<div>Ad. Upgrade to Top.gg Premium!<button>Get Premium!</button></div>';
+        })()""")
+        self.assertFalse((await vote.mark_vote_button(self.tab))["found"])
 
     async def test_hover_overlay_prevents_press_and_is_not_called_a_submission(self):
         await vote.evaluate(self.tab, """(() => {

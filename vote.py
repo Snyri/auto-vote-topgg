@@ -114,6 +114,10 @@ class VoteClickNotReady(RuntimeError):
     """No Vote mouse press was sent; the control never became actionable."""
 
 
+class VoteAPIBlocked(VoteClickNotReady):
+    """No Vote mouse press was sent because a recognized API remains denied."""
+
+
 TG_BOT_TOKEN = ""
 TG_CHAT_ID = ""
 SENSITIVE_VALUES: list[str] = []
@@ -981,6 +985,19 @@ async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
     return result if isinstance(result, dict) else {"ready": False, "reason": "unavailable"}
 
 
+async def _wait_for_vote_api(tab: Any) -> bool:
+    """Observe passive recovery briefly; return whether the caller had to wait."""
+    network = request_diagnostics.vote_state(tab)
+    if network is None or not network.protection_pending():
+        return False
+    print("  → Vote API is still challenged; waiting before mouse input")
+    for _ in range(VOTE_NETWORK_PREFLIGHT_POLLS):
+        await asyncio.sleep(VOTE_NETWORK_PREFLIGHT_DELAY_SEC)
+        if not network.protection_pending():
+            return True
+    raise VoteAPIBlocked("api_protection_active")
+
+
 async def _click_vote_control(tab: Any) -> bool:
     """Send one native mouse click; a target event still does not prove a vote."""
     pressed = False
@@ -988,6 +1005,7 @@ async def _click_vote_control(tab: Any) -> bool:
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     try:
         while asyncio.get_running_loop().time() < deadline:
+            await _wait_for_vote_api(tab)
             await dismiss_privacy_overlay(tab)
             # Reacquire after the ad/React transition; do not retain an old node.
             await mark_vote_button(tab)
@@ -997,6 +1015,10 @@ async def _click_vote_control(tab: Any) -> bool:
                     "mouseMoved", x=target["x"], y=target["y"], buttons=0,
                 )), timeout=2)
                 await asyncio.sleep(VOTE_TARGET_POLL_SEC)
+                # A denial can arrive after page preflight or during hover.
+                # If recovery takes time, reacquire the page/control before input.
+                if await _wait_for_vote_api(tab):
+                    continue
                 # Hover can change layout or reveal an overlay. Check again
                 # immediately before pressing and attach a target event observer.
                 target = await _vote_pointer_target(tab, arm=True)
@@ -1015,6 +1037,10 @@ async def _click_vote_control(tab: Any) -> bool:
         else:
             raise VoteClickNotReady(last_reason or "unavailable")
 
+        # No awaited work between this last health check and arming the press.
+        network = request_diagnostics.vote_state(tab)
+        if network is not None and network.protection_pending():
+            raise VoteAPIBlocked("api_protection_active")
         print("  → Sending native mouse press/release to Vote...")
         request_diagnostics.begin_vote_input(tab)
         # From this point a submission may have happened, even if CDP times out.
@@ -1894,6 +1920,12 @@ def vote_target_diagnostic(state: dict) -> str:
     return f"Vote target selected: kind={target_kind}, candidates={count}"
 
 
+def vote_api_blocked_result(bot_id: str) -> dict:
+    print("  ⏳ Vote API challenge persists; no Vote input sent")
+    return {"bot_id": bot_id, "status": "blocked", "vote_submitted": False,
+            "detail": "Vote API protection remained active before mouse input"}
+
+
 async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> dict:
     request_diagnostics.select_vote_bot(tab, bot_id)
     request_diagnostics.set_phase(tab, "vote_page")
@@ -1953,17 +1985,11 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             )
         await asyncio.sleep(2)
 
-    network = request_diagnostics.vote_state(tab)
-    if network is not None and network.protection_pending():
-        print("  → Vote API is still challenged; waiting before mouse input")
-        for observation in range(VOTE_NETWORK_PREFLIGHT_POLLS):
-            await asyncio.sleep(VOTE_NETWORK_PREFLIGHT_DELAY_SEC)
-            if not network.protection_pending():
-                break
-        if network.protection_pending():
-            print("  ⏳ Vote API challenge persists; no Vote input sent")
-            return {"bot_id": bot_id, "status": "blocked", "vote_submitted": False,
-                    "detail": "Vote API protection remained active before mouse input"}
+    try:
+        waited_for_api = await _wait_for_vote_api(tab)
+    except VoteAPIBlocked:
+        return vote_api_blocked_result(bot_id)
+    if waited_for_api:
         # Waiting can reveal an already registered vote or change page state.
         if not is_topgg_vote_url(await current_url(tab), bot_id):
             return {"bot_id": bot_id, "status": "error", "vote_submitted": False,
@@ -2021,6 +2047,8 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
                 "detail": "Vote mouse input sent; target click unconfirmed; automatic resubmission suppressed",
             }
         result = await verify_submitted_vote(tab, bot_id, account_id, before_click)
+    except VoteAPIBlocked:
+        return vote_api_blocked_result(bot_id)
     except VoteClickNotReady as exc:
         print(f"  ⚠️ Vote control not actionable; no mouse press sent ({exc})")
         return {

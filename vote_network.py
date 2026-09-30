@@ -8,7 +8,6 @@ from urllib.parse import parse_qs, urlparse
 
 
 MAX_VOTE_REQUESTS = 16
-PROTECTION_WINDOW_SEC = 15
 RPC_VOTE_MUTATIONS = {"vote", "castvote", "submitvote", "voteforbot"}
 RPC_VOTE_READS = {"getvotestate", "getvotestatus", "getvoteeligibility", "canvote", "hasvoted", "checkvote"}
 ROUTE_WORDS = frozenset({"api", "client", "v0", "v1", "bot", "bots", "entity", "entities", "vote", "votes",
@@ -145,6 +144,7 @@ class VoteNetworkState:
         self.generation = 0
         self.last_denial = None
         self.denial_started = None
+        self.recovered_by = None
         self.candidates = {}
         self.armed = False
         self.trusted = False
@@ -157,6 +157,7 @@ class VoteNetworkState:
             self.context += 1
             self.last_denial = None
             self.denial_started = None
+            self.recovered_by = None
         self.end_input()
 
     def begin_input(self):
@@ -184,7 +185,8 @@ class VoteNetworkState:
         stamp = number(getattr(event, "wall_time", None))
         info = {"operation": operation, "context": self.context, "generation": self.generation,
                 "started": stamp, "statuses": set(), "challenge": False, "finished": False,
-                "redirected": bool(getattr(event, "redirect_response", None))}
+                "redirected": bool(getattr(event, "redirect_response", None)),
+                "json_response": False, "readiness_invalid": False, "failed": False}
         if (self.armed and operation != "vote_state"
                 and first_party_write(request.url, request.method, getattr(event, "document_url", None), self.bot_id)):
             if len(self.candidates) >= MAX_VOTE_REQUESTS:
@@ -200,18 +202,48 @@ class VoteNetworkState:
         info["statuses"].add(status)
         challenged = status == 403 and safe["cloudflare_challenge"] is True and safe["content_kind"] == "html"
         info["challenge"] |= challenged
+        info["json_response"] |= (200 <= status < 300 and safe["content_kind"] == "json"
+                                   and safe["cloudflare_challenge"] is not True)
+        info["readiness_invalid"] |= safe["cloudflare_challenge"] is True or safe["content_kind"] == "html"
         if info["operation"] in {"vote_submission", "vote_state"}:
             if challenged:
-                self.last_denial = self.clock()
-                self.denial_started = info["started"]
-            elif 200 <= status < 300 and safe["content_kind"] == "json" and info["operation"] == "vote_state":
-                if (self.denial_started is not None and info["started"] is not None
-                        and info["started"] >= self.denial_started):
-                    self.last_denial = None
+                self.recovered_by = None
+                if self.last_denial is None:
+                    self.denial_started = info["started"]
+                elif self.denial_started is not None and info["started"] is not None:
+                    self.denial_started = max(self.denial_started, info["started"])
+                else:
                     self.denial_started = None
+                self.last_denial = self.clock()
+        self._clear_protection_if_ready(info)
+
+    def finish(self, info, *, failed=False):
+        info["finished"] = True
+        info["failed"] |= failed
+        self._clear_protection_if_ready(info)
+
+    def _clear_protection_if_ready(self, info):
+        ready = (info["context"] == self.context and info["operation"] == "vote_state"
+                and info["finished"] and not info["failed"] and not info["redirected"]
+                and not info["readiness_invalid"] and info["json_response"]
+                and len(info["statuses"]) == 1 and all(200 <= status < 300 for status in info["statuses"]))
+        # ExtraInfo may arrive after LoadingFinished. Revoke only this response's
+        # recovery if late evidence contradicts it, without retaining raw data.
+        if self.recovered_by is info and not ready:
+            self.last_denial = self.clock()
+            self.denial_started = info["started"]
+            self.recovered_by = None
+        if (ready
+                and self.denial_started is not None and info["started"] is not None
+                and info["started"] >= self.denial_started):
+            self.recovered_by = info
+            self.last_denial = None
+            self.denial_started = None
 
     def protection_pending(self):
-        return self.last_denial is not None and self.clock() - self.last_denial < PROTECTION_WINDOW_SEC
+        # Time passing is not evidence that the denied API became usable.
+        # A fresh, complete vote-state response or a new bot/browser clears it.
+        return self.last_denial is not None
 
     def definitely_rejected(self):
         if not self.armed or not self.trusted or self.pressed_at is None or self.incomplete:

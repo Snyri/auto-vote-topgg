@@ -128,10 +128,10 @@ class RequestDiagnostics:
         # This also records a denial whose response is hidden from page JS by CORS.
         self.emit(event.request_id, event.status_code, event.headers)
 
-    async def on_finished(self, event):
+    async def on_finished(self, event, *, failed=False):
         info = self.requests.pop(event.request_id, None)
         if info:
-            info["vote_network"]["finished"] = True
+            self.vote_network.finish(info["vote_network"], failed=failed)
             # ExtraInfo can arrive after the ordinary response/finish event.
             # Retain only already-sanitized metadata in a second bounded cache.
             self.completed[event.request_id] = info
@@ -146,7 +146,7 @@ class RequestDiagnostics:
             print("  Network request failed: " + json.dumps({
                 key: info[key] for key in ("request_kind", "resource_type", "method", "phase")
             }, sort_keys=True))
-        await self.on_finished(event)
+        await self.on_finished(event, failed=True)
 
 
 def set_phase(tab, phase):
