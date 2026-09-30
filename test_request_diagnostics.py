@@ -41,6 +41,7 @@ class NetworkDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("success", payload)
         for secret in ("SESSION_SECRET", "TOKEN_SECRET", "token=secret", "/api/submit"):
             self.assertNotIn(secret, text)
+        self.assertEqual(payload["api_route"], "/api/:other")
 
     async def test_extra_info_records_cors_hidden_denial_and_deduplicates_response(self):
         await self.request()

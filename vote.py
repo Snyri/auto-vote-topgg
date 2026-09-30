@@ -79,6 +79,8 @@ POST_VOTE_STRONG_MARKERS = (
 )
 POST_VOTE_VERIFY_ATTEMPTS = 2
 POST_VOTE_VERIFY_DELAY_SEC = 3
+VOTE_NETWORK_PREFLIGHT_POLLS = 6
+VOTE_NETWORK_PREFLIGHT_DELAY_SEC = 0.5
 POST_VOTE_CHALLENGE_SETTLE_POLLS = 2
 POST_VOTE_CHALLENGE_SETTLE_DELAY_SEC = 2
 VOTE_TARGET_STABLE_MS = 500
@@ -964,6 +966,9 @@ async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
                     if (event.isTrusted && event.composedPath().includes(el)) {
                         const key = {pointerdown: 'pressed', pointerup: 'released', click: 'clicked'}[type];
                         state.receipt[key] = true;
+                        if (type === 'pointerdown') {
+                            state.receipt.pressed_at = (performance.timeOrigin + event.timeStamp) / 1000;
+                        }
                     }
                 };
                 window.addEventListener(type, handler, true);
@@ -1011,6 +1016,7 @@ async def _click_vote_control(tab: Any) -> bool:
             raise VoteClickNotReady(last_reason or "unavailable")
 
         print("  → Sending native mouse press/release to Vote...")
+        request_diagnostics.begin_vote_input(tab)
         # From this point a submission may have happened, even if CDP times out.
         pressed = True
         try:
@@ -1026,6 +1032,7 @@ async def _click_vote_control(tab: Any) -> bool:
         receipt = await asyncio.wait_for(evaluate(tab,
             "(() => window.__autoVotePointer?.receipt || {})()"), timeout=2)
         receipt = receipt if isinstance(receipt, dict) else {}
+        request_diagnostics.record_vote_receipt(tab, receipt)
         flags = {key: receipt.get(key) is True for key in ("pressed", "released", "clicked")}
         print("  → Vote target received trusted events: " + json.dumps(flags, sort_keys=True))
         return flags["clicked"]
@@ -1888,6 +1895,7 @@ def vote_target_diagnostic(state: dict) -> str:
 
 
 async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> dict:
+    request_diagnostics.select_vote_bot(tab, bot_id)
     request_diagnostics.set_phase(tab, "vote_page")
     print(f"  → Voting for bot {bot_id}...")
     vote_url = f"https://top.gg/bot/{bot_id}/vote"
@@ -1944,6 +1952,25 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
                 tab, bot_id, "Interactive CAPTCHA requires manual completion", account_id
             )
         await asyncio.sleep(2)
+
+    network = request_diagnostics.vote_state(tab)
+    if network is not None and network.protection_pending():
+        print("  → Vote API is still challenged; waiting before mouse input")
+        for observation in range(VOTE_NETWORK_PREFLIGHT_POLLS):
+            await asyncio.sleep(VOTE_NETWORK_PREFLIGHT_DELAY_SEC)
+            if not network.protection_pending():
+                break
+        if network.protection_pending():
+            print("  ⏳ Vote API challenge persists; no Vote input sent")
+            return {"bot_id": bot_id, "status": "blocked", "vote_submitted": False,
+                    "detail": "Vote API protection remained active before mouse input"}
+        # Waiting can reveal an already registered vote or change page state.
+        if not is_topgg_vote_url(await current_url(tab), bot_id):
+            return {"bot_id": bot_id, "status": "error", "vote_submitted": False,
+                    "detail": "Vote page changed while awaiting API readiness"}
+        text = (await body_text(tab)).lower()
+        if page_indicates_cooldown(text):
+            return cooldown_result(bot_id, text)
 
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     state = {}
@@ -2008,14 +2035,26 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             "bot_id": bot_id, "status": "uncertain",
             "detail": "Vote submitted; browser confirmation unavailable",
         }
-    if result.get("status") not in COMPLETED_STATUSES:
+    if result.get("status") not in COMPLETED_STATUSES and result.get("submission_rejected") is not True:
         result["vote_submitted"] = True
     return result
 
 
 async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_click: dict) -> dict:
     request_diagnostics.set_phase(tab, "vote_confirmation")
-    await asyncio.sleep(5)
+    network = request_diagnostics.vote_state(tab)
+    if network is not None and network.armed:
+        # Give ordinary and late/CORS response events a short observation window.
+        # Keep the existing five-second wait on healthy or ambiguous submissions.
+        await asyncio.sleep(1)
+        if network.definitely_rejected():
+            return rejected_vote_result(bot_id)
+        await asyncio.sleep(4)
+    else:
+        await asyncio.sleep(5)
+
+    if network is not None and network.definitely_rejected():
+        return rejected_vote_result(bot_id)
 
     if await confirm_vote_without_reload(tab, bot_id, before_click):
         result = successful_vote_result(bot_id)
@@ -2150,6 +2189,13 @@ async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_c
         else "Clicked, but server-side vote confirmation was not observed"
     )
     return {"bot_id": bot_id, "status": "uncertain", "detail": detail}
+
+
+def rejected_vote_result(bot_id: str) -> dict:
+    print("  ⏳ Exact Vote submission rejected by Cloudflare; fresh-browser retry is eligible")
+    return {"bot_id": bot_id, "status": "blocked", "vote_submitted": False,
+            "submission_rejected": True,
+            "detail": "Exact vote request rejected by a Cloudflare challenge"}
 
 
 def normalize_diagnostic(value: bytes | str) -> str:
@@ -2479,6 +2525,8 @@ async def _run_account(
     results = []
     try:
         browser, tab = await session.acquire()
+        if bot_ids:
+            request_diagnostics.select_vote_bot(tab, bot_ids[0])
         auth_state = AUTH_INVALID
         was_authenticated = session.authenticated
         session.authenticated = False

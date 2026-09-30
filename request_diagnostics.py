@@ -1,4 +1,4 @@
-"""Passive CDP response metadata; never collect bodies, credentials or URLs."""
+"""Passive CDP metadata; never retain raw URLs, payloads or credentials."""
 
 import asyncio
 import json
@@ -7,6 +7,8 @@ from contextlib import suppress
 from urllib.parse import urlparse
 
 from nodriver import cdp
+
+from vote_network import VoteNetworkState, safe_api_route
 
 
 MAX_REQUESTS = 256
@@ -52,6 +54,7 @@ class RequestDiagnostics:
         self.tab, self.phase = tab, "authentication"
         self.requests = OrderedDict()
         self.completed = OrderedDict()
+        self.vote_network = VoteNetworkState()
         self.handlers = [(cdp.network.RequestWillBeSent, self.on_request),
                          (cdp.network.ResponseReceived, self.on_response),
                          (cdp.network.ResponseReceivedExtraInfo, self.on_extra),
@@ -72,6 +75,7 @@ class RequestDiagnostics:
             with suppress(Exception): self.tab.remove_handler(event, callback)
         self.requests.clear()
         self.completed.clear()
+        self.vote_network.end_input()
         if getattr(self.tab, "_topgg_diagnostics", None) is self:
             self.tab._topgg_diagnostics = None
 
@@ -79,6 +83,9 @@ class RequestDiagnostics:
         # A redirect reuses its request ID. Report its response before replacing
         # the metadata, with no Location URL or request headers.
         if getattr(event, "redirect_response", None):
+            previous = self.requests.get(event.request_id) or self.completed.get(event.request_id)
+            if previous:
+                previous["vote_network"]["redirected"] = True
             self.emit(event.request_id, event.redirect_response.status, event.redirect_response.headers)
         method = str(event.request.method).upper()
         resource = getattr(getattr(event, "type_", None), "value", "Other")
@@ -87,23 +94,31 @@ class RequestDiagnostics:
             "request_kind": request_kind(event.request.url), "method": method if method in METHODS else "OTHER",
             "resource_type": resource if resource in RESOURCE_TYPES else "Other",
             "phase": self.phase if self.phase in PHASES else "authentication", "emitted": set(),
+            "vote_network": self.vote_network.on_request(event),
+            "api_route": safe_api_route(event.request.url),
         }
         self.requests.move_to_end(event.request_id)
-        while len(self.requests) > MAX_REQUESTS: self.requests.popitem(last=False)
+        while len(self.requests) > MAX_REQUESTS:
+            request_id, _ = self.requests.popitem(last=False)
+            if request_id in self.vote_network.candidates:
+                self.vote_network.incomplete = True
 
     def emit(self, request_id, status, headers):
         info = self.requests.get(request_id) or self.completed.get(request_id)
         if not info or isinstance(status, bool) or not isinstance(status, (int, float)) or not 100 <= status <= 599:
             return
         status = int(status)
+        safe = safe_headers(headers)
+        self.vote_network.response(info["vote_network"], status, safe)
         relevant_write = info["phase"] in {"vote_input", "vote_confirmation"} and info["request_kind"] == "topgg_api" and info["method"] in {"POST", "PUT", "PATCH", "DELETE"}
         if status < 400 and not relevant_write: return
-        safe = safe_headers(headers)
         signature = (status, safe["cloudflare_challenge"])
         if signature in info["emitted"]: return
         info["emitted"].add(signature)
         print("  Network response diagnostic: " + json.dumps({
             **{key: info[key] for key in ("request_kind", "resource_type", "method", "phase")}, "status": status, **safe,
+            "vote_operation": info["vote_network"]["operation"],
+            "api_route": info["api_route"],
         }, sort_keys=True))
 
     async def on_response(self, event):
@@ -116,10 +131,14 @@ class RequestDiagnostics:
     async def on_finished(self, event):
         info = self.requests.pop(event.request_id, None)
         if info:
+            info["vote_network"]["finished"] = True
             # ExtraInfo can arrive after the ordinary response/finish event.
             # Retain only already-sanitized metadata in a second bounded cache.
             self.completed[event.request_id] = info
-            while len(self.completed) > MAX_REQUESTS: self.completed.popitem(last=False)
+            while len(self.completed) > MAX_REQUESTS:
+                request_id, _ = self.completed.popitem(last=False)
+                if request_id in self.vote_network.candidates:
+                    self.vote_network.incomplete = True
 
     async def on_failed(self, event):
         info = self.requests.get(event.request_id)
@@ -133,3 +152,26 @@ class RequestDiagnostics:
 def set_phase(tab, phase):
     tracker = getattr(tab, "_topgg_diagnostics", None)
     if isinstance(tracker, RequestDiagnostics) and phase in PHASES: tracker.phase = phase
+
+
+def vote_state(tab):
+    tracker = getattr(tab, "_topgg_diagnostics", None)
+    return tracker.vote_network if isinstance(tracker, RequestDiagnostics) else None
+
+
+def select_vote_bot(tab, bot_id):
+    state = vote_state(tab)
+    if state is not None:
+        state.select_bot(bot_id)
+
+
+def begin_vote_input(tab):
+    state = vote_state(tab)
+    if state is not None:
+        state.begin_input()
+
+
+def record_vote_receipt(tab, receipt):
+    state = vote_state(tab)
+    if state is not None:
+        state.receipt(receipt)
