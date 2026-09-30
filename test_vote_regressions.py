@@ -411,7 +411,7 @@ const sandbox = {
     AbortController,
     getComputedStyle: node => ({display:'block', visibility:'visible', opacity:'1', ...node.fixtureStyle}),
     document: {
-        body: {innerText: fixture.body || ''},
+        body: {innerText: fixture.body || '', hasChildNodes: () => !fixture.emptyBody},
         title: fixture.title || 'Vote for a bot',
         readyState: fixture.readyState || 'complete',
         querySelector: selector => selector.split(',').some(
@@ -471,6 +471,15 @@ const sandbox = {
 
 @unittest.skipUnless(NODE, "Node.js is needed to execute the browser JavaScript fixtures")
 class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loading_or_wrong_origin_skips_the_actual_session_fetch(self):
+        expression = await self.capture_expression(vote.topgg_session_probe)
+        for fixture in ({"readyState": "loading"}, {"emptyBody": True}, {"hostname": "discord.com"}, {"protocol": "http:"}):
+            with self.subTest(fixture=fixture):
+                output = await self.execute_expression(expression, fixture)
+                self.assertEqual(output["events"]["fetches"], [])
+                self.assertEqual(output["value"]["status"], 0)
+                self.assertFalse(output["value"]["userPresent"])
+
     async def capture_expression(self, function):
         with (
             patch("builtins.print"),
