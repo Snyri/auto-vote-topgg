@@ -179,6 +179,37 @@ Chrome is not on `PATH`.
 
 ### Cloudflare 403 diagnosis
 
+Verification disappearance is accepted only on a ready document across two
+observations. An empty document during navigation cannot clear a challenge or
+trigger a session fetch. A residual managed-challenge title does not block an
+otherwise actionable Vote control; human-verification text still does.
+
+A denied session fetch first gets a bounded application-state recheck. If the
+challenge exists only in that API response, one ordinary reload of the exact bot
+vote page can render verification. This recovery cannot loop or reopen an API,
+OAuth callback, or unrelated origin. No response HTML is injected.
+
+Login, Authorize, and consent use native mouse input with visibility, geometry,
+hover and event-receipt checks. Authentication still requires the expected
+redirect and application state; consent requires the overlay to disappear.
+Invalid Auth.js cookies are removed selectively, preserving Cloudflare clearance
+and cookies belonging to other origins.
+
+Within one account's five attempts, recoverable failures can reuse a browser
+that remains authenticated and usable across two observations. Persistent
+protection, lost authentication, disconnected documents and uncertain submissions
+replace the profile. Only pending bots retry; completed or unconfirmed
+submissions are not clicked again in that run. The profile is closed and deleted
+when that account ends, including cancellation; no profile crosses accounts or
+workflow runs. Unlimited fresh-workflow recovery remains as configured.
+
+Passive CDP diagnostics classify failed requests and top.gg API write responses
+around the Vote interaction. Logs contain fixed request/phase categories,
+HTTP status, content category and safe Cloudflare indicators, without URLs,
+bodies, cookie values or authorization headers. Extra response metadata also
+captures denials hidden from page JavaScript by CORS. A successful HTTP response
+alone never marks a vote as successful.
+
 The retained September 24 runs returned `403`, `text/html`, and `cf-mitigated: challenge` from `/api/auth/session`. This identifies a Cloudflare Challenge Page, not an expired Auth.js cookie. The exact WAF rule and IP reputation are not exposed by those logs. See the [full review and run evidence](docs/audit-2026-09-24.md).
 
 After a detected challenge, authentication waits for recognizable application UI before requesting the session endpoint. Managed challenge titles and DOM containers also count as protection; a transiently missing widget is not logged as verified access. Session requests have a 12-second browser timeout plus a bounded outer wait, so a hanging fetch cannot consume the entire workflow run.

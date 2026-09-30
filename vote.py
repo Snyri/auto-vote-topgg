@@ -20,6 +20,8 @@ import nodriver as uc
 import requests
 
 import cloudflare_click
+import request_diagnostics
+import ui_click
 
 WIB = timezone(timedelta(hours=7))
 DISCORD_LOGIN_URL = "https://discord.com/login"
@@ -28,6 +30,9 @@ TIMEOUT_VOTE_SEC = 30
 SESSION_PROBE_TIMEOUT_SEC = 12
 AUTH_PAGE_SETTLE_POLLS = 4
 AUTH_PAGE_SETTLE_DELAY_SEC = 2
+AUTH_RECOVERY_POLLS = 4
+AUTH_RECOVERY_DELAY_SEC = 0.5
+DOCUMENT_READY_JS = "Boolean(document.body && document.body.hasChildNodes()) && ['interactive', 'complete'].includes(document.readyState)"
 DELAY_BETWEEN_BOTS_SEC = 3
 DELAY_BETWEEN_ACCOUNTS_SEC = 5
 MAX_RETRIES = 5
@@ -875,10 +880,17 @@ async def wait_for_domain(tab: Any, domain: str, timeout: int) -> bool:
 async def _mark_exact_element(tab: Any, selector: str, texts: list[str], marker: str) -> bool:
     script = f"""(() => {{
         const wanted = new Set({json.dumps(texts)}.map(text => text.trim().toLowerCase()));
-        const nodes = [...document.querySelectorAll({json.dumps(selector)})];
-        const element = nodes.find(node =>
-            wanted.has((node.textContent || '').trim().toLowerCase())
+        document.querySelectorAll('[' + {json.dumps(marker)} + ']').forEach(
+            node => node.removeAttribute({json.dumps(marker)})
         );
+        const nodes = [...document.querySelectorAll({json.dumps(selector)})];
+        const element = nodes.find(node => {{
+            if (!wanted.has((node.textContent || '').trim().toLowerCase()) ||
+                node.matches(':disabled') || node.closest('[inert], [aria-disabled="true"]') ||
+                !node.getClientRects().length) return false;
+            const style = getComputedStyle(node);
+            return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
+        }});
         if (!element) return false;
         element.setAttribute({json.dumps(marker)}, '1');
         return true;
@@ -890,14 +902,11 @@ async def _click_marked(tab: Any, marker: str) -> bool:
     if marker == "data-auto-vote":
         return await _click_vote_control(tab)
     await dismiss_privacy_overlay(tab)
-    try:
-        element = await tab.select(f'[{marker}="1"]', timeout=2)
-        await element.scroll_into_view()
-        await element.click()
-        return True
-    except Exception as exc:
-        dbg(f"Marked click failed: {type(exc).__name__}")
-        return False
+    kind = "oauth" if marker == "data-auto-oauth" else "login"
+    receipt = await ui_click.click_control(tab, evaluate, f'[{marker}="1"]', kind=kind)
+    # A navigation can destroy the observer. The OAuth caller still checks its
+    # destination and authenticated application state; input alone is not login.
+    return receipt["input_sent"] and receipt["clicked"] is not False
 
 
 async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
@@ -910,14 +919,24 @@ async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
         const body = (document.body?.innerText || '').toLowerCase();
         const title = (document.title || '').trim().toLowerCase();
         if (body.includes('you will be able to vote after this ad')) return blocked('ad_active');
-        if (title.startsWith('just a moment') || title.startsWith('attention required') ||
+        // Match the challenge detector's application-control precedence. A
+        // residual interstitial title must not override an actionable Vote.
+        const managed = title.startsWith('just a moment') || title.startsWith('attention required') ||
             body.includes('performing security verification') ||
-            body.includes('verify you are human')) return blocked('protection_active');
+            body.includes('needs to review the security of your connection');
+        const style = getComputedStyle(el);
+        const usableVote = (el.textContent || '').trim().toLowerCase() === 'vote' &&
+            el.matches('button, [role="button"]') && !el.matches(':disabled') &&
+            !el.hasAttribute('disabled') && !el.closest('[inert], [aria-disabled="true"]') &&
+            el.getClientRects().length && style.display !== 'none' && style.visibility === 'visible' &&
+            Number(style.opacity) !== 0;
+        if ((managed && !usableVote) || body.includes('verify you are human') ||
+            body.includes('please solve the captcha to continue') || body.includes('complete the captcha'))
+            return blocked('protection_active');
         if ((el.textContent || '').trim().toLowerCase() !== 'vote' ||
             !el.matches('button, [role="button"]')) return blocked('changed');
         if (el.matches(':disabled') || el.hasAttribute('disabled') ||
             el.closest('[inert], [aria-disabled="true"]')) return blocked('disabled');
-        const style = getComputedStyle(el);
         if (style.display === 'none' || style.visibility !== 'visible' ||
             Number(style.opacity) === 0 || style.pointerEvents === 'none' ||
             !el.getClientRects().length) return blocked('hidden');
@@ -1026,43 +1045,47 @@ async def _click_vote_control(tab: Any) -> bool:
 
 
 async def dismiss_privacy_overlay(tab: Any) -> bool:
+    script = """(() => {
+        const body = document.body ? document.body.innerText.toLowerCase() : '';
+        const present = body.includes('we value your privacy') ||
+            body.includes('partners store and/or access information') ||
+            body.includes('personalised ads and content');
+        document.querySelectorAll('[data-auto-consent]').forEach(el => el.removeAttribute('data-auto-consent'));
+        if (!present) return {present: false};
+        const labels = new Set(['agree', 'accept', 'accept all', 'allow all', 'i agree']);
+        const controls = [...document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]')];
+        const direct = document.querySelector('#accept-btn');
+        const candidates = direct ? [direct, ...controls.filter(el => el !== direct)] : controls;
+        const target = candidates.find(el => {
+            const style = getComputedStyle(el);
+            if (!el.getClientRects().length || el.matches(':disabled') ||
+                el.closest('[inert], [aria-disabled="true"]') || style.visibility !== 'visible' ||
+                style.display === 'none' || Number(style.opacity) === 0) return false;
+            const text = [el.innerText, el.textContent, el.value, el.getAttribute('aria-label'), el.id]
+                .filter(Boolean).join(' ').trim().toLowerCase();
+            return el === direct || labels.has(text) || text.includes('agree') || text.includes('accept');
+        });
+        if (target) target.setAttribute('data-auto-consent', '1');
+        return {present: true, button_found: Boolean(target), reason: 'consent_button_not_found'};
+    })()"""
     try:
-        result = await evaluate(tab, """(() => {
-            const body = document.body ? document.body.innerText.toLowerCase() : '';
-            const looksLikeConsent = body.includes('we value your privacy') ||
-                body.includes('partners store and/or access information') ||
-                body.includes('personalised ads and content');
-            if (!looksLikeConsent) return {present: false, dismissed: false, reason: 'not_present'};
-            const labels = new Set(['agree', 'accept', 'accept all', 'allow all', 'i agree']);
-            const direct = document.querySelector('#accept-btn');
-            const controls = [...document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]')];
-            const target = direct || controls.find(el => {
-                const text = [
-                    el.innerText,
-                    el.textContent,
-                    el.value,
-                    el.getAttribute('aria-label'),
-                    el.id,
-                ].filter(Boolean).join(' ').trim().toLowerCase();
-                return labels.has(text) || text.includes('agree') || text.includes('accept');
-            });
-            if (!target) return {present: true, dismissed: false, reason: 'consent_button_not_found'};
-            try {
-                target.click();
-                return {present: true, dismissed: true, reason: 'clicked'};
-            } catch (error) {
-                return {present: true, dismissed: false, reason: `click_failed:${error && error.name ? error.name : 'Error'}`};
-            }
-        })()""")
+        result = await evaluate(tab, script)
+        if not isinstance(result, dict) or not result.get("present"):
+            return False
+        if result.get("button_found"):
+            receipt = await ui_click.click_control(tab, evaluate, '[data-auto-consent="1"]', kind="consent")
+            if receipt["input_sent"]:
+                for _ in range(4):
+                    await asyncio.sleep(0.25)
+                    observed = await evaluate(tab, script)
+                    if isinstance(observed, dict) and observed.get("present") is False:
+                        return True
+            result = {"present": True, "reason": "consent_dismissal_unconfirmed"}
     except Exception as exc:
         detail = f"JavaScript check failed: {type(exc).__name__}: {safe_exception_detail(exc)}"
         dbg(f"Privacy overlay dismiss skipped: {type(exc).__name__}")
         await report_privacy_dismiss_failure(tab, detail)
         return False
-    if not isinstance(result, dict) or not result.get("present"):
-        return False
-    if result.get("dismissed"):
-        return True
     await report_privacy_dismiss_failure(tab, str(result.get("reason", "unknown dismiss failure")))
     return False
 
@@ -1107,9 +1130,27 @@ async def inject_topgg_cookies(browser: Any, cookies: list[dict]) -> None:
         await browser.cookies.set_all(params)
 
 
+async def clear_topgg_auth_cookies(browser: Any) -> None:
+    """Remove invalid Auth.js state, preserving clearance and other origins."""
+    cookies = await browser.cookies.get_all()
+    for cookie in cookies:
+        domain = str(cookie.domain).lower().lstrip('.').rstrip('.')
+        name = str(cookie.name)
+        bare = re.sub(r"^__(?:Secure|Host)-", "", name)
+        if domain not in {"top.gg", "www.top.gg"} or not bare.startswith(("authjs.", "next-auth.")):
+            continue
+        tab = next(iter(browser))
+        await tab.send(uc.cdp.network.delete_cookies(name=name, domain=cookie.domain, path=cookie.path))
+
+
 async def topgg_session_probe(tab: Any) -> dict:
     """Return a credential-free Auth.js probe result for diagnostics and decisions."""
     script = """(async () => {
+        const skipped = error => ({ok: false, status: 0, contentType: '', jsonOk: false,
+            userPresent: false, error, cfMitigated: '', cfRay: '', server: ''});
+        if (location.protocol !== 'https:' || !['top.gg', 'www.top.gg'].includes(location.hostname))
+            return skipped('unexpected-session-origin');
+        if (!(__DOCUMENT_READY__)) return skipped('document-loading');
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), __PROBE_TIMEOUT_MS__);
         try {
@@ -1161,7 +1202,7 @@ async def topgg_session_probe(tab: Any) -> dict:
         } finally {
             clearTimeout(timer);
         }
-    })()""".replace("__PROBE_TIMEOUT_MS__", str(int(SESSION_PROBE_TIMEOUT_SEC * 1000)))
+    })()""".replace("__PROBE_TIMEOUT_MS__", str(int(SESSION_PROBE_TIMEOUT_SEC * 1000))).replace("__DOCUMENT_READY__", DOCUMENT_READY_JS)
     try:
         result = await asyncio.wait_for(
             evaluate(tab, script), timeout=SESSION_PROBE_TIMEOUT_SEC + 2
@@ -1306,8 +1347,9 @@ def probe_looks_blocked(probe: dict) -> bool:
     )
 
 
-async def topgg_auth_state(tab: Any) -> str:
+async def topgg_auth_state(tab: Any, *, allow_session_recovery: bool = True) -> str:
     await dismiss_privacy_overlay(tab)
+    challenge_handled = False
 
     page_hint = await topgg_page_auth_hint(tab)
     if page_hint == AUTHENTICATED:
@@ -1322,6 +1364,7 @@ async def topgg_auth_state(tab: Any) -> str:
         print("  → top.gg protection is active; clearing it before session validation")
         if not await solve_turnstile(tab):
             return await unresolved_challenge_auth_state(tab)
+        challenge_handled = True
         await asyncio.sleep(2)
         await settle_privacy_overlay(tab)
 
@@ -1343,6 +1386,39 @@ async def topgg_auth_state(tab: Any) -> str:
         return AUTHENTICATED
 
     if probe_looks_blocked(probe):
+        if allow_session_recovery:
+            # An API's HTML challenge is not rendered as an interactive page.
+            # First observe the existing application, preserving its cookies.
+            for recovery_poll in range(AUTH_RECOVERY_POLLS):
+                page_hint = await topgg_page_auth_hint(tab)
+                if page_hint == AUTHENTICATED:
+                    print("  ✅ top.gg page became usable after the blocked session response")
+                    return AUTHENTICATED
+                if not challenge_handled and await is_turnstile_present(tab):
+                    if not await solve_turnstile(tab):
+                        return await unresolved_challenge_auth_state(tab)
+                    return await topgg_auth_state(tab, allow_session_recovery=False)
+                if probe.get("error") == "document-loading" and await document_ready(tab):
+                    return await topgg_auth_state(tab, allow_session_recovery=False)
+                if recovery_poll < AUTH_RECOVERY_POLLS - 1:
+                    await asyncio.sleep(AUTH_RECOVERY_DELAY_SEC)
+            # If only the fetch was challenged, make at most one ordinary page
+            # navigation so the browser can render verification normally. Never
+            # inject the response HTML or open an API/callback URL as a page.
+            if probe.get("cf_mitigated") == "challenge":
+                try:
+                    url = urlparse(await current_url(tab))
+                    if (url.scheme == "https" and url.hostname in {"top.gg", "www.top.gg"}
+                            and re.fullmatch(r"/bot/[0-9]+/vote/?", url.path)
+                            and await document_ready(tab) and not await is_turnstile_present(tab)):
+                        print("  → Session fetch was challenged; reopening the current vote page once")
+                        await tab.reload()
+                        await asyncio.sleep(2)
+                        return await topgg_auth_state(tab, allow_session_recovery=False)
+                except Exception:
+                    # Diagnostic/recovery failure cannot turn denial into logout
+                    # or expose exception details from an OAuth URL.
+                    pass
         return AUTH_BLOCKED
     if probe.get("status") == 200 and probe.get("json_ok"):
         return AUTH_INVALID
@@ -1653,17 +1729,33 @@ async def log_challenge_diagnostic(tab: Any, phase: str) -> None:
 async def _click_cloudflare_checkbox(tab: Any) -> str:
     async def cleared() -> bool:
         await dismiss_privacy_overlay(tab)
-        return await is_turnstile_solved(tab) or not await is_turnstile_present(tab)
+        return await stable_challenge_clearance(tab)
 
     return await cloudflare_click.click_cloudflare_checkbox(tab, evaluate, cleared)
 
 
+async def document_ready(tab: Any) -> bool:
+    try:
+        return await asyncio.wait_for(evaluate(tab, DOCUMENT_READY_JS), timeout=2) is True
+    except Exception:
+        return False
+
+
+async def stable_challenge_clearance(tab: Any) -> bool:
+    async def clear_signal():
+        return await document_ready(tab) and (
+            await is_turnstile_solved(tab) or not await is_turnstile_present(tab)
+        )
+    if not await clear_signal(): return False
+    await asyncio.sleep(0.5)
+    return await clear_signal()
+
+
 async def solve_turnstile(tab: Any) -> bool:
     await dismiss_privacy_overlay(tab)
-    if await is_turnstile_solved(tab):
-        return True
-    if not await is_turnstile_present(tab):
-        return True
+    if await is_turnstile_solved(tab) or not await is_turnstile_present(tab):
+        if await stable_challenge_clearance(tab):
+            return True
     await log_challenge_diagnostic(tab, "detected")
     print("  → Challenge detected; waiting for a verified Cloudflare checkbox target...")
     try:
@@ -1683,11 +1775,13 @@ async def solve_turnstile(tab: Any) -> bool:
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     while asyncio.get_running_loop().time() < deadline:
         if await is_turnstile_solved(tab):
-            print("  ✅ Turnstile response received")
-            return True
+            if await stable_challenge_clearance(tab):
+                print("  ✅ Turnstile response received on a stable document")
+                return True
         if not await is_turnstile_present(tab):
-            print("  → Challenge widget disappeared; application access still needs verification")
-            return True
+            if await stable_challenge_clearance(tab):
+                print("  → Challenge absent on a stable document; application access still needs verification")
+                return True
         await asyncio.sleep(2)
     await log_challenge_diagnostic(tab, "timeout")
     print("  ⚠️  Challenge signals remained active after verification attempt")
@@ -1794,6 +1888,7 @@ def vote_target_diagnostic(state: dict) -> str:
 
 
 async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> dict:
+    request_diagnostics.set_phase(tab, "vote_page")
     print(f"  → Voting for bot {bot_id}...")
     vote_url = f"https://top.gg/bot/{bot_id}/vote"
     if is_topgg_vote_url(await current_url(tab), bot_id):
@@ -1891,6 +1986,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     before_click = await vote_page_confirmation(tab, bot_id)
     print(f"  → {vote_target_diagnostic(state)}")
     print("  → Preparing Vote mouse interaction...")
+    request_diagnostics.set_phase(tab, "vote_input")
     try:
         if not await _click_marked(tab, "data-auto-vote"):
             return {
@@ -1918,6 +2014,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
 
 
 async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_click: dict) -> dict:
+    request_diagnostics.set_phase(tab, "vote_confirmation")
     await asyncio.sleep(5)
 
     if await confirm_vote_without_reload(tab, bot_id, before_click):
@@ -2322,6 +2419,52 @@ async def start_browser() -> Any:
     raise BrowserStartupError(last_error_detail) from last_error
 
 
+class AccountBrowserSession:
+    """A verified profile belongs to one account and one process_account call."""
+
+    def __init__(self):
+        self.browser = None
+        self.tab = None
+        self.authenticated = False
+        self.diagnostics = None
+
+    async def acquire(self):
+        if self.browser is None:
+            self.browser = await start_browser()
+            self.tab = next(iter(self.browser))
+            self.diagnostics = request_diagnostics.RequestDiagnostics(self.tab)
+            await self.diagnostics.start()
+        request_diagnostics.set_phase(self.tab, "authentication")
+        return self.browser, self.tab
+
+    async def reusable(self):
+        if not self.authenticated or self.tab is None:
+            return False
+        try:
+            for observation in range(2):
+                url = urlparse(await current_url(self.tab))
+                if (url.scheme != "https" or url.hostname not in {"top.gg", "www.top.gg"}
+                        or not re.fullmatch(r"/bot/[0-9]+/vote/?", url.path)
+                        or not await document_ready(self.tab)
+                        or await topgg_page_auth_hint(self.tab) != AUTHENTICATED
+                        or (await is_turnstile_present(self.tab) and not await is_turnstile_solved(self.tab))):
+                    return False
+                if observation == 0: await asyncio.sleep(0.5)
+            return True
+        except Exception:
+            return False
+
+    async def close(self):
+        browser, self.browser = self.browser, None
+        self.tab, self.authenticated = None, False
+        if self.diagnostics:
+            self.diagnostics.stop()
+            self.diagnostics = None
+        if browser is not None:
+            await close_browser_safely(browser, "account attempt")
+            await asyncio.sleep(1)
+
+
 async def _run_account(
     token: str,
     bot_ids: list[str],
@@ -2329,21 +2472,29 @@ async def _run_account(
     account_cookies: list[dict] | None = None,
     *,
     capture_auth_failure: bool = False,
+    session: AccountBrowserSession | None = None,
 ) -> list[dict]:
-    browser = await start_browser()
+    owned_session = session is None
+    session = session if session is not None else AccountBrowserSession()
     results = []
     try:
-        tab = next(iter(browser))
+        browser, tab = await session.acquire()
         auth_state = AUTH_INVALID
-        if account_cookies:
+        was_authenticated = session.authenticated
+        session.authenticated = False
+        if was_authenticated:
+            print("  → Reusing authenticated browser for pending bots")
+            auth_state = await topgg_auth_state(tab)
+        elif account_cookies:
             auth_state = await login_with_cookies(tab, account_cookies, bot_ids)
-            if auth_state == AUTH_INVALID:
-                print("  → Cookie auth is invalid; falling back to Discord OAuth...")
-                await browser.cookies.clear()
-            elif auth_state == AUTH_BLOCKED:
-                print("  ⏳ top.gg is blocking this browser; skipping OAuth on the same session")
+        if auth_state == AUTH_INVALID and account_cookies:
+            print("  → Cookie auth is invalid; falling back to Discord OAuth...")
+            await clear_topgg_auth_cookies(browser)
+        elif auth_state == AUTH_BLOCKED:
+            print("  ⏳ top.gg is blocking this browser; skipping OAuth on the same session")
         if auth_state == AUTH_INVALID:
             auth_state = await discord_oauth_login(tab, token, bot_ids)
+        session.authenticated = auth_state == AUTHENTICATED
         if auth_state == AUTH_CAPTCHA_REQUIRED:
             result = {
                 "bot_id": "all",
@@ -2407,16 +2558,20 @@ async def _run_account(
                 await asyncio.sleep(DELAY_BETWEEN_BOTS_SEC)
         return results
     finally:
-        await close_browser_safely(browser, "account attempt")
-        await asyncio.sleep(1)
+        failed_state = any(result.get("status") in {"blocked", "captcha_required", "auth_failed"}
+                           or result.get("vote_submitted") is True for result in results)
+        if owned_session or failed_state or not await session.reusable():
+            await session.close()
 
 
-async def process_account(
+async def _process_account_attempts(
     token: str,
     bot_ids: list[str],
     index: int,
     total: int,
     account_cookies: list[dict] | None = None,
+    *,
+    session: AccountBrowserSession,
 ) -> list[dict]:
     prefix = f"[{index}/{total}]"
     account_id = account_fingerprint(token)
@@ -2445,6 +2600,7 @@ async def process_account(
                 account_id,
                 account_cookies,
                 capture_auth_failure=attempt == MAX_RETRIES,
+                session=session,
             )
         except Exception as exc:
             if isinstance(exc, BrowserStartupError):
@@ -2523,6 +2679,19 @@ async def process_account(
         "bot_id": "all", "status": "error",
         "detail": f"Failed after {MAX_RETRIES} retries", "account_id": account_id,
     }]
+
+
+async def process_account(
+    token: str, bot_ids: list[str], index: int, total: int,
+    account_cookies: list[dict] | None = None,
+) -> list[dict]:
+    session = AccountBrowserSession()
+    try:
+        return await _process_account_attempts(
+            token, bot_ids, index, total, account_cookies, session=session,
+        )
+    finally:
+        await session.close()
 
 
 def build_notification(all_results: list[list[dict]], now: str) -> str:

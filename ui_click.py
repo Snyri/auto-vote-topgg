@@ -1,0 +1,113 @@
+"""One native mouse interaction with a visible, stable application control."""
+
+import asyncio
+import json
+from contextlib import suppress
+
+from nodriver import cdp
+
+
+TARGET_SCRIPT = """(() => {
+    const state = window.__autoUiPointer || (window.__autoUiPointer = {});
+    const blocked = reason => { state.since = null; return {ready: false, reason}; };
+    if (document.readyState === 'loading') return blocked('loading');
+    const el = document.querySelector(__SELECTOR__);
+    if (!el || !el.isConnected) return blocked('missing');
+    if (el.matches(':disabled') || el.closest('[inert], [aria-disabled="true"]')) return blocked('disabled');
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0 ||
+        style.pointerEvents === 'none' || !el.getClientRects().length) return blocked('hidden');
+    el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+    const rect = el.getBoundingClientRect();
+    const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
+    const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
+    if (right <= left || bottom <= top) return blocked('offscreen');
+    const x = (left + right) / 2, y = (top + bottom) / 2;
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || !el.contains(hit)) return blocked('covered');
+    const geometry = [rect.left, rect.top, rect.width, rect.height];
+    if (state.element !== el || !state.geometry || state.since == null ||
+        geometry.some((value, i) => Math.abs(value - state.geometry[i]) > 1)) state.since = performance.now();
+    state.element = el; state.geometry = geometry;
+    if (performance.now() - state.since < 500) return {ready: false, reason: 'settling'};
+    if (__ARM__) {
+        state.receipt = {pressed: false, released: false, clicked: false};
+        state.listeners = ['pointerdown', 'pointerup', 'click'].map(type => {
+            const handler = event => {
+                if (event.isTrusted && event.composedPath().includes(el)) {
+                    state.receipt[{pointerdown: 'pressed', pointerup: 'released', click: 'clicked'}[type]] = true;
+                }
+            };
+            window.addEventListener(type, handler, true);
+            return [type, handler];
+        });
+    }
+    return {ready: true, x, y};
+})()"""
+
+CLEAN_SCRIPT = """(() => {
+    const state = window.__autoUiPointer;
+    for (const [type, handler] of state?.listeners || []) window.removeEventListener(type, handler, true);
+    delete window.__autoUiPointer;
+})()"""
+
+
+async def click_control(tab, evaluate, selector: str, *, kind="control", timeout=8) -> dict:
+    """Input receipt is separate from the caller's redirect/dismissal checks."""
+    kind = kind if kind in {"login", "oauth", "consent"} else "control"
+    sent = False
+    flags = {key: None for key in ("pressed", "released", "clicked")}
+    reason = "unavailable"
+    deadline = asyncio.get_running_loop().time() + timeout
+
+    async def target(arm=False):
+        script = TARGET_SCRIPT.replace("__SELECTOR__", json.dumps(selector)).replace("__ARM__", json.dumps(arm))
+        result = await asyncio.wait_for(evaluate(tab, script), timeout=2)
+        return result if isinstance(result, dict) else {"ready": False, "reason": "unavailable"}
+
+    async def send(command):
+        return await asyncio.wait_for(tab.send(command), timeout=2)
+
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            position = await target()
+            if position.get("ready") is True:
+                await send(cdp.input_.dispatch_mouse_event("mouseMoved", x=position["x"], y=position["y"], buttons=0))
+                await asyncio.sleep(0.25)
+                position = await target(arm=True)
+                if position.get("ready") is True:
+                    break
+            reason = position.get("reason", "unavailable")
+            await asyncio.sleep(0.25)
+        else:
+            return {"input_sent": False, "clicked": False}
+        sent = True
+        try:
+            await send(cdp.input_.dispatch_mouse_event(
+                "mousePressed", x=position["x"], y=position["y"],
+                button=cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,
+            ))
+        finally:
+            await send(cdp.input_.dispatch_mouse_event(
+                "mouseReleased", x=position["x"], y=position["y"],
+                button=cdp.input_.MouseButton.LEFT, buttons=0, click_count=1,
+            ))
+        with suppress(Exception):
+            receipt = await asyncio.wait_for(evaluate(tab, "window.__autoUiPointer?.receipt || null"), timeout=2)
+            if isinstance(receipt, dict):
+                flags = {key: receipt.get(key) is True for key in flags}
+    except Exception:
+        # Navigation can destroy the event observer after a successful press.
+        # The caller must still observe the expected application outcome.
+        pass
+    finally:
+        with suppress(Exception):
+            await asyncio.wait_for(evaluate(tab, CLEAN_SCRIPT), timeout=2)
+        safe_reason = reason if reason in {
+            "loading", "missing", "disabled", "hidden", "offscreen", "covered", "settling",
+        } else "unavailable"
+        print("  → Application mouse input: " + json.dumps({
+            "kind": kind, "input_sent": sent, "trusted_events": flags,
+            "reason": "sent" if sent else safe_reason,
+        }, sort_keys=True))
+    return {"input_sent": sent, "clicked": flags["clicked"] if sent else False}

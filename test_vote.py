@@ -1040,6 +1040,14 @@ class RetryOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        # These auth fixtures use AsyncMock tabs; handler registration is a
+        # synchronous CDP API, covered separately by network diagnostics tests.
+        for name, replacement in (("start", AsyncMock()), ("stop", MagicMock())):
+            p = patch("vote.request_diagnostics.RequestDiagnostics." + name, new=replacement)
+            p.start()
+            self.addCleanup(p.stop)
+
     @patch("builtins.print")
     @patch("vote.evaluate", new_callable=AsyncMock)
     async def test_session_probe_preserves_http_403_diagnostics(self, evaluate, _print):
@@ -1121,7 +1129,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
 
         solver.assert_awaited_once()
         session_probe.assert_awaited_once()
-        self.assertEqual(page_hint.await_count, 1 + vote.AUTH_PAGE_SETTLE_POLLS)
+        self.assertEqual(page_hint.await_count, 1 + vote.AUTH_PAGE_SETTLE_POLLS + vote.AUTH_RECOVERY_POLLS)
 
     @patch("builtins.print")
     @patch("vote.settle_privacy_overlay", new_callable=AsyncMock)
@@ -1265,6 +1273,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         browser = MagicMock()
         browser.__iter__.return_value = iter([AsyncMock()])
         browser.cookies.clear = AsyncMock()
+        browser.cookies.get_all = AsyncMock(return_value=[])
         browser.aclose = AsyncMock()
         start_browser.return_value = browser
         cookie_login.return_value = vote.AUTH_INVALID
@@ -1275,6 +1284,7 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results[0]["status"], "success")
         oauth_login.assert_awaited_once()
+        browser.cookies.clear.assert_not_awaited()
         browser.aclose.assert_awaited_once()
         browser.stop.assert_called_once()
 
@@ -1369,8 +1379,10 @@ class ElementMatchingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
-    @patch("vote.evaluate", new_callable=AsyncMock, return_value={"present": True, "dismissed": True})
-    async def test_privacy_overlay_dismiss_clicks_detected_consent(self, evaluate_mock):
+    @patch("vote.asyncio.sleep", new_callable=AsyncMock)
+    @patch("vote.ui_click.click_control", new_callable=AsyncMock, return_value={"input_sent": True, "clicked": True})
+    @patch("vote.evaluate", new_callable=AsyncMock, side_effect=[{"present": True, "button_found": True}, {"present": False}])
+    async def test_privacy_overlay_dismiss_clicks_detected_consent(self, evaluate_mock, click, _sleep):
         tab = AsyncMock()
 
         self.assertTrue(await vote.dismiss_privacy_overlay(tab))
@@ -1379,6 +1391,7 @@ class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#accept-btn", expression)
         self.assertIn("textContent", expression)
         self.assertIn("agree", expression)
+        click.assert_awaited_once()
 
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.dismiss_privacy_overlay", new_callable=AsyncMock, side_effect=[False, True, False])
@@ -1390,17 +1403,14 @@ class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sleep.await_count, 2)
         sleep.assert_awaited_with(0.25)
 
+    @patch("vote.ui_click.click_control", new_callable=AsyncMock, return_value={"input_sent": True, "clicked": True})
     @patch("vote.dismiss_privacy_overlay", new_callable=AsyncMock)
-    async def test_marked_click_dismisses_privacy_overlay_first(self, dismiss):
-        element = AsyncMock()
+    async def test_marked_click_dismisses_privacy_overlay_first(self, dismiss, click):
         tab = AsyncMock()
-        tab.select.return_value = element
 
         self.assertTrue(await vote._click_marked(tab, "data-login"))
         dismiss.assert_awaited_once_with(tab)
-        tab.select.assert_awaited_once_with('[data-login="1"]', timeout=2)
-        element.scroll_into_view.assert_awaited_once()
-        element.click.assert_awaited_once()
+        click.assert_awaited_once_with(tab, vote.evaluate, '[data-login="1"]', kind="login")
 
     @patch("builtins.print")
     @patch("vote.send_telegram_photo", return_value=True)
@@ -1430,11 +1440,12 @@ class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("consent_button_not_found", send_photo.call_args.args[1])
 
     @patch("builtins.print")
+    @patch("vote.stable_challenge_clearance", new_callable=AsyncMock, return_value=True)
     @patch("vote.dismiss_privacy_overlay", new_callable=AsyncMock)
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
     @patch("vote.is_turnstile_solved", new_callable=AsyncMock, side_effect=[False, True])
     async def test_solver_dismisses_privacy_overlay_before_click(
-        self, _solved, _present, dismiss, _print
+        self, _solved, _present, dismiss, _clear, _print
     ):
         tab = AsyncMock()
 
@@ -1449,6 +1460,9 @@ class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
         click = patch("vote._click_cloudflare_checkbox", new_callable=AsyncMock, return_value="sent")
         self.click = click.start()
         self.addCleanup(click.stop)
+        clearance = patch("vote.stable_challenge_clearance", new=AsyncMock(return_value=True))
+        clearance.start()
+        self.addCleanup(clearance.stop)
 
     async def test_unavailable_target_is_not_reported_as_a_sent_click(self):
         self.click.return_value = "unavailable"
@@ -1722,8 +1736,12 @@ class FullOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @patch("builtins.print")
     async def test_cookie_fallback_captcha_reports_failure_without_retry(self, _print):
         browser = MagicMock()
-        browser.__iter__.return_value = iter([AsyncMock()])
+        tab = AsyncMock()
+        tab.add_handler = MagicMock()
+        tab.remove_handler = MagicMock()
+        browser.__iter__.return_value = iter([tab])
         browser.cookies.clear = AsyncMock()
+        browser.cookies.get_all = AsyncMock(return_value=[])
         browser.aclose = AsyncMock()
         account_cookies = [[{"name": "__Secure-authjs.session-token"}]]
         captcha = {
