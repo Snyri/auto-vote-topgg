@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 import nodriver as uc
 import requests
 
+import cloudflare_click
+
 WIB = timezone(timedelta(hours=7))
 DISCORD_LOGIN_URL = "https://discord.com/login"
 TIMEOUT_OAUTH_SEC = 25
@@ -1518,10 +1520,25 @@ async def unresolved_challenge_auth_state(tab: Any) -> str:
 
 
 async def is_turnstile_present(tab: Any) -> bool:
-    # Keep widget detection separate from the full-page error classifier.
-    # A residual title/container must not keep this click/wait loop active.
+    # Managed challenges can expose only their title/security text before the
+    # checkbox appears. Observe those too, while keeping hard-denial error pages
+    # separate from interactive widget detection.
     return bool(await evaluate(tab, """(() => {
         const body = document.body ? document.body.innerText.toLowerCase() : '';
+        const title = (document.title || '').trim().toLowerCase();
+        const managed = title.startsWith('just a moment') ||
+            body.includes('performing security verification') ||
+            body.includes('needs to review the security of your connection');
+        const usableVote = [...document.querySelectorAll('button, [role="button"]')].some(node => {
+            if ((node.textContent || '').trim().toLowerCase() !== 'vote' || node.disabled ||
+                node.getAttribute('aria-disabled') === 'true' ||
+                !(node.getClientRects().length || node.offsetWidth || node.offsetHeight)) return false;
+            const style = getComputedStyle(node);
+            return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
+        });
+        const usableCooldown = body.includes('vote again in') || body.includes('already voted') ||
+            body.includes('can vote again');
+        if (managed && !usableVote && !usableCooldown) return true;
         if (body.includes('verify you are human') ||
             body.includes('please solve the captcha to continue') ||
             body.includes('complete the captcha') ||
@@ -1633,6 +1650,14 @@ async def log_challenge_diagnostic(tab: Any, phase: str) -> None:
         print(f"  Challenge diagnostic unavailable (phase={safe_phase})")
 
 
+async def _click_cloudflare_checkbox(tab: Any) -> str:
+    async def cleared() -> bool:
+        await dismiss_privacy_overlay(tab)
+        return await is_turnstile_solved(tab) or not await is_turnstile_present(tab)
+
+    return await cloudflare_click.click_cloudflare_checkbox(tab, evaluate, cleared)
+
+
 async def solve_turnstile(tab: Any) -> bool:
     await dismiss_privacy_overlay(tab)
     if await is_turnstile_solved(tab):
@@ -1640,15 +1665,21 @@ async def solve_turnstile(tab: Any) -> bool:
     if not await is_turnstile_present(tab):
         return True
     await log_challenge_diagnostic(tab, "detected")
-    print("  → Challenge detected; attempting library verification click...")
+    print("  → Challenge detected; waiting for a verified Cloudflare checkbox target...")
     try:
-        await tab.verify_cf()
-        print("  → Verification click dispatched; target match and acceptance unconfirmed")
+        click = await _click_cloudflare_checkbox(tab)
     except Exception as exc:
-        dbg(f"verify_cf failed: {type(exc).__name__}")
+        dbg(f"Cloudflare mouse interaction failed: {type(exc).__name__}")
         print(f"  ⚠️  Turnstile checkbox click failed ({type(exc).__name__})")
         await log_challenge_diagnostic(tab, "click_error")
         return False
+    if click == "cleared":
+        print("  → Challenge cleared while waiting; no checkbox click needed")
+        return True
+    if click != "sent":
+        await log_challenge_diagnostic(tab, "click_error")
+        return False
+    print("  → Cloudflare mouse input sent; waiting for verification acceptance")
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     while asyncio.get_running_loop().time() < deadline:
         if await is_turnstile_solved(tab):

@@ -1438,12 +1438,38 @@ class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
     ):
         tab = AsyncMock()
 
-        self.assertTrue(await vote.solve_turnstile(tab))
+        with patch("vote._click_cloudflare_checkbox", new=AsyncMock(return_value="sent")) as click:
+            self.assertTrue(await vote.solve_turnstile(tab))
         dismiss.assert_awaited_once_with(tab)
-        tab.verify_cf.assert_awaited_once_with()
+        click.assert_awaited_once_with(tab)
 
 
 class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        click = patch("vote._click_cloudflare_checkbox", new_callable=AsyncMock, return_value="sent")
+        self.click = click.start()
+        self.addCleanup(click.stop)
+
+    async def test_unavailable_target_is_not_reported_as_a_sent_click(self):
+        self.click.return_value = "unavailable"
+        with (
+            patch("builtins.print"),
+            patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
+            patch("vote.is_turnstile_solved", new=AsyncMock(return_value=False)),
+            patch("vote.log_challenge_diagnostic", new_callable=AsyncMock),
+        ):
+            self.assertFalse(await vote.solve_turnstile(AsyncMock()))
+
+    async def test_automatic_clearance_can_complete_without_a_click(self):
+        self.click.return_value = "cleared"
+        with (
+            patch("builtins.print"),
+            patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
+            patch("vote.is_turnstile_solved", new=AsyncMock(return_value=False)),
+            patch("vote.log_challenge_diagnostic", new_callable=AsyncMock),
+        ):
+            self.assertTrue(await vote.solve_turnstile(AsyncMock()))
+
     @patch("builtins.print")
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
     @patch("vote.is_turnstile_solved", new_callable=AsyncMock, return_value=False)
@@ -1451,7 +1477,7 @@ class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
         tab = AsyncMock()
 
         self.assertTrue(await vote.solve_turnstile(tab))
-        tab.verify_cf.assert_not_awaited()
+        self.click.assert_not_awaited()
 
     @patch("builtins.print")
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
@@ -1460,7 +1486,7 @@ class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
         tab = AsyncMock()
 
         self.assertTrue(await vote.solve_turnstile(tab))
-        tab.verify_cf.assert_awaited_once_with()
+        self.click.assert_awaited_once_with(tab)
 
     @patch("builtins.print")
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, side_effect=[True, False])
@@ -1469,17 +1495,17 @@ class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
         tab = AsyncMock()
 
         self.assertTrue(await vote.solve_turnstile(tab))
-        tab.verify_cf.assert_awaited_once_with()
+        self.click.assert_awaited_once_with(tab)
 
     @patch("builtins.print")
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=True)
     @patch("vote.is_turnstile_solved", new_callable=AsyncMock, return_value=False)
     async def test_click_exception_fails_immediately(self, _solved, _present, _print):
         tab = AsyncMock()
-        tab.verify_cf.side_effect = TypeError("missing template coordinates")
+        self.click.side_effect = TypeError("missing template coordinates")
 
         self.assertFalse(await vote.solve_turnstile(tab))
-        tab.verify_cf.assert_awaited_once_with()
+        self.click.assert_awaited_once_with(tab)
 
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
@@ -1495,7 +1521,7 @@ class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("vote.asyncio.get_running_loop", return_value=loop):
             self.assertFalse(await vote.solve_turnstile(tab))
-        tab.verify_cf.assert_awaited_once_with()
+        self.click.assert_awaited_once_with(tab)
 
 
 class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):

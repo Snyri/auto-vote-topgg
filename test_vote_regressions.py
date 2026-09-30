@@ -402,12 +402,14 @@ const controls = (fixture.controls || []).map(item => ({
     offsetWidth: item.visible === false ? 0 : 100,
     offsetHeight: item.visible === false ? 0 : 20,
     getClientRects: () => item.visible === false ? [] : [{}],
+    fixtureStyle: item.style || {},
     getAttribute: name => (item.attributes || {})[name] ?? null,
 }));
 const matches = (node, selector) => selector === node.tagName ||
     (selector === '[role="button"]' && node.getAttribute('role') === 'button');
 const sandbox = {
     AbortController,
+    getComputedStyle: node => ({display:'block', visibility:'visible', opacity:'1', ...node.fixtureStyle}),
     document: {
         body: {innerText: fixture.body || ''},
         title: fixture.title || 'Vote for a bot',
@@ -517,7 +519,7 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(expected=expected, fixture=fixture):
                     self.assertIs((await self.execute_expression(expression, fixture))["value"], expected)
 
-    async def test_interstitial_shell_alone_does_not_claim_an_active_widget(self):
+    async def test_managed_shell_waits_for_checkbox_without_confusing_hard_denials(self):
         expression = await self.capture_expression(vote.is_turnstile_present)
         fixtures = [
             {"title": "Just a moment..."},
@@ -530,11 +532,31 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
         ]
         for fixture in fixtures:
             with self.subTest(fixture=fixture):
-                self.assertFalse((await self.execute_expression(expression, fixture))["value"])
+                pending = fixture.get("title") == "Just a moment..." or "body" in fixture
+                self.assertIs((await self.execute_expression(expression, fixture))["value"], pending)
         self.assertFalse((await self.execute_expression(expression, {"body": "Welcome to top.gg"}))["value"])
         self.assertTrue((await self.execute_expression(expression, {
             "selectors": ['iframe[src*="challenges.cloudflare.com"]'],
         }))["value"])
+
+    async def test_residual_managed_signals_do_not_trigger_a_click_on_a_usable_page(self):
+        expression = await self.capture_expression(vote.is_turnstile_present)
+        for fixture in (
+            {"title": "Just a moment...", "controls": [{"text": "Vote"}]},
+            {"body": "Performing security verification", "controls": [{"text": "Vote"}]},
+            {"title": "Just a moment...", "body": "You can vote again in 11 hours"},
+        ):
+            with self.subTest(fixture=fixture):
+                self.assertFalse((await self.execute_expression(expression, fixture))["value"])
+        for control in (
+            {"text": "Vote", "disabled": True},
+            {"text": "Vote", "visible": False},
+            {"text": "Vote", "style": {"visibility": "hidden"}},
+        ):
+            with self.subTest(control=control):
+                self.assertTrue((await self.execute_expression(expression, {
+                    "title": "Just a moment...", "controls": [control],
+                }))["value"])
 
     async def test_residual_challenge_markers_do_not_hide_a_usable_vote_surface(self):
         expression = await self.capture_expression(vote.topgg_page_auth_hint)
