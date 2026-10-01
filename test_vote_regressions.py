@@ -406,8 +406,13 @@ const controls = (fixture.controls || []).map(item => ({
     getAttribute: name => (item.attributes || {})[name] ?? null,
     hasAttribute: name => Object.hasOwn(item.attributes || {}, name),
 }));
-const matches = (node, selector) => selector === node.tagName ||
+const matches = (node, selector) => selector === node.tagName.toLowerCase() ||
+    (selector === ':disabled' && node.disabled) ||
     (selector === '[role="button"]' && node.getAttribute('role') === 'button');
+for (const node of controls) {
+    node.matches = selector => selector.split(',').some(part => matches(node, part.trim()));
+    node.closest = () => node.getAttribute('aria-disabled') === 'true' ? {} : null;
+}
 const sandbox = {
     AbortController,
     getComputedStyle: node => ({display:'block', visibility:'visible', opacity:'1', ...node.fixtureStyle}),

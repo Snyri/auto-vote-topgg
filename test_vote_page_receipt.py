@@ -101,7 +101,7 @@ class VotePageReceiptEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_returned_evidence_does_not_include_raw_private_page_text(self):
         private_text = "Thanks for voting! Private user and session material"
         actual = await self.inspect(raw_page(text=private_text))
-        self.assertEqual(set(actual), {"observed", "confirmed", "evidence", "exact_vote_page", "ready", "vote_enabled", "challenge", "login_required", "error_present"})
+        self.assertEqual(set(actual), {"observed", "confirmed", "evidence", "exact_vote_page", "ready", "vote_enabled", "challenge", "login_required", "error_present", "ad_pending"})
         self.assertNotIn("Private user", json.dumps(actual))
 
     async def test_stalled_page_observation_is_cancelled_within_budget(self):
@@ -207,6 +207,10 @@ const nodes = (fixture.elements || []).map(item => ({
     getClientRects: () => item.visible === false ? [] : [{}],
     getAttribute: name => (item.attrs || {})[name] ?? null,
     hasAttribute: name => Object.hasOwn(item.attrs || {}, name) || (name === 'disabled' && Boolean(item.disabled)),
+    inheritedDisabled: Boolean(item.fieldsetDisabled),
+    inert: Boolean(item.inert),
+    parentElement: item.ancestorStyle ? {styleFixture: item.ancestorStyle} : null,
+    styleFixture: item.style || {},
 }));
 function matches(node, selector) {
     selector = selector.trim();
@@ -219,7 +223,12 @@ function matches(node, selector) {
         const value = node.getAttribute(attribute);
         return operator === '*=' ? String(value || '').includes(wanted) : value === wanted;
     }
+    if (selector === ':disabled') return node.disabled || node.inheritedDisabled;
     return node.tagName.toLowerCase() === selector.toLowerCase();
+}
+for (const node of nodes) {
+    node.matches = selector => selector.split(',').some(part => matches(node, part));
+    node.closest = () => node.inert || node.getAttribute('aria-disabled') === 'true' ? {} : null;
 }
 const document = {
     body: {innerText: fixture.text ?? 'Thanks for voting!'},
@@ -232,7 +241,7 @@ const sandbox = {
     document,
     location: new URL(fixture.url || 'https://top.gg/bot/111/vote'),
     URL,
-    getComputedStyle: node => ({display: node.offsetWidth ? 'block' : 'none', visibility: 'visible', opacity: '1'}),
+    getComputedStyle: node => ({display: node.offsetWidth === 0 ? 'none' : 'block', visibility: 'visible', opacity: '1', ...node.styleFixture}),
     fetch: () => {throw new Error('Receipt observation must not make network requests');},
 };
 sandbox.window = sandbox;
@@ -286,6 +295,9 @@ class VotePageReceiptJavaScriptTests(unittest.IsolatedAsyncioTestCase):
             {"text": "Vote", "disabled": True},
             {"text": "Vote", "visible": False},
             {"text": "Vote", "attrs": {"aria-disabled": "true"}},
+            {"text": "Vote", "fieldsetDisabled": True},
+            {"text": "Vote", "inert": True},
+            {"text": "Vote", "ancestorStyle": {"opacity": "0"}},
         ):
             with self.subTest(control=control):
                 self.assertTrue((await self.inspect({"elements": [control]}))["confirmed"])

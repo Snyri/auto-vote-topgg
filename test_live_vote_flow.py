@@ -12,13 +12,14 @@ import shutil
 import tempfile
 import unittest
 from contextlib import suppress
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import nodriver as uc
 
 import request_diagnostics
 import vote
 import cloudflare_click
+from recovery_state import SubmissionJournal
 
 
 CHROME = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
@@ -48,6 +49,13 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.late_error = False
         self.audit_error = False
         self.cloud_widget = False
+        self.ad_duration = 0
+        self.hydration_delay = 0
+        self.stale_cooldown = False
+        self.already_voted = False
+        self.persist_vote = False
+        self.unusable_controls = False
+        self.session_delay = 0
         self.provider_documents = 0
         self.fixture_errors = []
         try:
@@ -69,6 +77,8 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
             raise
 
     def html(self):
+        if self.persist_vote and self.mutations:
+            return '<!doctype html><title>Voting fixture</title><div>Thanks for voting!</div><script>window.readDone=true;</script>'
         read = not (self.omit_reloaded_read and self.documents > 1)
         query = json.dumps({"query": 'query State { canVote(botId:"111") }'})
         mutation = json.dumps({"query": 'mutation Cast { ' + self.mutation_field + '(botId:"111") { ok } }'})
@@ -80,9 +90,20 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                  'if(e.origin==="https://challenges.cloudflare.com") widgetClick=e.data;});</script>') if self.cloud_widget else ""
         return """<!doctype html><title>Voting fixture</title>
             <style>button { margin:100px;width:180px;height:50px }</style>
-            __BEFORE_WIDGET__<section id="surface"><button id="vote">Vote</button></section>
+            __BEFORE_WIDGET__<section id="surface">__STALE____UNUSABLE__<div id="ad"></div><button id="vote">Vote</button></section>
             <script>
-            window.readDone=false; window.nativeClicks=0;
+            window.readDone=false; window.nativeClicks=0; window.unusableClicks=0;
+            const button = document.getElementById('vote');
+            if (__AD_DURATION__) {
+                ad.textContent='You will be able to vote after this ad'; button.disabled=true;
+                setTimeout(()=>{ad.textContent=''; button.disabled=false; window.adFinishedAt=performance.now();}, __AD_DURATION__);
+            }
+            if (__HYDRATION_DELAY__) {
+                button.style.display='none';
+                setTimeout(()=>{button.style.display='';}, __HYDRATION_DELAY__);
+            }
+            if (__ALREADY_VOTED__) button.disabled=true;
+            document.addEventListener('click',e=>{if(e.target.closest('[data-unusable]')) unusableClicks++;});
             const post = body => fetch('/api/graphql', {method:'POST',
                 headers:{'content-type':'application/json'},body:JSON.stringify(body)});
             if (__READ__) post(__QUERY__).then(()=>readDone=true).catch(()=>readDone=true);
@@ -90,6 +111,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
             vote.addEventListener('click', async e => {
                 if (!e.isTrusted) return;
                 nativeClicks++;
+                window.clickedAt=performance.now();
                 await post(__MUTATION__);
                 // Model optimistic UI as well as normal acknowledgements.
                 if (__AUDIT__) await post({query:'mutation Audit { auditBotVote(botId:"111") { ok } }'});
@@ -101,7 +123,15 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                     "__AUDIT__", json.dumps(self.audit_error)).replace("__FRAME__", frame).replace(
                     "__LATE_ERROR__", json.dumps(self.late_error)).replace("__BEFORE_WIDGET__",
                     ('Verify you are human' + widget if self.pre_solved_widget else '') +
-                    ('<iframe src="https://challenges.cloudflare.com/local-fixture" style="display:none;width:200px;height:100px"></iframe>' if self.hidden_widget else ''))
+                    ('<iframe src="https://challenges.cloudflare.com/local-fixture" style="display:none;width:200px;height:100px"></iframe>' if self.hidden_widget else '')).replace(
+                        "__AD_DURATION__", str(self.ad_duration)).replace("__HYDRATION_DELAY__", str(self.hydration_delay)).replace(
+                        "__STALE__", '<div>You can vote again in 11 hours. Something went wrong.</div>' if self.stale_cooldown else
+                        '<div>You can vote again in 1 hour.</div>' if self.already_voted else '').replace(
+                        "__UNUSABLE__", ('<fieldset disabled><button data-unusable>Vote</button></fieldset>'
+                            '<div inert><button data-unusable>Vote</button></div>'
+                            '<div style="position:relative"><button data-unusable>Vote</button>'
+                            '<div style="position:absolute;inset:0;background:white;z-index:1"></div></div>') if self.unusable_controls else '').replace(
+                            "__ALREADY_VOTED__", json.dumps(self.already_voted))
 
     async def fulfill(self, event):
         try:
@@ -126,7 +156,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                     if blocked:
                         status, headers, body = 403, {"content-type": "text/html", "cf-mitigated": "challenge"}, "Denied"
                     else:
-                        status, headers, body = 200, {"content-type": "application/json"}, '{"data":{"canVote":true}}'
+                        status, headers, body = 200, {"content-type": "application/json"}, json.dumps({"data": {"canVote": not self.already_voted}})
                 elif "auditBotVote" in raw:
                     status, headers, body = 200, {"content-type":"application/json"}, '{"errors":[{"extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}'
                 else:
@@ -136,6 +166,9 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                             if self.mutation_error else json.dumps({"data": {self.mutation_field: {"ok": True}}}))
                     if self.late_error and self.mutations > 1:
                         body = '{"errors":[{"extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}'
+            elif url == "https://top.gg/api/auth/session":
+                await asyncio.sleep(self.session_delay)
+                status, headers, body = 200, {"content-type": "application/json"}, '{"user":{"id":"LOCAL_FIXTURE"}}'
             await self.tab.send(uc.cdp.fetch.fulfill_request(
                 event.request_id, status,
                 response_headers=[uc.cdp.fetch.HeaderEntry(k, v) for k, v in headers.items()],
@@ -197,6 +230,74 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mutations, 1)
         self.assertEqual(self.tracker.vote_network.submission_outcome(), "usable")
         self.assertEqual(await vote.evaluate(self.tab, "window.nativeClicks"), 1)
+
+    async def recover_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "vote-recovery.json")
+            journal = SubmissionJournal(path, ["local-token"], ["111"])
+            journal.select("local-token", "111")
+            journal.before_press()
+            recovered = SubmissionJournal(path, ["local-token"], ["111"])
+            self.session.authenticated = True
+            # Retain the local authenticated fixture for event assertions after
+            # the account call; navigation, network, journal, and input stay real.
+            with (patch("vote.RECOVERY_JOURNAL", recovered),
+                  patch("vote.topgg_auth_state", new=AsyncMock(return_value=vote.AUTHENTICATED)),
+                  patch.object(self.session, "reusable", new=AsyncMock(return_value=True))):
+                result = (await asyncio.wait_for(vote._run_account(
+                    "local-token", ["111"], "fixture", session=self.session), 45))[0]
+            self.assertEqual(recovered.records[recovered.active_key]["kind"], "complete")
+            return result
+
+    async def test_pending_handoff_waits_a_ten_second_ad_then_votes_once(self):
+        self.ad_duration = 10000
+        await self.load()
+        result = await self.recover_pending()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.documents, 2, "Recovery must retain the new document through the ad")
+        self.assertEqual(self.mutations, 1)
+        self.assertEqual(await vote.evaluate(self.tab, "window.nativeClicks"), 1)
+        self.assertTrue(await vote.evaluate(self.tab, "clickedAt >= adFinishedAt && adFinishedAt >= 10000"))
+
+    async def test_pending_handoff_waits_for_the_app_to_hydrate_without_reload_loops(self):
+        self.hydration_delay = 8000
+        await self.load()
+        result = await self.recover_pending()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.documents, 2)
+        self.assertEqual(self.mutations, 1)
+
+    async def test_stale_cooldown_with_a_vote_and_error_does_not_finish_without_input(self):
+        self.stale_cooldown = self.persist_vote = True
+        await self.load()
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.mutations, 1)
+        self.assertEqual(self.documents, 2, "Stale evidence still needs independent confirmation")
+
+    async def test_multiple_vote_controls_choose_the_unobstructed_enabled_one(self):
+        self.unusable_controls = True
+        await self.load()
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.mutations, 1)
+        self.assertEqual(await vote.evaluate(self.tab, "window.unusableClicks"), 0)
+        self.assertEqual(await vote.evaluate(self.tab, "window.nativeClicks"), 1)
+
+    async def test_genuine_cooldown_with_a_disabled_vote_is_accepted_without_input(self):
+        self.already_voted = True
+        await self.load()
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "cooldown")
+        self.assertEqual(self.mutations, 0)
+        self.assertEqual(await vote.evaluate(self.tab, "window.nativeClicks"), 0)
+        self.assertEqual(self.documents, 1)
+
+    async def test_nine_second_session_response_is_not_cancelled_by_the_cdp_default(self):
+        self.session_delay = 9
+        await self.load()
+        self.assertTrue((await vote.topgg_session_probe(self.tab))["authenticated"])
+        self.assertEqual(self.fixture_errors, [])
 
     async def test_cookie_navigation_preserves_the_session_owning_network_observers(self):
         session_id = self.tab.session_id

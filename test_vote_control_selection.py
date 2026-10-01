@@ -19,7 +19,7 @@ const controls = input.controls.map((item, index) => {
     const attributes = {...(item.attributes || {})};
     const tagName = (item.tag || 'button').toLowerCase();
     const nativeButton = tagName === 'button' || tagName === 'input';
-    return {
+    const node = {
         index,
         tagName: tagName.toUpperCase(),
         textContent: item.text || 'Vote',
@@ -33,7 +33,17 @@ const controls = input.controls.map((item, index) => {
         setAttribute: (name, value) => { attributes[name] = String(value); },
         removeAttribute: name => { delete attributes[name]; },
         styleFixture: item.style || {},
+        parentElement: item.inert || item.ancestorStyle ? {styleFixture: item.ancestorStyle || {}} : null,
+        matches: selector => selector.split(',').some(part => part.trim() === ':disabled'
+            ? nativeButton && Boolean(item.disabled || item.fieldsetDisabled || Object.hasOwn(attributes, 'disabled'))
+            : matches(node, part.trim())),
+        closest: () => item.inert || attributes['aria-disabled'] === 'true' ? {} : null,
+        scrollIntoView: () => {},
+        getBoundingClientRect: () => ({left: 10, right: 110, top: index * 30, bottom: index * 30 + 20}),
+        contains: hit => hit === node,
+        covered: Boolean(item.covered),
     };
+    return node;
 });
 const matches = (node, selector) => {
     if (selector === node.tagName.toLowerCase()) return true;
@@ -49,9 +59,14 @@ const sandbox = {
         querySelectorAll: selector => controls.filter(node => selector.split(',').some(
             part => matches(node, part.trim())
         )),
+        elementFromPoint: (x, y) => {
+            const node = controls.find(node => y >= node.index * 30 && y <= node.index * 30 + 20);
+            return node?.covered ? {} : node;
+        },
     },
+    innerWidth: 1000, innerHeight: 1000,
     getComputedStyle: node => ({
-        display: 'block', visibility: 'visible', opacity: '1', ...node.styleFixture,
+        display: 'block', visibility: 'visible', opacity: '1', pointerEvents: 'auto', ...node.styleFixture,
     }),
 };
 const result = vm.runInNewContext(input.expression, sandbox, {timeout: 1000});
@@ -100,6 +115,21 @@ class VoteControlSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(observed["result"]["found"])
         self.assertFalse(observed["result"]["disabled"])
         self.assertEqual(observed["marked"], [{"index": 1, "tag": "button"}])
+
+    async def test_unusable_first_candidate_cannot_hide_the_actionable_button(self):
+        for blocked in (
+            {"fieldsetDisabled": True}, {"inert": True}, {"covered": True},
+            {"style": {"pointerEvents": "none"}}, {"ancestorStyle": {"opacity": "0"}},
+        ):
+            with self.subTest(blocked=blocked):
+                observed = await self.select([blocked, {"tag": "button"}])
+                self.assertFalse(observed["result"]["disabled"])
+                self.assertEqual(observed["marked"], [{"index": 1, "tag": "button"}])
+
+    async def test_inherited_disabled_control_remains_unavailable_when_alone(self):
+        for blocked in ({"fieldsetDisabled": True}, {"inert": True}):
+            with self.subTest(blocked=blocked):
+                self.assertTrue((await self.select([blocked]))["result"]["disabled"])
 
     async def test_navigation_links_alone_do_not_supply_a_vote_click_target(self):
         observed = await self.select([

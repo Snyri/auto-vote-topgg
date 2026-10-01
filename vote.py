@@ -23,6 +23,7 @@ import cloudflare_click
 import request_diagnostics
 import ui_click
 from page_signals import CHALLENGE_JS
+from vote_controls import VOTE_CONTROL_JS
 from recovery_state import SubmissionJournal
 
 WIB = timezone(timedelta(hours=7))
@@ -31,6 +32,7 @@ BROWSER_COMMAND_TIMEOUT_SEC = 8
 TIMEOUT_OAUTH_SEC = 25
 TIMEOUT_VOTE_SEC = 30
 SESSION_PROBE_TIMEOUT_SEC = 12
+RECOVERY_OBSERVE_TIMEOUT_SEC = 90
 AUTH_PAGE_SETTLE_POLLS = 4
 AUTH_PAGE_SETTLE_DELAY_SEC = 2
 AUTH_RECOVERY_POLLS = 4
@@ -466,11 +468,27 @@ async def persisted_vote_confirmation(tab: Any, bot_id: str) -> dict:
     """Use the same error/challenge rules after an independent document load."""
     return await vote_page_confirmation(tab, bot_id)
 
+
+async def confirmed_cooldown(tab: Any, bot_id: str, text: str) -> dict | None:
+    """Record cooldown only when the actual vote page agrees, twice."""
+    if not page_indicates_cooldown(text):
+        return None
+    first = await vote_page_confirmation(tab, bot_id)
+    if first.get("confirmed") is not True:
+        return None
+    await asyncio.sleep(0.5)
+    second = await vote_page_confirmation(tab, bot_id)
+    if (second.get("confirmed") is not True
+            or second.get("evidence") != first.get("evidence")):
+        return None
+    print(f"  ⏳ Already voted for {bot_id} (verified cooldown)")
+    return cooldown_result(bot_id, text)
+
 async def vote_page_confirmation(tab: Any, bot_id: str) -> dict:
     """Observe a ready, exact vote page without leaking text or challenge tokens."""
     unknown = {"observed": False, "confirmed": False, "evidence": None,
                "exact_vote_page": False, "ready": False, "vote_enabled": False,
-               "challenge": False, "login_required": False, "error_present": False}
+               "challenge": False, "login_required": False, "error_present": False, "ad_pending": False}
     script = "(() => {" + CHALLENGE_JS + r"""
         const text = document.body?.innerText || '';
         const body = text.toLowerCase();
@@ -481,9 +499,7 @@ async def vote_page_confirmation(tab: Any, bot_id: str) -> dict:
                 (!location.port || location.port === '443') &&
                 location.pathname.replace(/\/+$/, '') === '/bot/' + __BOT_ID__ + '/vote',
             ready: ['complete', 'interactive'].includes(document.readyState),
-            vote_enabled: [...document.querySelectorAll('button, [role="button"]')].some(node =>
-                challengeState.visible(node) && (node.textContent || '').trim().toLowerCase() === 'vote' &&
-                !node.disabled && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true'),
+            vote_enabled: voteControl.candidates().some(voteControl.enabled),
             challenge: challengeState.present,
             login_required: ['must be logged in', 'login to vote', 'log in to vote'].some(marker => body.includes(marker)),
             error_present: ['failed to vote', 'vote failed', 'something went wrong', 'please try again'].some(marker => body.includes(marker))
@@ -498,12 +514,14 @@ async def vote_page_confirmation(tab: Any, bot_id: str) -> dict:
             or not all(type(result.get(key)) is bool for key in flags)):
         return unknown
     evidence = vote_success_evidence(result["text"])
+    ad_pending = "you will be able to vote after this ad" in result["text"].lower()
     return {
         **{key: result[key] for key in flags},
         "observed": result["exact_vote_page"] and result["ready"],
         "evidence": evidence,
+        "ad_pending": ad_pending,
         "confirmed": bool(evidence) and result["exact_vote_page"] and result["ready"]
-        and not any(result[key] for key in ("vote_enabled", "challenge", "login_required", "error_present")),
+        and not ad_pending and not any(result[key] for key in ("vote_enabled", "challenge", "login_required", "error_present")),
     }
 
 async def confirm_vote_without_reload(tab: Any, bot_id: str, before: dict) -> bool:
@@ -800,14 +818,14 @@ def send_notification(message: str) -> bool:
     return all_sent
 
 
-async def evaluate(tab: Any, expression: str) -> Any:
+async def evaluate(tab: Any, expression: str, *, timeout: float | None = None) -> Any:
     remote_object, exception = await asyncio.wait_for(tab.send(uc.cdp.runtime.evaluate(
         expression=expression,
         user_gesture=True,
         await_promise=True,
         return_by_value=True,
         allow_unsafe_eval_blocked_by_csp=True,
-    )), timeout=BROWSER_COMMAND_TIMEOUT_SEC)
+    )), timeout=BROWSER_COMMAND_TIMEOUT_SEC if timeout is None else timeout)
     if exception:
         raise RuntimeError("JavaScript evaluation failed")
     return remote_object.value if remote_object else None
@@ -894,22 +912,11 @@ async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
         const title = (document.title || '').trim().toLowerCase();
         if (body.includes('you will be able to vote after this ad')) return blocked('ad_active');
         if (challengeState.present) return blocked('protection_active');
-        const style = getComputedStyle(el);
-        if ((el.textContent || '').trim().toLowerCase() !== 'vote' ||
-            !el.matches('button, [role="button"]')) return blocked('changed');
-        if (el.matches(':disabled') || el.hasAttribute('disabled') ||
-            el.closest('[inert], [aria-disabled="true"]')) return blocked('disabled');
-        if (style.display === 'none' || style.visibility !== 'visible' ||
-            Number(style.opacity) === 0 || style.pointerEvents === 'none' ||
-            !el.getClientRects().length) return blocked('hidden');
-        el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-        const rect = el.getBoundingClientRect();
-        const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
-        const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
-        if (right <= left || bottom <= top) return blocked('offscreen');
-        const x = (left + right) / 2, y = (top + bottom) / 2;
-        const hit = document.elementFromPoint(x, y);
-        if (!hit || !el.contains(hit)) return blocked('covered');
+        if (!voteControl.action(el)) return blocked('changed');
+        if (voteControl.disabled(el)) return blocked('disabled');
+        const position = voteControl.position(el, true);
+        if (!position.ready) return blocked(position.reason);
+        const {x, y, rect} = position;
         const geometry = [rect.left, rect.top, rect.width, rect.height];
         const same = state.element === el && state.geometry &&
             geometry.every((value, i) => Math.abs(value - state.geometry[i]) <= 1);
@@ -1198,7 +1205,8 @@ async def topgg_session_probe(tab: Any) -> dict:
     })()""".replace("__PROBE_TIMEOUT_MS__", str(int(SESSION_PROBE_TIMEOUT_SEC * 1000))).replace("__DOCUMENT_READY__", DOCUMENT_READY_JS)
     try:
         result = await asyncio.wait_for(
-            evaluate(tab, script), timeout=SESSION_PROBE_TIMEOUT_SEC + 2
+            evaluate(tab, script, timeout=SESSION_PROBE_TIMEOUT_SEC + 2),
+            timeout=SESSION_PROBE_TIMEOUT_SEC + 2,
         )
     except (TimeoutError, asyncio.TimeoutError):
         result = {"status": 0, "error": "session-probe-timeout"}
@@ -1287,7 +1295,7 @@ async def is_topgg_authenticated(tab: Any) -> bool:
 
 async def topgg_page_auth_hint(tab: Any) -> str:
     """Infer auth only from strong vote-page UI signals; otherwise return unknown."""
-    result = await evaluate(tab, """(() => {
+    result = await evaluate(tab, "(() => {" + VOTE_CONTROL_JS + """
         const body = (document.body ? document.body.innerText : '').toLowerCase();
         if (location.protocol !== 'https:' ||
             !['top.gg', 'www.top.gg'].includes(location.hostname) ||
@@ -1295,17 +1303,9 @@ async def topgg_page_auth_hint(tab: Any) -> str:
             return 'unknown';
         }
         const controls = [...document.querySelectorAll('button, a, [role="button"]')];
-        const voteButtons = [...document.querySelectorAll('button, [role="button"]')];
         const exactText = (node) => (node.textContent || '').trim().toLowerCase();
-        const isVisible = (node) => Boolean(
-            node && (node.getClientRects().length || node.offsetWidth || node.offsetHeight)
-        );
-        const hasVoteButton = voteButtons.some(node =>
-            exactText(node) === 'vote' &&
-            !node.disabled &&
-            node.getAttribute('aria-disabled') !== 'true' &&
-            isVisible(node)
-        );
+        const isVisible = voteControl.visible;
+        const hasVoteButton = voteControl.candidates().some(voteControl.enabled);
         const hasLoginButton = controls.some(node =>
             ['login', 'log in', 'sign in'].includes(exactText(node)) &&
             isVisible(node)
@@ -1813,33 +1813,20 @@ async def wait_for_ad(tab: Any, bot_id: str) -> dict | None:
 
 
 async def mark_vote_button(tab: Any) -> dict:
-    return dict(await evaluate(tab, """(() => {
+    return dict(await evaluate(tab, "(() => {" + VOTE_CONTROL_JS + """
         document.querySelectorAll('[data-auto-vote]').forEach(
             el => el.removeAttribute('data-auto-vote')
         );
-        const visible = el => {
-            if (!el || !(el.getClientRects().length || el.offsetWidth || el.offsetHeight)) return false;
-            const style = getComputedStyle(el);
-            return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
-        };
-        // Plain anchors navigate to the public vote page; they do not submit
-        // a vote. Prefer an enabled action when disabled copies precede it.
-        const controls = [...document.querySelectorAll('button, [role="button"]')];
-        const candidates = controls.filter(el =>
-            visible(el) &&
-            (el.textContent || '').trim().toLowerCase() === 'vote' &&
-            (el.tagName.toLowerCase() !== 'a' || !(el.getAttribute('href') || '').trim() ||
-                (el.getAttribute('href') || '').trim().startsWith('#'))
-        );
-        const isDisabled = el => Boolean(
-            el.disabled || el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled')
-        );
-        const button = candidates.find(el => !isDisabled(el)) || candidates[0];
+        const candidates = voteControl.candidates();
+        // Inspect every candidate using the same rules as the pointer. Retain
+        // a fallback only to observe an unavailable control becoming ready.
+        const button = candidates.find(el => voteControl.enabled(el) && voteControl.position(el, true).ready) ||
+            candidates.find(voteControl.enabled) || candidates[0];
         if (!button) return {
             found: false, disabled: true, visible: false,
             target_kind: 'unknown', candidate_count: 0,
         };
-        const disabled = isDisabled(button);
+        const disabled = voteControl.disabled(button);
         button.setAttribute('data-auto-vote', '1');
         return {
             found: true, disabled, visible: true,
@@ -1903,9 +1890,9 @@ async def vote_for_bot(
 
     if "must be logged in" in text or "login to vote" in text:
         return {"bot_id": bot_id, "status": "auth_failed", "detail": "Not logged into top.gg"}
-    if page_indicates_cooldown(text):
-        print(f"  ⏳ Already voted for {bot_id} (cooldown)")
-        return cooldown_result(bot_id, text)
+    cooldown = await confirmed_cooldown(tab, bot_id, text)
+    if cooldown is not None:
+        return cooldown
     if "could not be found" in text or "404" in str(await evaluate(tab, "document.title")):
         return {"bot_id": bot_id, "status": "error", "detail": "Vote page 404"}
 
@@ -1950,8 +1937,9 @@ async def vote_for_bot(
             return {"bot_id": bot_id, "status": "error", "vote_submitted": False,
                     "detail": "Vote page changed while awaiting API readiness"}
         text = (await body_text(tab)).lower()
-        if page_indicates_cooldown(text):
-            return cooldown_result(bot_id, text)
+        cooldown = await confirmed_cooldown(tab, bot_id, text)
+        if cooldown is not None:
+            return cooldown
 
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     state = {}
@@ -1959,6 +1947,9 @@ async def vote_for_bot(
         state = await asyncio.wait_for(mark_vote_button(tab), timeout=max(0.001, deadline - asyncio.get_running_loop().time()))
         if state.get("found") and not state.get("disabled"):
             break
+        cooldown = await confirmed_cooldown(tab, bot_id, await body_text(tab))
+        if cooldown is not None:
+            return cooldown
         if await is_turnstile_present(tab):
             turnstile_cycles += 1
             if turnstile_cycles >= MAX_TURNSTILE_CYCLES_PER_PHASE:
@@ -1980,9 +1971,9 @@ async def vote_for_bot(
             await asyncio.sleep(2)
     else:
         text = (await body_text(tab)).lower()
-        if page_indicates_cooldown(text):
-            print(f"  ⏳ Already voted for {bot_id} (cooldown)")
-            return cooldown_result(bot_id, text)
+        cooldown = await confirmed_cooldown(tab, bot_id, text)
+        if cooldown is not None:
+            return cooldown
         if "must be logged in" in text or "login to vote" in text or "log in to vote" in text:
             return {"bot_id": bot_id, "status": "auth_failed", "detail": "Not logged into top.gg"}
         path = await error_screenshot(tab, f"screenshots/vote_{bot_id}_no_btn.png")
@@ -2047,27 +2038,55 @@ async def fresh_vote_document(tab: Any, bot_id: str, *, navigate: bool = False) 
 async def recover_prior_submission(tab: Any, bot_id: str, account_id: str) -> dict:
     print("  → Earlier Action sent possible Vote input; verifying before any new input")
     request_diagnostics.select_vote_bot(tab, bot_id)
-    if not await fresh_vote_document(tab, bot_id, navigate=True):
-        return {"bot_id": bot_id, "status": "uncertain", "vote_submitted": True,
-                "detail": "Earlier Vote input retained; new document could not be verified"}
-    await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
-    await settle_privacy_overlay(tab)
-    snapshot = await persisted_vote_confirmation(tab, bot_id)
-    if snapshot.get("confirmed") is True:
-        return successful_vote_result(bot_id)
-    # Two stable eligible observations on the freshly requested ordinary page
-    # establish that the old uncertain click did not leave a current vote.
-    eligible = (snapshot.get("observed") is True and snapshot.get("vote_enabled") is True
-                and not any(snapshot.get(key) for key in ("challenge", "login_required", "error_present")))
-    if eligible:
-        await asyncio.sleep(2)
-        second = await persisted_vote_confirmation(tab, bot_id)
-        network = request_diagnostics.vote_state(tab)
-        if (second.get("observed") is True and second.get("vote_enabled") is True
-                and not any(second.get(key) for key in ("challenge", "login_required", "error_present"))
-                and (network is None or not network.protection_pending())):
+    eligible_count, previous_evidence, challenge_cycles = 0, None, 0
+    can_resubmit = False
+    deadline = asyncio.get_running_loop().time() + RECOVERY_OBSERVE_TIMEOUT_SEC
+    try:
+        async with asyncio.timeout(RECOVERY_OBSERVE_TIMEOUT_SEC):
+            if not await fresh_vote_document(tab, bot_id, navigate=True):
+                return {"bot_id": bot_id, "status": "uncertain", "vote_submitted": True,
+                        "detail": "Earlier Vote input retained; new document could not be verified"}
+            await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
+            await settle_privacy_overlay(tab)
+            # Keep this independent document alive while its own prerequisites
+            # settle. Reopening it on each poll would restart the ad countdown.
+            while asyncio.get_running_loop().time() < deadline:
+                if await is_turnstile_present(tab):
+                    eligible_count, previous_evidence = 0, None
+                    challenge_cycles += 1
+                    if (challenge_cycles > MAX_TURNSTILE_CYCLES_PER_PHASE
+                            or not await solve_turnstile(tab)):
+                        break
+                    await settle_privacy_overlay(tab)
+                if await wait_for_ad(tab, bot_id):
+                    break
+                snapshot = await persisted_vote_confirmation(tab, bot_id)
+                evidence = snapshot.get("evidence") if snapshot.get("confirmed") is True else None
+                if evidence is not None and evidence == previous_evidence:
+                    text = await body_text(tab)
+                    if page_indicates_cooldown(text):
+                        return cooldown_result(bot_id, text)
+                    return successful_vote_result(bot_id)
+                previous_evidence = evidence
+                network = request_diagnostics.vote_state(tab)
+                eligible = (
+                    snapshot.get("observed") is True and snapshot.get("vote_enabled") is True
+                    and not any(snapshot.get(key) for key in ("challenge", "login_required", "error_present", "ad_pending"))
+                    and (network is None or not network.protection_pending())
+                )
+                eligible_count = eligible_count + 1 if eligible else 0
+                if eligible_count >= 2:
+                    can_resubmit = True
+                    break
+                await asyncio.sleep(2)
+    except TimeoutError:
+        print("  → Earlier Vote verification window expired; retaining pending handoff")
+    if can_resubmit:
+        if RECOVERY_JOURNAL is not None:
             RECOVERY_JOURNAL.clear_current()
-            return await vote_for_bot(tab, bot_id, account_id)
+        # The observation deadline must not cancel an ordinary submission or
+        # its confirmation after eligibility has been established.
+        return await vote_for_bot(tab, bot_id, account_id)
     return {"bot_id": bot_id, "status": "uncertain", "vote_submitted": True,
             "detail": "Earlier Vote input remains unconfirmed; verification only, no new input"}
 
