@@ -248,6 +248,9 @@ class HandoffAuditRegressions(unittest.IsolatedAsyncioTestCase):
             recovered = SubmissionJournal(path, ["secret-token"], ["111"])
             recovered.select("secret-token", "111")
             with patch("vote.RECOVERY_JOURNAL", recovered), patch("vote.fresh_vote_document", new=AsyncMock(return_value=True)), \
+                    patch("vote.RECOVERY_OBSERVE_TIMEOUT_SEC", 0.01), \
+                    patch("vote.is_turnstile_present", new=AsyncMock(return_value=False)), \
+                    patch("vote.wait_for_ad", new=AsyncMock(return_value=None)), \
                     patch("vote.asyncio.sleep", new=AsyncMock()), patch("vote.settle_privacy_overlay", new=AsyncMock()), \
                     patch("vote.persisted_vote_confirmation", new=AsyncMock(return_value={"observed": False})), \
                     patch("vote._click_marked", new=AsyncMock()) as click:

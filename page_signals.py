@@ -1,22 +1,14 @@
 """Shared DOM observations for challenge detection and vote confirmation."""
 
+from vote_controls import VOTE_CONTROL_JS
+
 # Only observe existing page state. Never create or return verification tokens.
-CHALLENGE_JS = r"""
+CHALLENGE_JS = VOTE_CONTROL_JS + r"""
 const challengeState = (() => {
     const body = (document.body?.innerText || '').toLowerCase();
     const title = (document.title || '').trim().toLowerCase();
-    const visible = node => {
-        if (!node || !(node.getClientRects().length || node.offsetWidth || node.offsetHeight)) return false;
-        for (let current = node; current; current = current.parentElement) {
-            const style = getComputedStyle(current);
-            if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) ||
-                Number(style.opacity) === 0) return false;
-        }
-        return true;
-    };
-    const vote = [...document.querySelectorAll('button, [role="button"]')].some(node =>
-        visible(node) && (node.textContent || '').trim().toLowerCase() === 'vote' &&
-        !node.disabled && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true');
+    const visible = voteControl.visible;
+    const vote = voteControl.candidates().some(voteControl.enabled);
     const surface = vote || body.includes('vote again in') || body.includes('already voted') ||
         body.includes('thanks for voting') || body.includes('you will be able to vote after this ad');
     const groups = [

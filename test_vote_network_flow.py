@@ -58,7 +58,8 @@ class VoteNetworkFlowTests(unittest.IsolatedAsyncioTestCase):
         if preflight:
             with patch("builtins.print"):
                 await self.response(url=ENDPOINT + "/status", method="GET")
-        snapshots = [BEFORE, ACK, ACK] if acknowledge else [BEFORE] * 5
+        snapshots = ([{**ACK, "evidence": "bounded cooldown"}] * 2 if cooldown else
+                     [BEFORE, ACK, ACK] if acknowledge else [BEFORE] * 5)
         with (
             patch("builtins.print"),
             patch("vote.asyncio.sleep", new=AsyncMock(side_effect=sleep)),

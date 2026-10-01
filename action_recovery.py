@@ -28,13 +28,20 @@ class GitHub:
             raise ValueError("Invalid repository")
         self.repository, self.token = repository, token
         self.opener = urllib.request.build_opener(NoRedirect)
+        self.deadline = None
+
+    def timeout(self):
+        remaining = 15 if self.deadline is None else self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Recovery read budget exhausted")
+        return min(15, remaining)
 
     def request(self, path, payload=None, limit=1024 * 1024):
         request = urllib.request.Request("https://api.github.com/repos/" + self.repository + path,
             data=json.dumps(payload).encode() if payload is not None else None,
             headers={"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
                      "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"})
-        with self.opener.open(request, timeout=15) as response:
+        with self.opener.open(request, timeout=self.timeout()) as response:
             content = response.read(limit + 1)
         if len(content) > limit:
             raise RuntimeError("GitHub response exceeds limit")
@@ -66,7 +73,7 @@ class GitHub:
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
             raise RuntimeError("Invalid artifact download redirect")
         # Signed storage URLs receive no GitHub credential and no further redirect.
-        with self.opener.open(urllib.request.Request(location), timeout=15) as response:
+        with self.opener.open(urllib.request.Request(location), timeout=self.timeout()) as response:
             archive = response.read(1024 * 1024 + 1)
         if len(archive) > 1024 * 1024:
             raise RuntimeError("Recovery artifact download exceeds limit")
@@ -76,23 +83,56 @@ class GitHub:
             return validate_state(json.loads(bundle.read("vote-recovery.json")))
 
 
-def restore(client, current_run, origin, path):
+def restore(client, current_run, origin, path, *, clock=time.monotonic, sleep=time.sleep, budget=120):
     if origin and not re.fullmatch(r"[0-9]+", origin):
         raise ValueError("Invalid recovery origin")
-    candidates = [int(origin)] if origin else []
-    candidates += sorted((run["id"] for run in client.runs()
-                          if type(run.get("id")) is int and run["id"] < current_run
-                          and run.get("status") == "completed"), reverse=True)[:30]
-    for run_id in sorted(set(candidates), reverse=True):
-        data = client.state(run_id)
-        if data is not None:
-            target = Path(path)
-            temporary = target.with_name(target.name + ".tmp")
-            temporary.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
-            temporary.replace(target)
-            print(f"Recovered vote handoff from run {run_id}")
-            return
-    print("No previous recovery artifact; starting with fresh state")
+    deadline = clock() + budget
+
+    def read(operation):
+        for attempt in range(5):
+            if clock() >= deadline:
+                raise TimeoutError("Recovery read budget exhausted")
+            try:
+                return operation()
+            except (OSError, TimeoutError, urllib.error.URLError) as exc:
+                # Retry reads, never dispatch POSTs or invalid/untrusted state.
+                if isinstance(exc, urllib.error.HTTPError) and not (exc.code == 429 or 500 <= exc.code < 600):
+                    raise
+                if attempt == 4:
+                    raise
+                delay = 2 ** attempt
+                if isinstance(exc, urllib.error.HTTPError):
+                    retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+                    if retry_after.isdigit():
+                        delay = max(delay, int(retry_after))
+                if delay >= deadline - clock():
+                    raise TimeoutError("Recovery read budget exhausted") from exc
+                print(f"Recovery read temporarily unavailable ({type(exc).__name__}); retry {attempt + 2}/5")
+                sleep(delay)
+
+    previous_deadline = client.deadline if isinstance(client, GitHub) else None
+    if isinstance(client, GitHub):
+        client.deadline = time.monotonic() + budget
+    try:
+        candidates = [int(origin)] if origin else []
+        candidates += sorted((run["id"] for run in read(client.runs)
+                              if type(run.get("id")) is int and run["id"] < current_run
+                              and run.get("status") == "completed"), reverse=True)[:30]
+        for run_id in sorted(set(candidates), reverse=True):
+            data = read(lambda: client.state(run_id))
+            if data is not None:
+                data = validate_state(data)
+                target = Path(path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + ".tmp")
+                temporary.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+                temporary.replace(target)
+                print(f"Recovered vote handoff from run {run_id}")
+                return
+        print("No previous recovery artifact; starting with fresh state")
+    finally:
+        if isinstance(client, GitHub):
+            client.deadline = previous_deadline
 
 
 def dispatch_retry(client, origin, *, clock=time.monotonic, sleep=time.sleep, budget=210):
