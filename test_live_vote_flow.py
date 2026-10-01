@@ -18,6 +18,7 @@ import nodriver as uc
 
 import request_diagnostics
 import vote
+import cloudflare_click
 
 
 CHROME = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
@@ -42,6 +43,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.mutation_error = False
         self.solved_widget = False
         self.audit_error = False
+        self.cloud_widget = False
         self.fixture_errors = []
         try:
             try:
@@ -67,6 +69,10 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         mutation = json.dumps({"query": 'mutation Cast { ' + self.mutation_field + '(botId:"111") { ok } }'})
         widget = ('<div class="cf-turnstile">Verification complete</div>'
                   '<input type="hidden" name="cf-turnstile-response" value="PRIVATE_FIXTURE_RESPONSE">') if self.solved_widget else ""
+        frame = ('<iframe src="https://challenges.cloudflare.com/local-fixture" '
+                 'style="position:absolute;left:40px;top:30px;width:400px;height:280px;border:0"></iframe>'
+                 '<script>window.widgetClick=null;addEventListener("message",e=>{'
+                 'if(e.origin==="https://challenges.cloudflare.com") widgetClick=e.data;});</script>') if self.cloud_widget else ""
         return """<!doctype html><title>Voting fixture</title>
             <style>button { margin:100px;width:180px;height:50px }</style>
             <section id="surface"><button id="vote">Vote</button></section>
@@ -84,8 +90,9 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                 if (__AUDIT__) await post({query:'mutation Audit { auditBotVote(botId:"111") { ok } }'});
                 surface.innerHTML='Thanks for voting!'+__WIDGET__;
             });
-            </script>""".replace("__READ__", json.dumps(read)).replace("__QUERY__", query).replace(
-                "__MUTATION__", mutation).replace("__WIDGET__", json.dumps(widget)).replace("__AUDIT__", json.dumps(self.audit_error))
+            </script>__FRAME__""".replace("__READ__", json.dumps(read)).replace("__QUERY__", query).replace(
+                "__MUTATION__", mutation).replace("__WIDGET__", json.dumps(widget)).replace(
+                    "__AUDIT__", json.dumps(self.audit_error)).replace("__FRAME__", frame)
 
     async def fulfill(self, event):
         try:
@@ -94,6 +101,13 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
             if url == PAGE:
                 self.documents += 1
                 status, headers, body = 200, {"content-type": "text/html"}, self.html()
+            elif url == "https://challenges.cloudflare.com/local-fixture":
+                status, headers = 200, {"content-type":"text/html"}
+                body = '''<!doctype html><div id="host"></div><script>
+                    const root=host.attachShadow({mode:'closed'});
+                    root.innerHTML='<label style="display:block;margin:60px"><input type="checkbox" style="width:30px;height:30px">Verify</label>';
+                    root.querySelector('input').addEventListener('click',e=>parent.postMessage({trusted:e.isTrusted},'https://top.gg'));
+                </script>'''
             elif url == "https://top.gg/api/graphql":
                 raw = event.request.post_data or ""
                 if "query State" in raw:
@@ -173,10 +187,10 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cookie_navigation_preserves_the_session_owning_network_observers(self):
         session_id = self.tab.session_id
-        result = await vote.login_with_cookies(self.tab, [{
+        result = await vote.login_with_cookies(self.tab, [vote._normalize_cookie({
             "name":"authjs.session-token", "value":"LOCAL_FIXTURE_COOKIE",
             "domain":".top.gg", "path":"/", "secure":True,
-        }], ["111"])
+        })], ["111"])
         self.assertEqual(result, vote.AUTHENTICATED)
         self.assertEqual(self.tab.session_id, session_id)
         await self.wait(lambda: any(x["vote_network"]["response_outcome"] == "usable"
@@ -189,6 +203,24 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(self.documents, 1)
         self.assertEqual(self.mutations, 1)
+
+    async def test_cross_origin_closed_shadow_control_is_reachable_without_image_matching(self):
+        from unittest.mock import AsyncMock
+        self.cloud_widget = True
+        await self.load()
+        for _ in range(100):
+            if (await cloudflare_click.widget_state(self.tab))["present"]:
+                break
+            await asyncio.sleep(0.05)
+        with patch.object(cloudflare_click, "match_checkbox", side_effect=AssertionError("semantic target required")):
+            result = await cloudflare_click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
+        self.assertEqual(result, "sent")
+        for _ in range(100):
+            value = await vote.evaluate(self.tab, "window.widgetClick")
+            if value:
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(value, {"trusted":True})
 
     async def test_a_new_document_does_not_inherit_an_old_api_denial(self):
         self.block_reads, self.omit_reloaded_read = "first", True
