@@ -239,8 +239,11 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
             journal.before_press()
             recovered = SubmissionJournal(path, ["local-token"], ["111"])
             self.session.authenticated = True
+            # Retain the local authenticated fixture for event assertions after
+            # the account call; navigation, network, journal, and input stay real.
             with (patch("vote.RECOVERY_JOURNAL", recovered),
-                  patch("vote.topgg_auth_state", new=AsyncMock(return_value=vote.AUTHENTICATED))):
+                  patch("vote.topgg_auth_state", new=AsyncMock(return_value=vote.AUTHENTICATED)),
+                  patch.object(self.session, "reusable", new=AsyncMock(return_value=True))):
                 result = (await asyncio.wait_for(vote._run_account(
                     "local-token", ["111"], "fixture", session=self.session), 45))[0]
             self.assertEqual(recovered.records[recovered.active_key]["kind"], "complete")
