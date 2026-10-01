@@ -1,0 +1,49 @@
+"""Shared DOM observations for challenge detection and vote confirmation."""
+
+# Only observe existing page state. Never create or return verification tokens.
+CHALLENGE_JS = r"""
+const challengeState = (() => {
+    const body = (document.body?.innerText || '').toLowerCase();
+    const title = (document.title || '').trim().toLowerCase();
+    const visible = node => {
+        if (!node || !(node.getClientRects().length || node.offsetWidth || node.offsetHeight)) return false;
+        for (let current = node; current; current = current.parentElement) {
+            const style = getComputedStyle(current);
+            if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) ||
+                Number(style.opacity) === 0) return false;
+        }
+        return true;
+    };
+    const vote = [...document.querySelectorAll('button, [role="button"]')].some(node =>
+        visible(node) && (node.textContent || '').trim().toLowerCase() === 'vote' &&
+        !node.disabled && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true');
+    const surface = vote || body.includes('vote again in') || body.includes('already voted') ||
+        body.includes('thanks for voting') || body.includes('you will be able to vote after this ad');
+    const groups = [
+        ['iframe[src*="challenges.cloudflare.com"], .cf-turnstile',
+         'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="cf_challenge_response"]'],
+        ['iframe[src*="hcaptcha.com"], .h-captcha',
+         'input[name="h-captcha-response"], textarea[name="h-captcha-response"]'],
+        ['iframe[src*="recaptcha"], .g-recaptcha',
+         'input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]']
+    ];
+    let solved = false, activeWidget = false;
+    for (const [selector, fields] of groups) {
+        const widgets = [...document.querySelectorAll(selector)].filter(visible);
+        // A wrapper and its iframe describe one widget, not two controls.
+        const roots = widgets.filter(node => !widgets.some(other => other !== node && other.contains?.(node)));
+        const responses = [...document.querySelectorAll(fields)].filter(field => field.value?.length > 10).length;
+        const completed = roots.filter(node => node.dataset?.response?.length > 10).length;
+        solved ||= responses > 0 || completed > 0;
+        activeWidget ||= roots.length > Math.max(responses, completed);
+    }
+    const gate = [...document.querySelectorAll('#challenge-running, #challenge-stage, #challenge-form')].some(visible);
+    const hard = title.startsWith('attention required');
+    const managed = (typeof providerMarked !== 'undefined' && providerMarked) || title.startsWith('just a moment') ||
+        body.includes('performing security verification') || body.includes('needs to review the security of your connection');
+    const human = ['verify you are human', 'complete the captcha', 'please solve the captcha to continue',
+        'let us know you are human'].some(marker => body.includes(marker));
+    return {present: gate || (managed && !surface) || activeWidget || (human && !solved),
+            solved: solved && !activeWidget && !gate, managed: gate || ((managed || hard) && !surface), visible};
+})();
+"""

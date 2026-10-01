@@ -1,4 +1,6 @@
 import io
+import hashlib
+from pathlib import Path
 import json
 import os
 import time
@@ -105,29 +107,6 @@ def latest_vote_run(minimum_run_id=None):
         if latest.get("id") != minimum_run_id:
             raise RuntimeError("GitHub returned an unexpected workflow run")
     return latest
-
-
-def latest_prior_success_schedule(run_id, now=None):
-    """Preserve a still-future confirmed schedule after a newer failed run.
-
-    A failed early workflow can produce a short retry artifact, but it must
-    not override a future schedule from the most recent successful run.
-    """
-    now = time.time() if now is None else now
-    successful = [
-        run for run in list_vote_runs(100)
-        if type(run.get("id")) is int
-        and run["id"] < run_id
-        and run.get("status") == "completed"
-        and run.get("conclusion") == "success"
-    ]
-    if not successful:
-        return None
-    newest_success = max(successful, key=lambda run: run["id"])
-    scheduled = next_vote_at_from_run(newest_success["id"])
-    if scheduled is not None and scheduled > now:
-        return newest_success["id"], scheduled
-    return None
 
 
 def get_run(run_id):
@@ -410,17 +389,9 @@ def resolve_schedule(minimum_run_id=None):
 
 def schedule_from_completed_run(run):
     next_at = next_vote_at_from_run(int(run["id"]))
-    if run.get("conclusion") not in {None, "success"}:
-        guarded = latest_prior_success_schedule(int(run["id"]))
-        if guarded is not None and (next_at is None or guarded[1] > next_at):
-            log(
-                f"Retaining future schedule from successful run "
-                f"{guarded[0]}; failed run {run['id']} cannot "
-                f"bring the next dispatch forward"
-            )
-            # This decision has observed the newer failed run. Retain its ID
-            # so subsequent stale lists cannot undo the successful-run guard.
-            return int(run["id"]), guarded[1]
+    # Each account/bot now carries its own confirmed/pending handoff into the
+    # next Action. A prior run's global timestamp may belong to another target
+    # configuration and must not suppress this run's retry schedule.
     if next_at is None:
         return None
     return int(run["id"]), next_at
@@ -497,6 +468,8 @@ def wait_until(epoch, source_run_id=None):
 
 
 def main():
+    log("Scheduler build: " + os.environ.get("BUILD_REVISION", "unknown") +
+        "; source SHA256: " + hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     log(
         f"Scheduler started for "
         f"{GH_REPOSITORY}/{GH_WORKFLOW} "

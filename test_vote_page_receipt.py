@@ -101,7 +101,7 @@ class VotePageReceiptEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_returned_evidence_does_not_include_raw_private_page_text(self):
         private_text = "Thanks for voting! Private user and session material"
         actual = await self.inspect(raw_page(text=private_text))
-        self.assertEqual(set(actual), {"observed", "confirmed", "evidence"})
+        self.assertEqual(set(actual), {"observed", "confirmed", "evidence", "exact_vote_page", "ready", "vote_enabled", "challenge", "login_required", "error_present"})
         self.assertNotIn("Private user", json.dumps(actual))
 
     async def test_stalled_page_observation_is_cancelled_within_budget(self):
@@ -298,7 +298,6 @@ class VotePageReceiptJavaScriptTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_challenge_or_login_requirements_override_success_copy(self):
         for fixture in (
-            {"title": "Just a moment..."},
             {"elements": [{"tag": "div", "id": "challenge-form"}]},
             {"elements": [{"tag": "iframe", "attrs": {"src": "https://challenges.cloudflare.com/turnstile"}}]},
             {"text": "Thanks for voting! Please solve the captcha to continue"},

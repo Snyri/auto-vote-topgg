@@ -8,6 +8,7 @@ permissions: {}
 concurrency:
   group: topgg-vote
   cancel-in-progress: false
+  queue: max
 
 jobs:
   inspect:
