@@ -310,26 +310,29 @@ ARM_FUNCTION = """function () {
     const el = hit?.matches('input[type="checkbox"], [role="checkbox"]') ? hit :
         hit?.closest('label')?.control || hit?.closest('[role="checkbox"]');
     if (!el?.matches('input[type="checkbox"], [role="checkbox"]') || !el.isConnected) return false;
-    const win = el.ownerDocument.defaultView;
+    // Outside a closed shadow root, composedPath() hides its internal control.
+    // Observe inside the same root rather than reporting a real click as absent.
+    const scope = el.getRootNode();
+    const labels = [...(el.labels || [])].filter(label => label.control === el);
     const receipt = {pressed: false, released: false, clicked: false};
     const listeners = ['pointerdown', 'pointerup', 'click'].map(type => {
         const handler = event => {
             const path = event.composedPath();
-            if (event.isTrusted && (path.includes(el) || path.includes(el.closest('label')))) {
+            if (event.isTrusted && (path.includes(el) || labels.some(label => path.includes(label)))) {
                 receipt[{pointerdown: 'pressed', pointerup: 'released', click: 'clicked'}[type]] = true;
             }
         };
-        win.addEventListener(type, handler, true);
+        scope.addEventListener(type, handler, true);
         return [type, handler];
     });
-    this.__autoCfReceipt = {win, receipt, listeners};
+    this.__autoCfReceipt = {scope, receipt, listeners};
     return true;
 }"""
 
 READ_FUNCTION = """function () { return this.__autoCfReceipt?.receipt || null; }"""
 CLEAN_FUNCTION = """function () {
     const state = this.__autoCfReceipt;
-    for (const [type, handler] of state?.listeners || []) state.win.removeEventListener(type, handler, true);
+    for (const [type, handler] of state?.listeners || []) state.scope.removeEventListener(type, handler, true);
     delete this.__autoCfReceipt;
 }"""
 

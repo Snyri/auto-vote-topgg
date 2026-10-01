@@ -44,6 +44,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.solved_widget = False
         self.audit_error = False
         self.cloud_widget = False
+        self.provider_documents = 0
         self.fixture_errors = []
         try:
             try:
@@ -102,11 +103,13 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.documents += 1
                 status, headers, body = 200, {"content-type": "text/html"}, self.html()
             elif url == "https://challenges.cloudflare.com/local-fixture":
+                self.provider_documents += 1
                 status, headers = 200, {"content-type":"text/html"}
                 body = '''<!doctype html><div id="host"></div><script>
                     const root=host.attachShadow({mode:'closed'});
                     root.innerHTML='<label style="display:block;margin:60px"><input type="checkbox" style="width:30px;height:30px">Verify</label>';
                     root.querySelector('input').addEventListener('click',e=>parent.postMessage({trusted:e.isTrusted},'https://top.gg'));
+                    parent.postMessage({ready:true},'https://top.gg');
                 </script>'''
             elif url == "https://top.gg/api/graphql":
                 raw = event.request.post_data or ""
@@ -209,9 +212,44 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.cloud_widget = True
         await self.load()
         for _ in range(100):
+            if await vote.evaluate(self.tab, "window.widgetClick?.ready === true"):
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(self.provider_documents, 1, "Provider document must be fulfilled locally")
+        self.assertTrue(await vote.evaluate(self.tab, "window.widgetClick?.ready === true"),
+                        "Cross-origin fixture must finish loading before input")
+        for _ in range(100):
             if (await cloudflare_click.widget_state(self.tab))["present"]:
                 break
             await asyncio.sleep(0.05)
+        # Fixture-only diagnostics distinguish a missing child document from a
+        # coordinate/hit-test failure. These contain no real-site state.
+        document = await self.tab.send(uc.cdp.dom.get_document(depth=-1, pierce=True))
+        pending, nodes, candidates = [document], [], []
+        while pending:
+            node = pending.pop()
+            if node.node_name in {"IFRAME", "INPUT", "#document"}:
+                nodes.append({"name":node.node_name, "frame":str(node.frame_id),
+                              "backend":int(node.backend_node_id),
+                              "document":bool(node.content_document)})
+            if node.node_name == "INPUT":
+                candidates.append(node.backend_node_id)
+            pending.extend((node.children or []) + (node.shadow_roots or []))
+            if node.content_document:
+                pending.append(node.content_document)
+        print("Local cross-origin DOM:", json.dumps(nodes))
+        for backend in candidates:
+            try:
+                box = await self.tab.send(uc.cdp.dom.get_box_model(backend_node_id=backend))
+                x, y = sum(box.border[::2])/4, sum(box.border[1::2])/4
+                print("Local cross-origin hit:", json.dumps({"border":box.border,
+                    "hit":await cloudflare_click._hit_target(self.tab,x,y)}))
+            except Exception as exc:
+                print("Local cross-origin observation error:", type(exc).__name__)
+        print("Local cross-origin targets:", [(x.type_, x.url) for x in await self.tab.send(uc.cdp.target.get_targets())])
+        viewport = await vote.evaluate(self.tab, "({width:innerWidth,height:innerHeight})")
+        print("Local cross-origin semantic:", await cloudflare_click.semantic_checkbox_target(
+            self.tab, viewport["width"], viewport["height"]))
         with patch.object(cloudflare_click, "match_checkbox", side_effect=AssertionError("semantic target required")):
             result = await cloudflare_click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
         self.assertEqual(result, "sent")

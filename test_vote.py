@@ -430,7 +430,9 @@ class CooldownVotePageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "cooldown")
         self.assertIsInstance(result.get("retry_at"), int)
-        tab.get.assert_awaited_once_with("https://top.gg/bot/111/vote")
+        navigations = [next(call.args[0]) for call in tab.send.await_args_list]
+        self.assertEqual([command["params"]["url"] for command in navigations
+                          if command["method"] == "Page.navigate"], ["https://top.gg/bot/111/vote"])
 
 
 class PreVoteProtectionTests(unittest.IsolatedAsyncioTestCase):
@@ -1199,7 +1201,8 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         result = await vote.login_with_cookies(tab, [{"name": "authjs"}], ["111"])
 
         self.assertEqual(result, vote.AUTHENTICATED)
-        tab.get.assert_awaited_once_with("https://top.gg/bot/111/vote")
+        command = next(tab.send.await_args_list[0].args[0])
+        self.assertEqual(command, {"method":"Page.navigate", "params":{"url":"https://top.gg/bot/111/vote"}})
         tab.reload.assert_not_awaited()
         self.assertTrue(any(call.args == (6,) for call in sleep.await_args_list))
 
@@ -1253,7 +1256,8 @@ class AuthenticationStateTests(unittest.IsolatedAsyncioTestCase):
         result = await vote.discord_oauth_login(tab, "token", ["111"])
 
         self.assertEqual(result, vote.AUTHENTICATED)
-        destinations = [call.args[0] for call in tab.get.await_args_list]
+        commands = [next(call.args[0]) for call in tab.send.await_args_list]
+        destinations = [command["params"]["url"] for command in commands if command["method"] == "Page.navigate"]
         self.assertEqual(destinations[0], "https://top.gg/bot/111/vote")
         self.assertIn(vote.DISCORD_LOGIN_URL, destinations)
         self.assertEqual(destinations[-1], "https://top.gg/bot/111/vote")

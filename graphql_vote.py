@@ -182,6 +182,8 @@ class Document:
         for field, key, _, nested in children:
             if field in STATE_FIELDS:
                 return True
+            if nested and self.state_fields(nested, visited):
+                return True
             if field == "..." and key not in visited and key in self.fragments:
                 if self.state_fields(self.fragments[key], visited | {key}):
                     return True
@@ -226,39 +228,53 @@ def _target(args, bot_id):
 
 def inspect_request(raw, bot_id):
     result = {"operation": "unrelated", "graphql_kind": "unknown", "graphql_target": "unknown",
-              "graphql_shape": "unknown", "entity_key": None, "response_key": None}
+              "graphql_shape": "unknown", "graphql_gate": "payload_missing", "entity_key": None, "response_key": None}
     if not isinstance(raw, str) or len(raw) > MAX_PAYLOAD:
+        if isinstance(raw, str):
+            result["graphql_gate"] = "payload_too_large"
         return result
     try:
+        result["graphql_gate"] = "payload_invalid"
         data = json.loads(raw)
         if isinstance(data, list):
             if len(data) != 1:
                 result["graphql_shape"] = "batch"
+                result["graphql_gate"] = "mixed_batch"
                 return result
             data = data[0]
         if not isinstance(data, dict) or not isinstance(data.get("query"), str):
+            result["graphql_gate"] = "document_missing"
             return result
         variables = data.get("variables") or {}
         if not isinstance(variables, dict):
             return result
+        result["graphql_gate"] = "unsupported_document"
         document = Document(data["query"], variables.copy())
         kind, name, fields = document.operation()
         result.update(graphql_kind=kind, graphql_shape="single" if len(fields) == 1 else "mixed")
         if data.get("operationName") is not None and data["operationName"] != name:
+            result["graphql_gate"] = "operation_mismatch"
             return result
         if len(fields) != 1:
+            result["graphql_gate"] = "mixed_operation"
             return result
         field, response_key, args, children = fields[0]
+        # A bounded single-operation response can expose application errors even
+        # when the live schema uses a root name outside the semantic allowlist.
+        # That does not identify a vote or permit resubmission.
+        result["response_key"] = hashlib.sha256(response_key.encode()).hexdigest()
+        scope, entity_key = _target(args, bot_id)
+        result["graphql_target"] = scope
         state_field = field in STATE_FIELDS or (
             field in {"bot", "entity"} and document.state_fields(children))
         if (kind == "mutation" and field not in VOTE_FIELDS) or (kind == "query" and not state_field):
+            result["graphql_gate"] = "unrecognized_field"
             return result
-        scope, entity_key = _target(args, bot_id)
-        result["graphql_target"] = scope
         if scope not in {"matching_bot", "page_entity"}:
+            result["graphql_gate"] = "other_bot" if scope == "other_bot" else "target_unresolved"
             return result
         result.update(operation="vote_submission" if kind == "mutation" else "vote_state",
-                      entity_key=entity_key, response_key=hashlib.sha256(response_key.encode()).hexdigest())
+                      entity_key=entity_key, graphql_gate="recognized")
         return result
     except (ValueError, TypeError, RecursionError, IndexError):
         return result

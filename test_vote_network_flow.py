@@ -106,7 +106,7 @@ class VoteNetworkFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertFalse(result["vote_submitted"])
         clicked.assert_not_awaited()
-        self.tab.reload.assert_not_awaited()
+        self.tab.reload.assert_awaited_once()
 
     async def test_fresh_vote_state_allows_input_after_preflight(self):
         result, clicked, _ = await self.exercise((200,), acknowledge=True, preflight=True, clear=True)
@@ -123,7 +123,8 @@ class VoteNetworkFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertFalse(result["vote_submitted"])
         self.assertNotIn("submission_rejected", result)
-        clicked.assert_awaited_once()
+        self.assertEqual(clicked.await_count, 2)
+        self.tab.reload.assert_awaited_once()
         persisted.assert_not_awaited()
         self.assertTrue(vote.should_request_protection_retry([[result]]))
 

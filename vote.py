@@ -505,6 +505,14 @@ async def vote_page_confirmation(tab: Any, bot_id: str) -> dict:
             'iframe[src*="challenges.cloudflare.com"]', 'iframe[src*="hcaptcha.com"]',
             'iframe[src*="recaptcha"]', '.cf-turnstile', '.h-captcha', '.g-recaptcha'
         ].join(','))];
+        const responseFields = [...document.querySelectorAll([
+            'input[name="cf-turnstile-response"]', 'textarea[name="cf-turnstile-response"]',
+            'input[name="cf_challenge_response"]', 'input[name="g-recaptcha-response"]',
+            'textarea[name="g-recaptcha-response"]', 'input[name="h-captcha-response"]',
+            'textarea[name="h-captcha-response"]'
+        ].join(','))];
+        const solvedWidget = responseFields.some(field => field.value && field.value.length > 10) ||
+            widgets.some(widget => widget.dataset?.response?.length > 10);
         return {
             text: text.slice(0, 250000),
             exact_vote_page: location.protocol === 'https:' &&
@@ -520,7 +528,7 @@ async def vote_page_confirmation(tab: Any, bot_id: str) -> dict:
                 body.includes('needs to review the security of your connection') ||
                 body.includes('verify you are human') || body.includes('complete the captcha') ||
                 body.includes('please solve the captcha to continue') ||
-                widgets.some(visible) || gates.some(visible),
+                (widgets.some(visible) && !solvedWidget) || gates.some(visible),
             login_required: body.includes('must be logged in') ||
                 body.includes('login to vote') || body.includes('log in to vote'),
             error_present: body.includes('failed to vote') || body.includes('vote failed') ||
@@ -857,6 +865,17 @@ async def body_text(tab: Any) -> str:
 
 async def current_url(tab: Any) -> str:
     return str(await evaluate(tab, "location.href") or "")
+
+
+async def navigate_page(tab: Any, url: str) -> None:
+    """Keep the CDP session that owns Network/Page observers during navigation.
+
+    nodriver 0.50.3 Tab.get() calls attach() again after navigation; the new
+    session does not own responses observed by the previous Network.enable.
+    """
+    result = await tab.send(uc.cdp.page.navigate(url))
+    if isinstance(result, (tuple, list)) and len(result) > 2 and result[2]:
+        raise RuntimeError("Page navigation failed")
 
 
 def is_topgg_vote_url(url: str, bot_id: str) -> bool:
@@ -1482,7 +1501,7 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
     await inject_topgg_cookies(tab.browser, cookies)
 
     vote_url = f"https://top.gg/bot/{bot_ids[0]}/vote"
-    await tab.get(vote_url)
+    await navigate_page(tab, vote_url)
     await asyncio.sleep(3)
 
     retry_delays = (0, 6)
@@ -1542,7 +1561,7 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
     print("  → Preparing Discord session for top.gg login...")
     vote_url = f"https://top.gg/bot/{bot_ids[0]}/vote"
 
-    await tab.get(vote_url)
+    await navigate_page(tab, vote_url)
     await asyncio.sleep(2)
     await settle_privacy_overlay(tab)
     state = await topgg_auth_state(tab)
@@ -1553,7 +1572,7 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
         return state
 
     print("  → Establishing Discord browser session...")
-    await tab.get(DISCORD_LOGIN_URL)
+    await navigate_page(tab, DISCORD_LOGIN_URL)
     await asyncio.sleep(2)
     if not url_has_domain(await current_url(tab), "discord.com"):
         print("  ❌ Discord login page did not open")
@@ -1568,7 +1587,7 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
     await asyncio.sleep(3)
 
     print("  → Navigating to top.gg to initiate OAuth...")
-    await tab.get(vote_url)
+    await navigate_page(tab, vote_url)
     await asyncio.sleep(3)
     await settle_privacy_overlay(tab)
     state = await topgg_auth_state(tab)
@@ -1953,15 +1972,31 @@ def vote_api_blocked_result(bot_id: str) -> dict:
             "detail": "Vote API protection remained active before mouse input"}
 
 
-async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> dict:
+async def vote_for_bot(
+    tab: Any, bot_id: str, account_id: str = "unknown", *, allow_api_recovery: bool = True,
+) -> dict:
     request_diagnostics.select_vote_bot(tab, bot_id)
     request_diagnostics.set_phase(tab, "vote_page")
     print(f"  → Voting for bot {bot_id}...")
     vote_url = f"https://top.gg/bot/{bot_id}/vote"
+
+    async def blocked_before_input():
+        network = request_diagnostics.vote_state(tab)
+        if (allow_api_recovery and network is not None and not network.armed
+                and is_topgg_vote_url(await current_url(tab), bot_id)):
+            # A passive latch cannot recover if the app never repeats its read.
+            # Reopen the ordinary page once, before any input, so its prerequisites
+            # can run again. A committed document gets its own network context.
+            print("  → Vote API preflight blocked; reopening the vote page once before input")
+            await tab.reload()
+            await asyncio.sleep(3)
+            return await vote_for_bot(tab, bot_id, account_id, allow_api_recovery=False)
+        return vote_api_blocked_result(bot_id)
+
     if is_topgg_vote_url(await current_url(tab), bot_id):
         print("  → Reusing current top.gg vote page to preserve verified browser state")
     else:
-        await tab.get(vote_url)
+        await navigate_page(tab, vote_url)
         await asyncio.sleep(3)
     await settle_privacy_overlay(tab)
     text = (await body_text(tab)).lower()
@@ -2015,7 +2050,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
     try:
         waited_for_api = await _wait_for_vote_api(tab)
     except VoteAPIBlocked:
-        return vote_api_blocked_result(bot_id)
+        return await blocked_before_input()
     if waited_for_api:
         # Waiting can reveal an already registered vote or change page state.
         if not is_topgg_vote_url(await current_url(tab), bot_id):
@@ -2075,7 +2110,7 @@ async def vote_for_bot(tab: Any, bot_id: str, account_id: str = "unknown") -> di
             }
         result = await verify_submitted_vote(tab, bot_id, account_id, before_click)
     except VoteAPIBlocked:
-        return vote_api_blocked_result(bot_id)
+        return await blocked_before_input()
     except VoteClickNotReady as exc:
         print(f"  ⚠️ Vote control not actionable; no mouse press sent ({exc})")
         return {
@@ -2112,7 +2147,7 @@ async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_c
         return rejected_vote_result(bot_id)
 
     outcome = network.submission_outcome() if network is not None else None
-    application_error = outcome in {"captcha_required", "unauthenticated", "error", "invalid"}
+    application_error = outcome in {"captcha_required", "unauthenticated", "error", "invalid", "protection_rejected"}
     if application_error:
         print(f"  ⚠️ GraphQL vote response reported {outcome}; a 200 is not vote confirmation")
     if not application_error and await confirm_vote_without_reload(tab, bot_id, before_click):
@@ -2142,7 +2177,7 @@ async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_c
         await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 
         outcome = network.submission_outcome() if network is not None else None
-        if outcome not in {"captcha_required", "unauthenticated", "error", "invalid"} and await confirm_vote_without_reload(tab, bot_id, before_click):
+        if outcome not in {"captcha_required", "unauthenticated", "error", "invalid", "protection_rejected"} and await confirm_vote_without_reload(tab, bot_id, before_click):
             result = successful_vote_result(bot_id)
             result["detail"] = "Vote acknowledged on page after verification"
             return result
