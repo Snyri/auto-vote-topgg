@@ -264,9 +264,14 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.block_reads, self.omit_reloaded_read = "first", True
         await self.load()
         self.assertTrue(self.tracker.vote_network.protection_pending())
-        await self.tab.reload()
-        await asyncio.sleep(0.25)
-        self.assertTrue(await vote._click_marked(self.tab, "data-auto-vote"))
+        # Use the production reload/settle/input path, rather than calling its
+        # lowest input primitive 250ms after a fresh visible-Chrome navigation.
+        # The reopened page deliberately omits its state query: only the new
+        # committed document can release the old denial, not a healthy read.
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.documents, 2)
+        self.assertEqual(self.mutations, 1)
         self.assertEqual(await vote.evaluate(self.tab, "window.nativeClicks"), 1)
 
     async def test_preflight_has_one_real_recovery_before_giving_up(self):
