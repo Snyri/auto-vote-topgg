@@ -1615,7 +1615,7 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch.object(vote, "BROWSER_START_RETRIES", 1)
     @patch("vote.uc.Browser")
-    @patch("vote.uc.Config")
+    @patch("vote.browser_environment.ChromeConfig")
     async def test_partial_start_failure_is_cleaned(
         self, config_class, browser_class, _sleep
     ):
@@ -1731,7 +1731,7 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.recover_slow_browser_start", new_callable=AsyncMock, return_value=True)
     @patch.object(vote, "BROWSER_START_RETRIES", 1)
     @patch("vote.uc.Browser")
-    @patch("vote.uc.Config")
+    @patch("vote.browser_environment.ChromeConfig")
     async def test_start_browser_keeps_process_when_late_attach_recovers(
         self, _config, browser_class, recover, _print
     ):

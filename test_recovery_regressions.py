@@ -98,7 +98,8 @@ class ConfirmationAuditRegressions(unittest.IsolatedAsyncioTestCase):
                 patch("vote.RECOVERY_JOURNAL", None):
             with self.assertRaisesRegex(vote.VoteClickNotReady, "disabled"):
                 await vote._click_vote_control(tab)
-        tab.send.assert_not_awaited()
+        commands = [next(call.args[0])["method"] for call in tab.send.await_args_list]
+        self.assertEqual(commands, ["Page.bringToFront"])
 
     async def verify(self, state, *, late_error=False, persisted=False):
         tab = AsyncMock()

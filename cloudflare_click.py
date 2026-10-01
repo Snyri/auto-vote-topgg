@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 from nodriver import cdp
 from nodriver.core.util import get_cf_template
 from nodriver.core.connection import Connection
+import browser_environment
+import native_mouse
 
 
 MATCH_THRESHOLD = 0.85
@@ -479,16 +481,7 @@ async def _send_checkbox_input(tab, observer, target) -> None:
             with suppress(Exception):
                 remote = await _send(observer, cdp.dom.resolve_node(backend_node_id=target["backend"]))
                 observable = await _on_node(observer, remote.object_id, ARM_FUNCTION) is True
-        try:
-            await _send(tab, cdp.input_.dispatch_mouse_event(
-                "mousePressed", x=target["x"], y=target["y"],
-                button=cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,
-            ))
-        finally:
-            await _send(tab, cdp.input_.dispatch_mouse_event(
-                "mouseReleased", x=target["x"], y=target["y"],
-                button=cdp.input_.MouseButton.LEFT, buttons=0, click_count=1,
-            ))
+        await native_mouse.press_and_release(tab, target["x"], target["y"])
         if observable:
             with suppress(Exception):
                 receipt = await _on_node(observer, remote.object_id, READ_FUNCTION)
@@ -512,9 +505,13 @@ async def _click_cloudflare_checkbox_impl(tab, evaluate, cleared) -> str:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + TARGET_WAIT_SEC
     previous, stable_since, last_reason = None, None, None
+    activated = False
     while loop.time() < deadline:
         if await cleared():
             return "cleared"
+        if not activated:
+            await browser_environment.foreground(tab)
+            activated = True
         try:
             target = await checkbox_target(tab, evaluate)
         except Exception:

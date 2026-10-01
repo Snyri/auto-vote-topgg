@@ -22,6 +22,8 @@ import requests
 import cloudflare_click
 import request_diagnostics
 import ui_click
+import browser_environment
+import native_mouse
 from page_signals import CHALLENGE_JS
 from vote_controls import VOTE_CONTROL_JS
 from recovery_state import SubmissionJournal
@@ -972,6 +974,7 @@ async def _click_vote_control(tab: Any) -> bool:
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     try:
         async with asyncio.timeout(TIMEOUT_VOTE_SEC):
+            await browser_environment.foreground(tab)
             while asyncio.get_running_loop().time() < deadline:
                 await _wait_for_vote_api(tab)
                 await dismiss_privacy_overlay(tab)
@@ -1015,16 +1018,7 @@ async def _click_vote_control(tab: Any) -> bool:
         if RECOVERY_JOURNAL is not None:
             RECOVERY_JOURNAL.before_press()
         pressed = True
-        try:
-            await asyncio.wait_for(tab.send(uc.cdp.input_.dispatch_mouse_event(
-                "mousePressed", x=target["x"], y=target["y"],
-                button=uc.cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,
-            )), timeout=2)
-        finally:
-            await asyncio.wait_for(tab.send(uc.cdp.input_.dispatch_mouse_event(
-                "mouseReleased", x=target["x"], y=target["y"],
-                button=uc.cdp.input_.MouseButton.LEFT, buttons=0, click_count=1,
-            )), timeout=2)
+        await native_mouse.press_and_release(tab, target["x"], target["y"])
         receipt = await asyncio.wait_for(evaluate(tab,
             "(() => window.__autoVotePointer?.receipt || {})()"), timeout=2)
         receipt = receipt if isinstance(receipt, dict) else {}
@@ -1353,6 +1347,29 @@ def probe_looks_blocked(probe: dict) -> bool:
     )
 
 
+async def public_topgg_login_ready(tab: Any) -> bool:
+    """A usable public Login can start OAuth; it never establishes a session."""
+    async def observe():
+        script = "(() => {" + VOTE_CONTROL_JS + r"""
+            if (location.protocol !== 'https:' || !['top.gg', 'www.top.gg'].includes(location.hostname) ||
+                location.port || !/^\/bot\/[0-9]+\/vote\/?$/.test(location.pathname) ||
+                !document.body || document.readyState === 'loading') return false;
+            const body = document.body.innerText.toLowerCase();
+            const loggedOut = ['must be logged in', 'login to vote', 'log in to vote'].some(text => body.includes(text));
+            if (!loggedOut) return false;
+            return [...document.querySelectorAll('a,button,[role="button"]')].some(node =>
+                ['login', 'log in', 'sign in'].includes((node.textContent || '').trim().toLowerCase()) &&
+                !voteControl.disabled(node) && voteControl.position(node).ready);
+        })()"""
+        if await evaluate(tab, script) is not True:
+            return False
+        return not await is_turnstile_present(tab)
+    try:
+        return await asyncio.wait_for(observe(), timeout=BROWSER_COMMAND_TIMEOUT_SEC)
+    except Exception:
+        return False
+
+
 async def topgg_auth_state(
     tab: Any, *, allow_session_recovery: bool = True, allow_challenge_input: bool = True,
 ) -> str:
@@ -1406,6 +1423,12 @@ async def topgg_auth_state(
         return AUTHENTICATED
 
     if probe_looks_blocked(probe):
+        if await public_topgg_login_ready(tab):
+            # The protected fetch is not an authentication verdict. Preserve
+            # this ordinary page for one real Login/OAuth attempt instead of
+            # replacing it with a new navigation challenge.
+            print("  → Session API blocked, but the public Login control is usable")
+            return AUTH_BLOCKED
         if allow_session_recovery:
             # An API's HTML challenge is not rendered as an interactive page.
             # First observe the existing application, preserving its cookies.
@@ -1414,6 +1437,8 @@ async def topgg_auth_state(
                 if page_hint == AUTHENTICATED:
                     print("  ✅ top.gg page became usable after the blocked session response")
                     return AUTHENTICATED
+                if page_hint == AUTH_INVALID and await public_topgg_login_ready(tab):
+                    return AUTH_BLOCKED
                 if not challenge_handled and await is_turnstile_present(tab):
                     if not allow_challenge_input or not await solve_turnstile(tab):
                         return await unresolved_challenge_auth_state(tab)
@@ -1515,40 +1540,60 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
     print("  → Preparing Discord session for top.gg login...")
     vote_url = f"https://top.gg/bot/{bot_ids[0]}/vote"
 
-    await navigate_page(tab, vote_url)
-    await asyncio.sleep(2)
-    await settle_privacy_overlay(tab)
+    public_page = await public_topgg_login_ready(tab)
+    if not public_page:
+        await navigate_page(tab, vote_url)
+        await asyncio.sleep(2)
+        await settle_privacy_overlay(tab)
     state = await topgg_auth_state(tab)
     if state == AUTHENTICATED:
         print("  ✅ Already logged into top.gg")
         return state
-    if state in {AUTH_CAPTCHA_REQUIRED, AUTH_BLOCKED}:
+    if state == AUTH_CAPTCHA_REQUIRED or (state == AUTH_BLOCKED and not await public_topgg_login_ready(tab)):
         return state
 
+    public_page = public_page or await public_topgg_login_ready(tab)
     print("  → Establishing Discord browser session...")
-    await navigate_page(tab, DISCORD_LOGIN_URL)
-    await asyncio.sleep(2)
-    if not url_has_domain(await current_url(tab), "discord.com"):
-        print("  ❌ Discord login page did not open")
-        return AUTH_INVALID
+    discord_tab = tab
+    if public_page:
+        # Preserve the usable application document and its verification cookies
+        # while the same profile establishes its Discord-origin session.
+        with suppress(Exception):
+            candidate = await asyncio.wait_for(tab.browser.get("about:blank", new_tab=True),
+                timeout=BROWSER_COMMAND_TIMEOUT_SEC)
+            if candidate is not None:
+                discord_tab = candidate
+    try:
+        await navigate_page(discord_tab, DISCORD_LOGIN_URL)
+        await asyncio.sleep(2)
+        if not url_has_domain(await current_url(discord_tab), "discord.com"):
+            print("  ❌ Discord login page did not open")
+            return AUTH_INVALID
 
-    await evaluate(tab, f"""(() => {{
-        const token = {json.dumps(token)};
-        localStorage.setItem('token', JSON.stringify(token));
-        localStorage.setItem('tokens', JSON.stringify({{"default": token}}));
-    }})()""")
-    await asyncio.wait_for(tab.reload(), timeout=BROWSER_COMMAND_TIMEOUT_SEC)
-    await asyncio.sleep(3)
+        await evaluate(discord_tab, f"""(() => {{
+            const token = {json.dumps(token)};
+            localStorage.setItem('token', JSON.stringify(token));
+            localStorage.setItem('tokens', JSON.stringify({{"default": token}}));
+        }})()""")
+        await asyncio.wait_for(discord_tab.reload(), timeout=BROWSER_COMMAND_TIMEOUT_SEC)
+        await asyncio.sleep(3)
+    finally:
+        if discord_tab is not tab:
+            with suppress(Exception):
+                await asyncio.wait_for(discord_tab.close(), timeout=BROWSER_COMMAND_TIMEOUT_SEC)
 
     print("  → Navigating to top.gg to initiate OAuth...")
-    await navigate_page(tab, vote_url)
-    await asyncio.sleep(3)
+    if discord_tab is tab or not await public_topgg_login_ready(tab):
+        await navigate_page(tab, vote_url)
+        await asyncio.sleep(3)
+    else:
+        print("  → Continuing OAuth from the preserved public Login page")
     await settle_privacy_overlay(tab)
     state = await topgg_auth_state(tab)
     if state == AUTHENTICATED:
         print("  ✅ Session established before OAuth redirect")
         return state
-    if state in {AUTH_CAPTCHA_REQUIRED, AUTH_BLOCKED}:
+    if state == AUTH_CAPTCHA_REQUIRED or (state == AUTH_BLOCKED and not await public_topgg_login_ready(tab)):
         return state
 
     marker = "data-auto-login"
@@ -1771,6 +1816,7 @@ async def solve_turnstile(tab: Any) -> bool:
         if await stable_challenge_clearance(tab):
             return True
     await log_challenge_diagnostic(tab, "detected")
+    await browser_environment.log_facts(tab, evaluate, "challenge_detected")
     print("  → Challenge detected; waiting for a verified Cloudflare checkbox target...")
     try:
         click = await _click_cloudflare_checkbox(tab)
@@ -1800,6 +1846,7 @@ async def solve_turnstile(tab: Any) -> bool:
             break
         await asyncio.sleep(min(2, max(0, deadline - asyncio.get_running_loop().time())))
     await log_challenge_diagnostic(tab, "timeout")
+    await browser_environment.log_facts(tab, evaluate, "challenge_timeout")
     print("  ⚠️  Challenge signals remained active after verification attempt")
     return False
 
@@ -2538,7 +2585,7 @@ async def start_browser() -> Any:
     scrub_browser_environment()
     for attempt in range(1, BROWSER_START_RETRIES + 1):
         profile_path = tempfile.mkdtemp(prefix="auto-vote-topgg-")
-        config = uc.Config(
+        config = browser_environment.ChromeConfig(
             user_data_dir=profile_path,
             headless=False,
             sandbox=True,
@@ -2561,6 +2608,7 @@ async def start_browser() -> Any:
                 browser.get("about:blank"),
                 timeout=BROWSER_INITIAL_PAGE_TIMEOUT_SEC,
             )
+            await browser_environment.log_facts(next(iter(browser)), evaluate, "startup")
             return browser
         except Exception as exc:
             last_error = exc
@@ -2662,12 +2710,16 @@ async def _run_account(
             auth_state = await topgg_auth_state(tab)
         elif account_cookies:
             auth_state = await login_with_cookies(tab, account_cookies, bot_ids)
+        public_login = auth_state == AUTH_BLOCKED and await public_topgg_login_ready(tab)
         if auth_state == AUTH_INVALID and account_cookies:
             print("  → Cookie auth is invalid; falling back to Discord OAuth...")
             await clear_topgg_auth_cookies(browser)
         elif auth_state == AUTH_BLOCKED:
-            print("  ⏳ top.gg is blocking this browser; skipping OAuth on the same session")
-        if auth_state == AUTH_INVALID:
+            if public_login:
+                print("  → Public Login remains usable; trying ordinary Discord OAuth once")
+            else:
+                print("  ⏳ top.gg is blocking this browser; skipping OAuth on the same session")
+        if auth_state == AUTH_INVALID or public_login:
             auth_state = await discord_oauth_login(tab, token, bot_ids)
         session.authenticated = auth_state == AUTHENTICATED
         if auth_state == AUTH_CAPTCHA_REQUIRED:

@@ -5,6 +5,8 @@ import json
 from contextlib import suppress
 
 from nodriver import cdp
+import browser_environment
+import native_mouse
 from vote_controls import VOTE_CONTROL_JS
 
 
@@ -68,6 +70,9 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
 
     async def prepare():
         nonlocal reason
+        # Activate before waiting for layout stability: a background document
+        # may not expose a settled layout until Chrome foregrounds the tab.
+        await browser_environment.foreground(tab)
         while asyncio.get_running_loop().time() < deadline:
             position = await target()
             if position.get("ready") is True:
@@ -85,16 +90,7 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
         if position is None:
             return {"input_sent": False, "clicked": False}
         sent = True
-        try:
-            await send(cdp.input_.dispatch_mouse_event(
-                "mousePressed", x=position["x"], y=position["y"],
-                button=cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,
-            ))
-        finally:
-            await send(cdp.input_.dispatch_mouse_event(
-                "mouseReleased", x=position["x"], y=position["y"],
-                button=cdp.input_.MouseButton.LEFT, buttons=0, click_count=1,
-            ))
+        await native_mouse.press_and_release(tab, position["x"], position["y"])
         with suppress(Exception):
             receipt = await asyncio.wait_for(evaluate(tab, "window.__autoUiPointer?.receipt || null"), timeout=2)
             if isinstance(receipt, dict):

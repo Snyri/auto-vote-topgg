@@ -82,6 +82,31 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         tab.reload.assert_awaited_once()
         self.assertEqual(self.mocks["topgg_session_probe"].await_count, 2)
 
+    async def test_usable_public_login_survives_a_challenge_of_the_session_fetch(self):
+        tab = AsyncMock()
+        self.mocks["topgg_page_auth_hint"].return_value = vote.AUTH_INVALID
+        with patch("vote.public_topgg_login_ready", new=AsyncMock(return_value=True), create=True):
+            self.assertEqual(await vote.topgg_auth_state(tab), vote.AUTH_BLOCKED)
+        # A challenged API does not establish logout, but it must not discard
+        # the ordinary page whose real Login control is still usable.
+        tab.reload.assert_not_awaited()
+        self.mocks["topgg_session_probe"].assert_awaited_once()
+
+    async def test_account_can_try_real_login_after_only_the_api_was_blocked(self):
+        browser, tab = browser_fixture()
+        with (patch("vote.start_browser", new=AsyncMock(return_value=browser)),
+              patch("vote.login_with_cookies", new=AsyncMock(return_value=vote.AUTH_BLOCKED)),
+              patch("vote.public_topgg_login_ready", new=AsyncMock(return_value=True), create=True),
+              patch("vote.discord_oauth_login", new=AsyncMock(return_value=vote.AUTHENTICATED)) as oauth,
+              patch("vote.clear_topgg_auth_cookies", new_callable=AsyncMock) as clear,
+              patch("vote.vote_for_bot", new=AsyncMock(return_value={"bot_id": BOT, "status": "success"})),
+              patch("vote.browser_screenshot", new_callable=AsyncMock),
+              patch("vote.close_browser_safely", new_callable=AsyncMock)):
+            result = await vote._run_account("local-fixture-token", [BOT], "fixture", [{"name": "authjs.session-token"}])
+        self.assertEqual(result[0]["status"], "success")
+        oauth.assert_awaited_once()
+        clear.assert_not_awaited()
+
     async def test_api_callback_or_other_origin_is_never_reopened(self):
         for url in ["https://top.gg/api/auth/session", "https://top.gg/api/auth/callback/discord?code=secret",
                     "https://discord.com/oauth2/authorize", "http://top.gg/bot/111/vote"]:
