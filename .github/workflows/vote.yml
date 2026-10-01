@@ -176,13 +176,14 @@ jobs:
         run: exit "${STATUS:-1}"
 
   verify-vote:
+    name: Check recorded vote result
     needs: vote
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Apply vote result
+      - name: Check script exit status
         env:
           VOTE_STATUS: ${{ needs.vote.outputs.vote_status }}
           VOTE_JOB_RESULT: ${{ needs.vote.result }}

@@ -1380,7 +1380,9 @@ def probe_looks_blocked(probe: dict) -> bool:
     )
 
 
-async def topgg_auth_state(tab: Any, *, allow_session_recovery: bool = True) -> str:
+async def topgg_auth_state(
+    tab: Any, *, allow_session_recovery: bool = True, allow_challenge_input: bool = True,
+) -> str:
     await dismiss_privacy_overlay(tab)
     challenge_handled = False
 
@@ -1394,9 +1396,21 @@ async def topgg_auth_state(tab: Any, *, allow_session_recovery: bool = True) -> 
     # authentication signal. Clear the page challenge first, then probe only
     # if the vote surface is still ambiguous.
     if await is_turnstile_present(tab):
-        print("  → top.gg protection is active; clearing it before session validation")
-        if not await solve_turnstile(tab):
-            return await unresolved_challenge_auth_state(tab)
+        if not allow_challenge_input:
+            # The first cookie check already waited for a target/clearance on
+            # this document. A recheck observes progress without repeating the
+            # same solver attempt or another protected session fetch.
+            for poll in range(AUTH_PAGE_SETTLE_POLLS):
+                if not await is_turnstile_present(tab) and await document_ready(tab):
+                    break
+                if poll < AUTH_PAGE_SETTLE_POLLS - 1:
+                    await asyncio.sleep(AUTH_PAGE_SETTLE_DELAY_SEC)
+            else:
+                return await unresolved_challenge_auth_state(tab)
+        else:
+            print("  → top.gg protection is active; clearing it before session validation")
+            if not await solve_turnstile(tab):
+                return await unresolved_challenge_auth_state(tab)
         challenge_handled = True
         await asyncio.sleep(2)
         await settle_privacy_overlay(tab)
@@ -1428,7 +1442,7 @@ async def topgg_auth_state(tab: Any, *, allow_session_recovery: bool = True) -> 
                     print("  ✅ top.gg page became usable after the blocked session response")
                     return AUTHENTICATED
                 if not challenge_handled and await is_turnstile_present(tab):
-                    if not await solve_turnstile(tab):
+                    if not allow_challenge_input or not await solve_turnstile(tab):
                         return await unresolved_challenge_auth_state(tab)
                     return await topgg_auth_state(tab, allow_session_recovery=False)
                 if probe.get("error") == "document-loading" and await document_ready(tab):
@@ -1483,7 +1497,8 @@ async def login_with_cookies(tab: Any, cookies: list[dict], bot_ids: list[str]) 
             await asyncio.sleep(delay)
 
         await settle_privacy_overlay(tab)
-        state = await topgg_auth_state(tab)
+        state = await topgg_auth_state(tab) if attempt == 1 else await topgg_auth_state(
+            tab, allow_session_recovery=False, allow_challenge_input=False)
         last_state = state
 
         if state == AUTHENTICATED:
@@ -1605,6 +1620,9 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
 
 async def is_cloudflare_challenge_page(tab: Any) -> bool:
     """Recognize a full-page access gate, independently of embedded widgets."""
+    tracker = getattr(tab, "_topgg_diagnostics", None)
+    if getattr(tracker, "document_challenged", None) is True:
+        return True
     result = await evaluate(tab, """(() => {
         const body = document.body ? document.body.innerText.toLowerCase() : '';
         const title = (document.title || '').trim().toLowerCase();
@@ -1632,10 +1650,12 @@ async def is_turnstile_present(tab: Any) -> bool:
     # Managed challenges can expose only their title/security text before the
     # checkbox appears. Observe those too, while keeping hard-denial error pages
     # separate from interactive widget detection.
-    return bool(await evaluate(tab, """(() => {
+    tracker = getattr(tab, "_topgg_diagnostics", None)
+    marked = getattr(tracker, "document_challenged", None) is True
+    present = bool(await evaluate(tab, """(() => {
         const body = document.body ? document.body.innerText.toLowerCase() : '';
         const title = (document.title || '').trim().toLowerCase();
-        const managed = title.startsWith('just a moment') ||
+        const managed = __PROVIDER_MARKED__ || title.startsWith('just a moment') ||
             body.includes('performing security verification') ||
             body.includes('needs to review the security of your connection');
         const usableVote = [...document.querySelectorAll('button, [role="button"]')].some(node => {
@@ -1646,7 +1666,8 @@ async def is_turnstile_present(tab: Any) -> bool:
             return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
         });
         const usableCooldown = body.includes('vote again in') || body.includes('already voted') ||
-            body.includes('can vote again');
+            body.includes('can vote again') || body.includes('thanks for voting') ||
+            body.includes('you will be able to vote after this ad');
         if (managed && !usableVote && !usableCooldown) return true;
         if (body.includes('verify you are human') ||
             body.includes('please solve the captcha to continue') ||
@@ -1657,11 +1678,14 @@ async def is_turnstile_present(tab: Any) -> bool:
         if (document.querySelector('iframe[src*="recaptcha"]')) return true;
         if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
         return Boolean(document.querySelector('.cf-turnstile, .h-captcha, .g-recaptcha'));
-    })()"""))
+    })()""".replace("__PROVIDER_MARKED__", "true" if marked else "false")))
+    if present:
+        return True
+    return (await cloudflare_click.widget_state(tab))["present"] is True
 
 
 async def is_turnstile_solved(tab: Any) -> bool:
-    return bool(await evaluate(tab, """(() => {
+    solved = bool(await evaluate(tab, """(() => {
         const fields = document.querySelectorAll([
             'input[name="cf-turnstile-response"]',
             'textarea[name="cf-turnstile-response"]',
@@ -1673,6 +1697,9 @@ async def is_turnstile_solved(tab: Any) -> bool:
         const widget = document.querySelector('.cf-turnstile');
         return Boolean(widget && widget.dataset.response && widget.dataset.response.length > 10);
     })()"""))
+    if solved:
+        return True
+    return (await cloudflare_click.widget_state(tab))["solved"] is True
 
 
 async def challenge_diagnostic(tab: Any) -> dict:
@@ -2084,12 +2111,26 @@ async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_c
     if network is not None and network.definitely_rejected():
         return rejected_vote_result(bot_id)
 
-    if await confirm_vote_without_reload(tab, bot_id, before_click):
+    outcome = network.submission_outcome() if network is not None else None
+    application_error = outcome in {"captcha_required", "unauthenticated", "error", "invalid"}
+    if application_error:
+        print(f"  ⚠️ GraphQL vote response reported {outcome}; a 200 is not vote confirmation")
+    if not application_error and await confirm_vote_without_reload(tab, bot_id, before_click):
         result = successful_vote_result(bot_id)
         result["detail"] = "Vote acknowledged on page"
         return result
 
-    if await is_turnstile_present(tab):
+    challenged = await is_turnstile_present(tab)
+    if outcome == "captcha_required" and not challenged:
+        for _ in range(2):
+            await asyncio.sleep(2)
+            challenged = await is_turnstile_present(tab)
+            if challenged:
+                break
+        if not challenged:
+            return await captcha_result(tab, bot_id,
+                "Vote API requires CAPTCHA; no interactive control became available", account_id)
+    if challenged:
         if not await solve_turnstile(tab):
             return await unresolved_challenge_result(
                 tab,
@@ -2100,7 +2141,8 @@ async def verify_submitted_vote(tab: Any, bot_id: str, account_id: str, before_c
             )
         await asyncio.sleep(POST_VOTE_VERIFY_DELAY_SEC)
 
-        if await confirm_vote_without_reload(tab, bot_id, before_click):
+        outcome = network.submission_outcome() if network is not None else None
+        if outcome not in {"captcha_required", "unauthenticated", "error", "invalid"} and await confirm_vote_without_reload(tab, bot_id, before_click):
             result = successful_vote_result(bot_id)
             result["detail"] = "Vote acknowledged on page after verification"
             return result
@@ -2703,7 +2745,7 @@ async def _process_account_attempts(
             if status == "blocked":
                 blocked_attempts += 1
                 if blocked_attempts < MAX_BLOCKED_ATTEMPTS and attempt < MAX_RETRIES:
-                    print(f"{prefix} ↺ Protection block detected; trying one fresh browser")
+                    print(f"{prefix} ↺ Protection block detected; trying the next browser ({attempt + 1}/{MAX_RETRIES})")
                     continue
                 print(f"{prefix} ⏳ Protection block persists; ending this run")
                 return apply_account_error(last_account_error)
@@ -2739,7 +2781,7 @@ async def _process_account_attempts(
             blocked_attempts += 1
             if blocked_attempts < MAX_BLOCKED_ATTEMPTS and attempt < MAX_RETRIES:
                 pending = list(dict.fromkeys(blocked_bot_ids + transient_bot_ids))
-                print(f"{prefix} ↺ Vote-page protection block; trying one fresh browser")
+                print(f"{prefix} ↺ Vote-page protection block; trying the next browser ({attempt + 1}/{MAX_RETRIES})")
                 continue
             print(f"{prefix} ⏳ Vote-page protection block persists; deferring")
             return [results_by_bot[bot_id] for bot_id in bot_ids if bot_id in results_by_bot]
@@ -2796,6 +2838,31 @@ def has_business_failure(all_results: list[list[dict]]) -> bool:
         or any(result.get("status") not in COMPLETED_STATUSES for result in account_results)
         for account_results in all_results
     )
+
+
+def publish_run_summary(all_results: list[list[dict]]) -> None:
+    """GitHub fallback reporting with aggregate categories only, never account data."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    statuses = ("success", "cooldown", "blocked", "captcha_required", "uncertain", "auth_failed", "error", "unknown")
+    counts = dict.fromkeys(statuses, 0)
+    for results in all_results:
+        for result in results:
+            status = result.get("status")
+            counts[status if isinstance(status, str) and status in counts else "unknown"] += 1
+    lines = ["### Recorded vote outcomes", "", "| Outcome | Count |", "|---|---:|"]
+    lines.extend(f"| {status} | {count} |" for status, count in counts.items() if count)
+    lines.extend(["", "Success requires an observed page acknowledgement or persisted vote state. "
+                  "A mouse click or HTTP 200 alone is not confirmation.",
+                  "HTTP/GraphQL and challenge diagnostics are in the vote log. "
+                  "The result-check job validates the script exit status; it does not contact Top.gg.", ""])
+    try:
+        with open(path, "a", encoding="utf-8") as summary:
+            summary.write("\n".join(lines))
+    except OSError:
+        # Reporting must never replace a completed vote with a retryable failure.
+        print("  GitHub result summary unavailable; vote outcome unchanged")
 
 
 async def main() -> int:
@@ -2860,6 +2927,7 @@ async def main() -> int:
     if write_protection_retry_state(all_results):
         print("↺ Protection-block failure marker recorded")
     report = build_notification(all_results, now)
+    publish_run_summary(all_results)
     send_notification(report)
     await send_captcha_screenshots(all_results)
     await send_auth_failure_screenshots(all_results)

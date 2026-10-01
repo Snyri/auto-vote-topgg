@@ -6,6 +6,8 @@ import re
 import time
 from urllib.parse import parse_qs, urlparse
 
+import graphql_vote
+
 
 MAX_VOTE_REQUESTS = 16
 RPC_VOTE_MUTATIONS = {"vote", "castvote", "submitvote", "voteforbot"}
@@ -104,6 +106,8 @@ def vote_operation(url, method, document_url, bot_id, post_data=None):
                 return "vote_submission"
             if method == "GET":
                 return "vote_state"
+        if parsed.path.rstrip("/") == "/api/graphql" and method == "POST":
+            return graphql_vote.inspect_request(post_data, bot_id)["operation"]
         rpc = re.fullmatch(r"/api/trpc/(bot|bots|vote|votes|voting)\.([A-Za-z]+)", parsed.path)
         if rpc:
             action = rpc.group(2).lower()
@@ -150,6 +154,7 @@ class VoteNetworkState:
         self.trusted = False
         self.pressed_at = None
         self.incomplete = False
+        self.entity_key = None
 
     def select_bot(self, bot_id):
         if bot_id != self.bot_id:
@@ -158,6 +163,7 @@ class VoteNetworkState:
             self.last_denial = None
             self.denial_started = None
             self.recovered_by = None
+            self.entity_key = None
         self.end_input()
 
     def begin_input(self):
@@ -182,12 +188,27 @@ class VoteNetworkState:
         request = event.request
         operation = vote_operation(request.url, request.method, getattr(event, "document_url", None),
                                    self.bot_id, getattr(request, "post_data", None))
+        graphql = (safe_api_route(request.url) == "/api/graphql"
+                   and bot_vote_page(getattr(event, "document_url", None), self.bot_id or ""))
+        descriptor = graphql_vote.inspect_request(getattr(request, "post_data", None), self.bot_id) if graphql else {}
+        entity_key = descriptor.get("entity_key")
+        if operation != "unrelated" and entity_key is not None:
+            if self.entity_key is None:
+                self.entity_key = entity_key
+            elif entity_key != self.entity_key:
+                operation = "unrelated"
         stamp = number(getattr(event, "wall_time", None))
         info = {"operation": operation, "context": self.context, "generation": self.generation,
                 "started": stamp, "statuses": set(), "challenge": False, "finished": False,
                 "redirected": bool(getattr(event, "redirect_response", None)),
-                "json_response": False, "readiness_invalid": False, "failed": False}
-        if (self.armed and operation != "vote_state"
+                "json_response": False, "readiness_invalid": False, "failed": False,
+                "graphql": graphql, "response_key": descriptor.get("response_key"),
+                "response_outcome": "pending" if graphql else "not_applicable",
+                "graphql_kind": descriptor.get("graphql_kind", "not_applicable"),
+                "graphql_target": descriptor.get("graphql_target", "not_applicable"),
+                "graphql_shape": descriptor.get("graphql_shape", "not_applicable")}
+        readonly_graphql = graphql and descriptor.get("graphql_kind") == "query"
+        if (self.armed and operation != "vote_state" and not readonly_graphql
                 and first_party_write(request.url, request.method, getattr(event, "document_url", None), self.bot_id)):
             if len(self.candidates) >= MAX_VOTE_REQUESTS:
                 self.incomplete = True
@@ -222,10 +243,17 @@ class VoteNetworkState:
         info["failed"] |= failed
         self._clear_protection_if_ready(info)
 
+    def response_body(self, info, outcome):
+        if outcome not in {"usable", "captcha_required", "unauthenticated", "error", "invalid", "unavailable"}:
+            outcome = "unavailable"
+        info["response_outcome"] = outcome
+        self._clear_protection_if_ready(info)
+
     def _clear_protection_if_ready(self, info):
         ready = (info["context"] == self.context and info["operation"] == "vote_state"
                 and info["finished"] and not info["failed"] and not info["redirected"]
                 and not info["readiness_invalid"] and info["json_response"]
+                and (not info["graphql"] or info["response_outcome"] == "usable")
                 and len(info["statuses"]) == 1 and all(200 <= status < 300 for status in info["statuses"]))
         # ExtraInfo may arrive after LoadingFinished. Revoke only this response's
         # recovery if late evidence contradicts it, without retaining raw data.
@@ -244,6 +272,19 @@ class VoteNetworkState:
         # Time passing is not evidence that the denied API became usable.
         # A fresh, complete vote-state response or a new bot/browser clears it.
         return self.last_denial is not None
+
+    def submission_outcome(self):
+        """Only the latest identified mutation belonging to this trusted press."""
+        if not self.armed or not self.trusted or self.pressed_at is None:
+            return None
+        requests = [info for info in self.candidates.values()
+                    if info["operation"] == "vote_submission" and info["graphql"]
+                    and info["context"] == self.context and info["generation"] == self.generation
+                    and info["started"] is not None and info["started"] >= self.pressed_at]
+        if not requests:
+            return None
+        latest = max(requests, key=lambda info: info["started"])
+        return latest["response_outcome"] if latest["finished"] else "pending"
 
     def definitely_rejected(self):
         if not self.armed or not self.trusted or self.pressed_at is None or self.incomplete:

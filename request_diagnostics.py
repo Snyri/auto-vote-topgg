@@ -1,6 +1,7 @@
 """Passive CDP metadata; never retain raw URLs, payloads or credentials."""
 
 import asyncio
+import base64
 import json
 from collections import OrderedDict
 from contextlib import suppress
@@ -8,7 +9,8 @@ from urllib.parse import urlparse
 
 from nodriver import cdp
 
-from vote_network import VoteNetworkState, safe_api_route
+import graphql_vote
+from vote_network import VoteNetworkState, bot_vote_page, safe_api_route
 
 
 MAX_REQUESTS = 256
@@ -46,7 +48,8 @@ def safe_headers(headers) -> dict:
     ray = ray if isinstance(ray, str) and re.fullmatch(r"[a-fA-F0-9]{16}-[A-Z]{3}", ray) else None
     content = str(selected.get("content-type", "")).lower().split(";", 1)[0]
     return {"cloudflare_challenge": selected.get("cf-mitigated") == "challenge", "cf_ray": ray,
-            "content_kind": "json" if content == "application/json" else "html" if content == "text/html" else "other"}
+            "content_kind": "json" if content in {"application/json", "application/graphql-response+json"}
+            else "html" if content == "text/html" else "other"}
 
 
 class RequestDiagnostics:
@@ -55,6 +58,8 @@ class RequestDiagnostics:
         self.requests = OrderedDict()
         self.completed = OrderedDict()
         self.vote_network = VoteNetworkState()
+        self.document_request = None
+        self.document_challenged = False
         self.handlers = [(cdp.network.RequestWillBeSent, self.on_request),
                          (cdp.network.ResponseReceived, self.on_response),
                          (cdp.network.ResponseReceivedExtraInfo, self.on_extra),
@@ -64,7 +69,10 @@ class RequestDiagnostics:
     async def start(self):
         try:
             for event, callback in self.handlers: self.tab.add_handler(event, callback)
-            await asyncio.wait_for(self.tab.send(cdp.network.enable()), timeout=2)
+            await asyncio.wait_for(self.tab.send(cdp.network.enable(
+                max_total_buffer_size=2 * 1024 * 1024, max_resource_buffer_size=256 * 1024,
+                max_post_data_size=graphql_vote.MAX_PAYLOAD,
+            )), timeout=2)
             self.tab._topgg_diagnostics = self
         except Exception:
             self.stop()
@@ -76,6 +84,7 @@ class RequestDiagnostics:
         self.requests.clear()
         self.completed.clear()
         self.vote_network.end_input()
+        self.document_challenged = False
         if getattr(self.tab, "_topgg_diagnostics", None) is self:
             self.tab._topgg_diagnostics = None
 
@@ -97,7 +106,19 @@ class RequestDiagnostics:
             "vote_network": self.vote_network.on_request(event),
             "api_route": safe_api_route(event.request.url),
         }
+        if (resource == "Document" and self.requests[event.request_id]["request_kind"] == "topgg_page"
+                and self.vote_network.bot_id is not None
+                and bot_vote_page(event.request.url, self.vote_network.bot_id)):
+            self.document_request = event.request_id
+            self.document_challenged = False
         self.requests.move_to_end(event.request_id)
+        info = self.requests[event.request_id]["vote_network"]
+        if info["graphql"]:
+            print("  GraphQL request diagnostic: " + json.dumps({
+                "phase": self.phase, "vote_operation": info["operation"],
+                **{key: info[key] for key in ("graphql_kind", "graphql_target", "graphql_shape")},
+                "payload_available": isinstance(getattr(event.request, "post_data", None), str),
+            }, sort_keys=True))
         while len(self.requests) > MAX_REQUESTS:
             request_id, _ = self.requests.popitem(last=False)
             if request_id in self.vote_network.candidates:
@@ -109,6 +130,8 @@ class RequestDiagnostics:
             return
         status = int(status)
         safe = safe_headers(headers)
+        if request_id == self.document_request:
+            self.document_challenged = safe["cloudflare_challenge"] is True and safe["content_kind"] == "html"
         self.vote_network.response(info["vote_network"], status, safe)
         relevant_write = info["phase"] in {"vote_input", "vote_confirmation"} and info["request_kind"] == "topgg_api" and info["method"] in {"POST", "PUT", "PATCH", "DELETE"}
         if status < 400 and not relevant_write: return
@@ -119,6 +142,8 @@ class RequestDiagnostics:
             **{key: info[key] for key in ("request_kind", "resource_type", "method", "phase")}, "status": status, **safe,
             "vote_operation": info["vote_network"]["operation"],
             "api_route": info["api_route"],
+            **({key: info["vote_network"][key] for key in ("graphql_kind", "graphql_target", "graphql_shape")}
+               if info["vote_network"]["graphql"] else {}),
         }, sort_keys=True))
 
     async def on_response(self, event):
@@ -139,6 +164,24 @@ class RequestDiagnostics:
                 request_id, _ = self.completed.popitem(last=False)
                 if request_id in self.vote_network.candidates:
                     self.vote_network.incomplete = True
+            network = info["vote_network"]
+            if (not failed and network["graphql"] and network["operation"] != "unrelated"
+                    and network["json_response"] and not network["readiness_invalid"]):
+                outcome = "unavailable"
+                try:
+                    body, encoded = await asyncio.wait_for(
+                        self.tab.send(cdp.network.get_response_body(event.request_id)), timeout=2)
+                    if isinstance(body, str) and len(body) <= graphql_vote.MAX_RESPONSE * 4 // 3 + 4:
+                        if encoded:
+                            body = base64.b64decode(body, validate=True).decode("utf-8")
+                        outcome = graphql_vote.inspect_response(body, network["response_key"], network["operation"])
+                except Exception:
+                    pass
+                self.vote_network.response_body(network, outcome)
+                print("  GraphQL response diagnostic: " + json.dumps({
+                    "phase": info["phase"], "vote_operation": network["operation"],
+                    "outcome": outcome,
+                }, sort_keys=True))
 
     async def on_failed(self, event):
         info = self.requests.get(event.request_id)
