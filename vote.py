@@ -1023,7 +1023,8 @@ async def _click_vote_control(tab: Any) -> bool:
         return flags["clicked"]
     except Exception as exc:
         if not pressed and not isinstance(exc, VoteClickNotReady):
-            raise VoteClickNotReady("browser_unavailable") from exc
+            reason = last_reason if isinstance(exc, TimeoutError) and last_reason else "browser_unavailable"
+            raise VoteClickNotReady(reason) from exc
         raise
     finally:
         with suppress(Exception):

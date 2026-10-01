@@ -89,6 +89,17 @@ class NetworkAuditRegressions(unittest.TestCase):
 
 
 class ConfirmationAuditRegressions(unittest.IsolatedAsyncioTestCase):
+    async def test_pointer_deadline_preserves_the_observed_blocking_reason(self):
+        tab = AsyncMock()
+        with patch("vote.TIMEOUT_VOTE_SEC", 0.01), patch("vote.dismiss_privacy_overlay", new=AsyncMock()), \
+                patch("vote.mark_vote_button", new=AsyncMock()), \
+                patch("vote._vote_pointer_target", new=AsyncMock(return_value={"ready":False,"reason":"disabled"})), \
+                patch("vote.evaluate", new=AsyncMock(return_value={})), \
+                patch("vote.RECOVERY_JOURNAL", None):
+            with self.assertRaisesRegex(vote.VoteClickNotReady, "disabled"):
+                await vote._click_vote_control(tab)
+        tab.send.assert_not_awaited()
+
     async def verify(self, state, *, late_error=False, persisted=False):
         tab = AsyncMock()
         async def observe(*_):
