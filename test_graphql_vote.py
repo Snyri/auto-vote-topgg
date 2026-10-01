@@ -56,6 +56,18 @@ class GraphQLRequestTests(unittest.TestCase):
             self.assertEqual(self.operation(payload(query)), "vote_state")
         self.assertEqual(self.operation(payload('query Cast { bot(id:"111") { description monthlyVotes } }')), "unrelated")
 
+    def test_state_fields_nested_under_the_entity_are_reachable(self):
+        self.assertEqual(self.operation(payload('query Cast { entity(id:"111") { voting { canVote } } }')), "vote_state")
+
+    def test_unknown_root_exposes_a_fixed_gate_without_becoming_a_known_vote(self):
+        result = graphql_vote.inspect_request(payload('mutation Cast { PRIVATE_ROOT(botId:"111") { ok } }'), "111")
+        self.assertEqual(result["operation"], "unrelated")
+        self.assertEqual(result["graphql_kind"], "mutation")
+        self.assertEqual(result["graphql_target"], "matching_bot")
+        self.assertEqual(result["graphql_gate"], "unrecognized_field")
+        self.assertIsInstance(result["response_key"], str)
+        self.assertNotIn("PRIVATE", repr(result))
+
     def test_nested_union_and_named_output_fragments_do_not_hide_the_root_operation(self):
         raw = payload('mutation Cast { castVote(botId:"111") { ... on VoteSuccess { ok } ...Error } } '
                       'fragment Error on VoteError { code }')

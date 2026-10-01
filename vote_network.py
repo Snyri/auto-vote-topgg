@@ -155,6 +155,17 @@ class VoteNetworkState:
         self.pressed_at = None
         self.incomplete = False
         self.entity_key = None
+        self.document_id = None
+
+    def select_document(self, loader_id):
+        """A committed main document must not inherit an earlier page's gate."""
+        if not isinstance(loader_id, str) or not loader_id or loader_id == self.document_id:
+            return
+        self.document_id = loader_id
+        self.context += 1
+        self.last_denial = self.denial_started = self.recovered_by = None
+        self.entity_key = None
+        self.end_input()
 
     def select_bot(self, bot_id):
         if bot_id != self.bot_id:
@@ -191,6 +202,10 @@ class VoteNetworkState:
         graphql = (safe_api_route(request.url) == "/api/graphql"
                    and bot_vote_page(getattr(event, "document_url", None), self.bot_id or ""))
         descriptor = graphql_vote.inspect_request(getattr(request, "post_data", None), self.bot_id) if graphql else {}
+        loader = getattr(event, "loader_id", None)
+        current_document = not (self.document_id and loader and loader != self.document_id)
+        if not current_document:
+            operation = "unrelated"
         entity_key = descriptor.get("entity_key")
         if operation != "unrelated" and entity_key is not None:
             if self.entity_key is None:
@@ -198,7 +213,7 @@ class VoteNetworkState:
             elif entity_key != self.entity_key:
                 operation = "unrelated"
         stamp = number(getattr(event, "wall_time", None))
-        info = {"operation": operation, "context": self.context, "generation": self.generation,
+        info = {"operation": operation, "context": self.context if current_document else -1, "generation": self.generation,
                 "started": stamp, "statuses": set(), "challenge": False, "finished": False,
                 "redirected": bool(getattr(event, "redirect_response", None)),
                 "json_response": False, "readiness_invalid": False, "failed": False,
@@ -206,9 +221,14 @@ class VoteNetworkState:
                 "response_outcome": "pending" if graphql else "not_applicable",
                 "graphql_kind": descriptor.get("graphql_kind", "not_applicable"),
                 "graphql_target": descriptor.get("graphql_target", "not_applicable"),
-                "graphql_shape": descriptor.get("graphql_shape", "not_applicable")}
+                "graphql_shape": descriptor.get("graphql_shape", "not_applicable"),
+                "graphql_gate": descriptor.get("graphql_gate", "not_applicable") if current_document else "previous_document",
+                "application_submission": current_document and graphql
+                    and descriptor.get("graphql_kind") == "mutation"
+                    and descriptor.get("graphql_shape") == "single"
+                    and (operation == "vote_submission" or descriptor.get("graphql_target") == "matching_bot")}
         readonly_graphql = graphql and descriptor.get("graphql_kind") == "query"
-        if (self.armed and operation != "vote_state" and not readonly_graphql
+        if (current_document and self.armed and operation != "vote_state" and not readonly_graphql
                 and first_party_write(request.url, request.method, getattr(event, "document_url", None), self.bot_id)):
             if len(self.candidates) >= MAX_VOTE_REQUESTS:
                 self.incomplete = True
@@ -278,13 +298,31 @@ class VoteNetworkState:
         if not self.armed or not self.trusted or self.pressed_at is None:
             return None
         requests = [info for info in self.candidates.values()
-                    if info["operation"] == "vote_submission" and info["graphql"]
+                    if (info["application_submission"] or info["operation"] == "vote_submission")
                     and info["context"] == self.context and info["generation"] == self.generation
                     and info["started"] is not None and info["started"] >= self.pressed_at]
         if not requests:
             return None
+        # Once an actual vote operation is identified, ancillary bot mutations
+        # must not replace its result merely because they completed later.
+        known = [info for info in requests if info["operation"] == "vote_submission"]
+        if known:
+            requests = known
         latest = max(requests, key=lambda info: info["started"])
-        return latest["response_outcome"] if latest["finished"] else "pending"
+        def observed_outcome(info):
+            if not info["finished"]:
+                return "pending"
+            if info["challenge"] and info["statuses"] == {403}:
+                return "protection_rejected"
+            if any(status >= 400 for status in info["statuses"]):
+                return "error"
+            return info["response_outcome"]
+        if not known:
+            for info in requests:
+                outcome = observed_outcome(info)
+                if outcome in {"captcha_required", "unauthenticated", "error", "invalid", "protection_rejected"}:
+                    return outcome
+        return observed_outcome(latest)
 
     def definitely_rejected(self):
         if not self.armed or not self.trusted or self.pressed_at is None or self.incomplete:

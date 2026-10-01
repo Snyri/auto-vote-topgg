@@ -4,12 +4,13 @@ import asyncio
 import base64
 import json
 import math
-from contextlib import suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from functools import lru_cache
 from urllib.parse import urlparse
 
 from nodriver import cdp
 from nodriver.core.util import get_cf_template
+from nodriver.core.connection import Connection
 
 
 MATCH_THRESHOLD = 0.85
@@ -75,6 +76,36 @@ async def _on_node(tab, object_id, function):
     if exception:
         raise RuntimeError("Checkbox observation unavailable")
     return result.value if result else None
+
+
+@asynccontextmanager
+async def _provider_session(tab, frame_id):
+    """An OOPIF has its own CDP session; never reattach the observed main tab."""
+    owner, _ = await _send(tab, cdp.dom.get_frame_owner(frame_id))
+    node = await _send(tab, cdp.dom.describe_node(backend_node_id=owner, depth=0))
+    if not _cloudflare_frame(node):
+        raise RuntimeError("Provider frame unavailable")
+    infos = await _send(tab, cdp.target.get_targets())
+    providers = [info for info in infos if info.type_ == "iframe"
+        and urlparse(info.url).scheme == "https"
+        and urlparse(info.url).hostname == "challenges.cloudflare.com"]
+    if len(providers) > 4:
+        raise RuntimeError("Ambiguous provider frames")
+    for info in providers:
+        connection = Connection(target=info, parent=tab, auto_attach=False)
+        try:
+            await asyncio.wait_for(connection.attach(), timeout=2)
+            tree = await _send(connection, cdp.page.get_frame_tree())
+            # Frame IDs and DevTools Target IDs are different identifiers.
+            # Match the actual root frame exposed by the attached session.
+            if tree.frame.id_ != frame_id:
+                continue
+            yield connection, owner
+            return
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(connection.aclose(), timeout=2)
+    raise RuntimeError("Provider frame unavailable")
 
 
 async def interstitial_context(tab) -> bool:
@@ -220,30 +251,100 @@ VISIBLE_CONTROL_FUNCTION = """function () {
 }"""
 
 
-async def semantic_checkbox_target(tab, width, height) -> dict:
-    """Find a real control in closed shadow DOM without relying on its appearance."""
-    main_allowed = await interstitial_context(tab)
-    document = await _send(tab, cdp.dom.get_document(depth=-1, pierce=True))
-    pending = [(document, main_allowed)]
-    candidates = []
-    visited = 0
+LOCAL_POINT_FUNCTION = """function () {
+    const rect = this.getBoundingClientRect();
+    const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    // Each enclosing root must hit this control/label or its shadow host.
+    // This detects an overlay both inside and outside a closed shadow root.
+    let node = this;
+    while (node) {
+        const root = node.getRootNode();
+        const hit = root.elementFromPoint?.(x, y);
+        if (!hit || !(node === hit || node.contains(hit))) return null;
+        node = root.host || null;
+    }
+    const view = this.ownerDocument.defaultView;
+    return {x, y, width:view.innerWidth, height:view.innerHeight};
+}"""
+
+
+def _checkbox_nodes(document, allowed):
+    pending, candidates, frames, visited = [(document, allowed)], [], [], 0
     while pending:
         node, allowed = pending.pop()
         visited += 1
         if visited > 4096:
-            return {"ready": False, "reason": "document_too_large"}
+            raise ValueError("document_too_large")
         if node.node_name == "IFRAME":
             allowed = _cloudflare_frame(node)
+            if allowed and not node.content_document and node.frame_id:
+                frames.append(node.frame_id)
+                if len(frames) > 4:
+                    raise ValueError("ambiguous_controls")
         attrs = dict(zip((node.attributes or [])[::2], (node.attributes or [])[1::2]))
         if allowed and ((node.node_name == "INPUT" and attrs.get("type", "").lower() == "checkbox")
                         or attrs.get("role") == "checkbox"):
             candidates.append(node.backend_node_id)
             if len(candidates) > 8:
-                return {"ready": False, "reason": "ambiguous_controls"}
+                raise ValueError("ambiguous_controls")
         for child in (node.children or []) + (node.shadow_roots or []):
             pending.append((child, allowed))
         if node.content_document:
             pending.append((node.content_document, allowed))
+    return candidates, frames
+
+
+async def _frame_checkbox_targets(tab, frame_id, width, height):
+    targets = []
+    async with _provider_session(tab, frame_id) as (child, owner):
+        document = await _send(child, cdp.dom.get_document(depth=-1, pierce=True))
+        candidates, _ = _checkbox_nodes(document, True)
+        owner_model = await _send(tab, cdp.dom.get_box_model(backend_node_id=owner))
+        quad = owner_model.content
+        for backend in candidates:
+            remote, visible = None, None
+            try:
+                remote = await _send(child, cdp.dom.resolve_node(backend_node_id=backend))
+                visible, exception = await _send(child, cdp.runtime.call_function_on(
+                    VISIBLE_CONTROL_FUNCTION, object_id=remote.object_id, return_by_value=False))
+                if exception or not visible or not visible.object_id:
+                    continue
+                point = await _on_node(child, visible.object_id, LOCAL_POINT_FUNCTION)
+                if (not isinstance(point, dict) or not all(type(point.get(key)) in (int, float)
+                        and math.isfinite(point[key]) for key in ("x", "y", "width", "height"))
+                        or not (0 < point["x"] < point["width"] and 0 < point["y"] < point["height"])):
+                    continue
+                # JS rectangles are explicitly child-viewport coordinates.
+                # Map through the owner's content quad; do not guess whether a
+                # cross-process DOM.getBoxModel is local or main-page relative.
+                u, v = point["x"] / point["width"], point["y"] / point["height"]
+                x = (1-u)*(1-v)*quad[0] + u*(1-v)*quad[2] + u*v*quad[4] + (1-u)*v*quad[6]
+                y = (1-u)*(1-v)*quad[1] + u*(1-v)*quad[3] + u*v*quad[5] + (1-u)*v*quad[7]
+                if not (0 < x < width and 0 < y < height):
+                    continue
+                hit_backend, hit_frame, _ = await _send(tab, cdp.dom.get_node_for_location(
+                    x=round(x), y=round(y), include_user_agent_shadow_dom=True,
+                    ignore_pointer_events_none=False))
+                if hit_backend != owner and hit_frame != frame_id:
+                    continue
+                targets.append({"ready":True, "backend":backend, "frame_id":frame_id,
+                    "target":"checkbox", "x":x, "y":y, "score":None, "source":"frame_dom"})
+            finally:
+                for ref in (visible, remote):
+                    if ref and ref.object_id:
+                        with suppress(Exception):
+                            await _send(child, cdp.runtime.release_object(ref.object_id))
+    return targets
+
+
+async def semantic_checkbox_target(tab, width, height) -> dict:
+    """Find a real control in closed shadow DOM without relying on its appearance."""
+    main_allowed = await interstitial_context(tab)
+    document = await _send(tab, cdp.dom.get_document(depth=-1, pierce=True))
+    try:
+        candidates, frames = _checkbox_nodes(document, main_allowed)
+    except ValueError as exc:
+        return {"ready":False, "reason":str(exc)}
     targets = []
     for backend in candidates:
         remote, visible = None, None
@@ -272,6 +373,9 @@ async def semantic_checkbox_target(tab, width, height) -> dict:
                 if ref and ref.object_id:
                     with suppress(Exception):
                         await _send(tab, cdp.runtime.release_object(ref.object_id))
+    for frame_id in frames:
+        with suppress(Exception):
+            targets.extend(await _frame_checkbox_targets(tab, frame_id, width, height))
     if len(targets) == 1:
         return targets[0]
     return {"ready": False, "reason": "ambiguous_controls" if targets else "no_semantic_control"}
@@ -310,45 +414,57 @@ ARM_FUNCTION = """function () {
     const el = hit?.matches('input[type="checkbox"], [role="checkbox"]') ? hit :
         hit?.closest('label')?.control || hit?.closest('[role="checkbox"]');
     if (!el?.matches('input[type="checkbox"], [role="checkbox"]') || !el.isConnected) return false;
-    const win = el.ownerDocument.defaultView;
+    // Outside a closed shadow root, composedPath() hides its internal control.
+    // Observe inside the same root rather than reporting a real click as absent.
+    const scope = el.getRootNode();
+    const labels = [...(el.labels || [])].filter(label => label.control === el);
     const receipt = {pressed: false, released: false, clicked: false};
     const listeners = ['pointerdown', 'pointerup', 'click'].map(type => {
         const handler = event => {
             const path = event.composedPath();
-            if (event.isTrusted && (path.includes(el) || path.includes(el.closest('label')))) {
+            if (event.isTrusted && (path.includes(el) || labels.some(label => path.includes(label)))) {
                 receipt[{pointerdown: 'pressed', pointerup: 'released', click: 'clicked'}[type]] = true;
             }
         };
-        win.addEventListener(type, handler, true);
+        scope.addEventListener(type, handler, true);
         return [type, handler];
     });
-    this.__autoCfReceipt = {win, receipt, listeners};
+    this.__autoCfReceipt = {scope, receipt, listeners};
     return true;
 }"""
 
 READ_FUNCTION = """function () { return this.__autoCfReceipt?.receipt || null; }"""
 CLEAN_FUNCTION = """function () {
     const state = this.__autoCfReceipt;
-    for (const [type, handler] of state?.listeners || []) state.win.removeEventListener(type, handler, true);
+    for (const [type, handler] of state?.listeners || []) state.scope.removeEventListener(type, handler, true);
     delete this.__autoCfReceipt;
 }"""
 
 
 def _same_target(first, second) -> bool:
-    return second.get("ready") is True and first.get("backend") == second.get("backend") and all(
+    return (second.get("ready") is True and first.get("backend") == second.get("backend")
+            and first.get("frame_id") == second.get("frame_id") and all(
         abs(first[key] - second[key]) <= 1 for key in ("x", "y")
-    )
+    ))
 
 
 async def _click_target(tab, target) -> None:
+    async with AsyncExitStack() as stack:
+        observer = tab
+        if target.get("frame_id"):
+            observer, _ = await stack.enter_async_context(_provider_session(tab, target["frame_id"]))
+        await _send_checkbox_input(tab, observer, target)
+
+
+async def _send_checkbox_input(tab, observer, target) -> None:
     remote = None
     observable = False
     flags = {key: None for key in ("pressed", "released", "clicked")}
     try:
         if target["target"] == "checkbox":
             with suppress(Exception):
-                remote = await _send(tab, cdp.dom.resolve_node(backend_node_id=target["backend"]))
-                observable = await _on_node(tab, remote.object_id, ARM_FUNCTION) is True
+                remote = await _send(observer, cdp.dom.resolve_node(backend_node_id=target["backend"]))
+                observable = await _on_node(observer, remote.object_id, ARM_FUNCTION) is True
         try:
             await _send(tab, cdp.input_.dispatch_mouse_event(
                 "mousePressed", x=target["x"], y=target["y"],
@@ -361,7 +477,7 @@ async def _click_target(tab, target) -> None:
             ))
         if observable:
             with suppress(Exception):
-                receipt = await _on_node(tab, remote.object_id, READ_FUNCTION)
+                receipt = await _on_node(observer, remote.object_id, READ_FUNCTION)
                 if isinstance(receipt, dict):
                     flags = {key: receipt.get(key) is True for key in flags}
         print("  → Cloudflare mouse input: " + json.dumps({
@@ -372,9 +488,9 @@ async def _click_target(tab, target) -> None:
     finally:
         if remote:
             with suppress(Exception):
-                await _on_node(tab, remote.object_id, CLEAN_FUNCTION)
+                await _on_node(observer, remote.object_id, CLEAN_FUNCTION)
             with suppress(Exception):
-                await _send(tab, cdp.runtime.release_object(remote.object_id))
+                await _send(observer, cdp.runtime.release_object(remote.object_id))
 
 
 async def click_cloudflare_checkbox(tab, evaluate, cleared) -> str:

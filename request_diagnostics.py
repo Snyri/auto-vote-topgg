@@ -60,15 +60,18 @@ class RequestDiagnostics:
         self.vote_network = VoteNetworkState()
         self.document_request = None
         self.document_challenged = False
+        self.main_frame = None
         self.handlers = [(cdp.network.RequestWillBeSent, self.on_request),
                          (cdp.network.ResponseReceived, self.on_response),
                          (cdp.network.ResponseReceivedExtraInfo, self.on_extra),
                          (cdp.network.LoadingFinished, self.on_finished),
-                         (cdp.network.LoadingFailed, self.on_failed)]
+                         (cdp.network.LoadingFailed, self.on_failed),
+                         (cdp.page.FrameNavigated, self.on_navigated)]
 
     async def start(self):
         try:
             for event, callback in self.handlers: self.tab.add_handler(event, callback)
+            await asyncio.wait_for(self.tab.send(cdp.page.enable()), timeout=2)
             await asyncio.wait_for(self.tab.send(cdp.network.enable(
                 max_total_buffer_size=2 * 1024 * 1024, max_resource_buffer_size=256 * 1024,
                 max_post_data_size=graphql_vote.MAX_PAYLOAD,
@@ -77,6 +80,12 @@ class RequestDiagnostics:
         except Exception:
             self.stop()
             print("  Network diagnostics unavailable")
+
+    async def on_navigated(self, event):
+        frame = event.frame
+        if getattr(frame, "parent_id", None) is None:
+            self.main_frame = frame.id_
+            self.vote_network.select_document(str(frame.loader_id))
 
     def stop(self):
         for event, callback in self.handlers:
@@ -107,6 +116,7 @@ class RequestDiagnostics:
             "api_route": safe_api_route(event.request.url),
         }
         if (resource == "Document" and self.requests[event.request_id]["request_kind"] == "topgg_page"
+                and (self.main_frame is None or getattr(event, "frame_id", None) == self.main_frame)
                 and self.vote_network.bot_id is not None
                 and bot_vote_page(event.request.url, self.vote_network.bot_id)):
             self.document_request = event.request_id
@@ -116,7 +126,7 @@ class RequestDiagnostics:
         if info["graphql"]:
             print("  GraphQL request diagnostic: " + json.dumps({
                 "phase": self.phase, "vote_operation": info["operation"],
-                **{key: info[key] for key in ("graphql_kind", "graphql_target", "graphql_shape")},
+                **{key: info[key] for key in ("graphql_kind", "graphql_target", "graphql_shape", "graphql_gate")},
                 "payload_available": isinstance(getattr(event.request, "post_data", None), str),
             }, sort_keys=True))
         while len(self.requests) > MAX_REQUESTS:
@@ -131,7 +141,7 @@ class RequestDiagnostics:
         status = int(status)
         safe = safe_headers(headers)
         if request_id == self.document_request:
-            self.document_challenged = safe["cloudflare_challenge"] is True and safe["content_kind"] == "html"
+            self.document_challenged |= safe["cloudflare_challenge"] is True and safe["content_kind"] == "html"
         self.vote_network.response(info["vote_network"], status, safe)
         relevant_write = info["phase"] in {"vote_input", "vote_confirmation"} and info["request_kind"] == "topgg_api" and info["method"] in {"POST", "PUT", "PATCH", "DELETE"}
         if status < 400 and not relevant_write: return
@@ -142,7 +152,7 @@ class RequestDiagnostics:
             **{key: info[key] for key in ("request_kind", "resource_type", "method", "phase")}, "status": status, **safe,
             "vote_operation": info["vote_network"]["operation"],
             "api_route": info["api_route"],
-            **({key: info["vote_network"][key] for key in ("graphql_kind", "graphql_target", "graphql_shape")}
+            **({key: info["vote_network"][key] for key in ("graphql_kind", "graphql_target", "graphql_shape", "graphql_gate")}
                if info["vote_network"]["graphql"] else {}),
         }, sort_keys=True))
 
@@ -165,7 +175,7 @@ class RequestDiagnostics:
                 if request_id in self.vote_network.candidates:
                     self.vote_network.incomplete = True
             network = info["vote_network"]
-            if (not failed and network["graphql"] and network["operation"] != "unrelated"
+            if (not failed and network["graphql"]
                     and network["json_response"] and not network["readiness_invalid"]):
                 outcome = "unavailable"
                 try:
@@ -174,7 +184,8 @@ class RequestDiagnostics:
                     if isinstance(body, str) and len(body) <= graphql_vote.MAX_RESPONSE * 4 // 3 + 4:
                         if encoded:
                             body = base64.b64decode(body, validate=True).decode("utf-8")
-                        outcome = graphql_vote.inspect_response(body, network["response_key"], network["operation"])
+                        inspected_operation = "vote_submission" if network["application_submission"] else network["operation"]
+                        outcome = graphql_vote.inspect_response(body, network["response_key"], inspected_operation)
                 except Exception:
                     pass
                 self.vote_network.response_body(network, outcome)

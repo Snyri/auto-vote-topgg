@@ -150,7 +150,7 @@ async def main():
         browser = await vote.start_browser()
         tab = next(iter(browser))
         await vote.inject_topgg_cookies(browser, cookies)
-        await asyncio.wait_for(tab.get(f"https://top.gg/bot/{bot_id}/vote"), timeout=30)
+        await asyncio.wait_for(vote.navigate_page(tab, f"https://top.gg/bot/{bot_id}/vote"), timeout=30)
         for observation, delay in enumerate((3, 10, 20), 1):
             await asyncio.sleep(delay)
             try:

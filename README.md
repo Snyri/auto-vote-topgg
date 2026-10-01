@@ -189,6 +189,8 @@ Only a trusted Vote press followed by completed Cloudflare denials for every
 tracked same-site write permits another submission. Parsed read-only GraphQL
 queries do not veto that rejection; unknown writes still do.
 
+A failed HTTP response to a targeted vote mutation also vetoes an optimistic UI acknowledgement. It does not prove that resubmission is safe.
+
 A GraphQL HTTP 200 is inspected for protocol errors and CAPTCHA/authentication
 outcomes, including typed results. It never establishes a successful vote by
 itself. API readiness needs a fresh completed JSON state response with usable
@@ -196,8 +198,23 @@ data and no errors; page acknowledgement or persisted cooldown still establishes
 the actual outcome. Public diagnostics contain only fixed categories, never
 query text, variables, aliases, tokens or response messages.
 
+The response inspector also observes an unrecognized root field. A single
+mutation explicitly targeting the current bot can veto an optimistic acknowledgement
+on an application error, but remains an unknown write for resubmission. An
+identified vote takes precedence over ancillary mutation errors. Diagnostics
+include `graphql_gate` to distinguish missing/oversized payloads, unsupported
+documents, unrecognized fields and unresolved targets. The allowlist is not proof
+that the live Top.gg schema is covered; inspect these categories on actual runs.
+
+Navigation uses `Page.navigate` on the existing CDP session. In nodriver 0.50.3,
+`Tab.get()` attaches a new session, breaking the relationship between enabled
+Network observers and subsequent response-body reads. `Page.enable` activates
+main-document navigation events. A committed main document gets a new readiness
+context; subframes and late responses from the earlier document cannot change it.
+
 Checkbox targeting first searches real enabled controls in provider-owned frames
-and closed shadow DOM, checks viewport geometry and hit testing, then reacquires
+and closed shadow DOM, attaches a separate short-lived CDP session for a provider
+iframe in another process, checks viewport geometry and hit testing, then reacquires
 the stable target after hover. Its appearance need not match an old screenshot.
 The conservative image matcher remains a fallback for opaque frames. No checkbox
 means no checkbox input; managed verification can clear without a click. A
@@ -245,9 +262,12 @@ and credentials are never retained or printed; bounded RPC input is inspected
 only for explicit bot identifiers.
 
 Cloudflare challenges on recognized vote/state operations cause a short
-pre-click wait. Elapsed time never clears a denial: a fresh, completed JSON
-vote-state response must establish recovery, without a redirect, transport
-failure or conflicting status. A new bot/browser starts a separate context.
+pre-click wait. Elapsed time never clears a denial on the same document: a fresh,
+completed JSON vote-state response must establish recovery, without a redirect,
+transport failure or conflicting status. A new committed document, bot or browser
+starts a separate context. If the app does not repeat its denied read, preflight
+can reopen the ordinary vote page once before any input and check its prerequisites
+again. A fresh denial still blocks the click; no API URL is opened as a page.
 The check runs during control preparation, after hover and immediately before
 the native mouse press, so a denial arriving after page preflight still prevents
 input. Recovery during hover restarts the control checks; a persistent challenge
@@ -290,7 +310,7 @@ DEBUG=1 python vote.py
 
 Non-CAPTCHA error screenshots remain disabled unless `SEND_ERROR_SCREENSHOTS=1` is set, except final top.gg authentication failures which are captured automatically on the last retry.
 
-A Vote click alone is not success. The browser first looks for a **new acknowledgement on the current bot page**: strong success/cooldown text absent before the click, observed in two consecutive checks, with no enabled Vote button, active challenge, login requirement, or explicit error. This records application acknowledgement without a navigation that could trigger Cloudflare. It does not claim an independently queried server receipt. A pre-existing phrase or a still-enabled Vote button cannot confirm the vote.
+A Vote click alone is not success. The browser first looks for a **new acknowledgement on the current bot page**: strong success/cooldown text absent before the click, observed in two consecutive checks, with no enabled Vote button, active challenge, login requirement, or explicit error. A retained widget with a response is not by itself an active challenge; visible challenge gates and challenge text still veto acknowledgement. This records application acknowledgement without a navigation that could trigger Cloudflare. It does not claim an independently queried server receipt. A pre-existing phrase or a still-enabled Vote button cannot confirm the vote.
 
 If no such acknowledgement appears, the existing independent page-reload check remains a fallback. A post-click result that cannot be confirmed retains `vote_submitted` and its original outcome. It is not clicked again during that run. An unconfirmed submission still fails the workflow and therefore starts a fresh run under the unlimited recovery policy; the new run checks the page for cooldown before attempting another vote. Other bots can still retry within the current run. Unconfirmed outcomes remain failures, rather than being silently turned green; normal scheduled/manual runs are not deduplicated across runs by this in-memory flag.
 

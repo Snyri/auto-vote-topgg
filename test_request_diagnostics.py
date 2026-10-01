@@ -98,20 +98,20 @@ class NetworkDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handlers_and_phase_are_scoped_to_one_browser_session(self):
         await self.tracker.start()
-        self.assertEqual(self.tab.add_handler.call_count, 5)
+        self.assertEqual(self.tab.add_handler.call_count, 6)
         set_phase(self.tab, "vote_input")
         self.assertEqual(self.tracker.phase, "vote_input")
         set_phase(self.tab, "SECRET")
         self.assertEqual(self.tracker.phase, "vote_input")
         self.tracker.stop()
-        self.assertEqual(self.tab.remove_handler.call_count, 5)
+        self.assertEqual(self.tab.remove_handler.call_count, 6)
         self.assertIsNone(self.tab._topgg_diagnostics)
 
     async def test_diagnostic_failure_does_not_fail_a_vote_or_leave_handlers(self):
         self.tab.send.side_effect = TimeoutError
         with patch("builtins.print"):
             await self.tracker.start()
-        self.assertEqual(self.tab.remove_handler.call_count, 5)
+        self.assertEqual(self.tab.remove_handler.call_count, 6)
 
     async def test_graphql_response_body_is_inspected_without_retaining_or_printing_secrets(self):
         self.tracker.vote_network.select_bot("111")
@@ -146,4 +146,68 @@ class NetworkDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                     request=NS(url="https://top.gg/api/graphql", method="POST", post_data=query)))
                 await self.tracker.on_response(NS(request_id=request_id, response=NS(status=status, headers=headers)))
                 await self.tracker.on_finished(NS(request_id=request_id))
+        self.assertTrue(state.protection_pending())
+
+    async def test_unknown_mutation_errors_are_observed_but_never_enable_resubmission(self):
+        state = self.tracker.vote_network
+        state.select_bot("111")
+        state.begin_input()
+        state.receipt({"pressed": True, "released": True, "clicked": True, "pressed_at": 100})
+        self.tab.send.return_value = ('{"data":{"PRIVATE_ROOT":false}}', False)
+        with patch("builtins.print") as log:
+            await self.tracker.on_request(NS(request_id="unknown", wall_time=101,
+                document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                request=NS(url="https://top.gg/api/graphql", method="POST",
+                    post_data=graphql_payload('mutation Cast { PRIVATE_ROOT(botId:"111") }'))))
+            await self.tracker.on_response(NS(request_id="unknown", response=NS(status=200,
+                headers={"content-type":"application/json"})))
+            await self.tracker.on_finished(NS(request_id="unknown"))
+        self.assertEqual(state.submission_outcome(), "error")
+        self.assertFalse(state.definitely_rejected())
+        self.assertNotIn("PRIVATE", repr(log.call_args_list))
+
+    async def test_http_failure_of_targeted_mutation_is_not_a_healthy_acknowledgement(self):
+        for field in ("castVote", "submitEntityBallot"):
+            for status in (401, 403, 500):
+                with self.subTest(field=field, status=status):
+                    state = self.tracker.vote_network
+                    state.select_bot("111")
+                    state.begin_input()
+                    state.receipt({"pressed":True,"released":True,"clicked":True,"pressed_at":100})
+                    with patch("builtins.print"):
+                        await self.tracker.on_request(NS(request_id="http-error", wall_time=101,
+                            document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                            request=NS(url="https://top.gg/api/graphql", method="POST",
+                                post_data=graphql_payload('mutation Cast { '+field+'(botId:"111") { ok } }'))))
+                        await self.tracker.on_response(NS(request_id="http-error", response=NS(status=status,
+                            headers={"content-type":"application/json"})))
+                        await self.tracker.on_finished(NS(request_id="http-error"))
+                    self.assertEqual(state.submission_outcome(), "error")
+                    self.assertFalse(state.definitely_rejected())
+
+    async def test_committed_main_document_clears_old_gates_and_late_responses_cannot_restore_them(self):
+        state = self.tracker.vote_network
+        state.select_bot("111")
+        await self.tracker.on_navigated(NS(frame=NS(id_="main", loader_id="old", parent_id=None)))
+        raw = graphql_payload('query Cast { canVote(botId:"111") }')
+        with patch("builtins.print"):
+            await self.tracker.on_request(NS(request_id="old", loader_id="old", wall_time=100,
+                document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                request=NS(url="https://top.gg/api/graphql", method="POST", post_data=raw)))
+            await self.tracker.on_response(NS(request_id="old", response=NS(status=403,
+                headers={"cf-mitigated":"challenge", "content-type":"text/html"})))
+            self.assertTrue(state.protection_pending())
+            await self.tracker.on_navigated(NS(frame=NS(id_="child", loader_id="child", parent_id="main")))
+            self.assertTrue(state.protection_pending())
+            await self.tracker.on_navigated(NS(frame=NS(id_="main", loader_id="new", parent_id=None)))
+            self.assertFalse(state.protection_pending())
+            await self.tracker.on_finished(NS(request_id="old"))
+            await self.tracker.on_extra(NS(request_id="old", status_code=403,
+                headers={"cf-mitigated":"challenge", "content-type":"text/html"}))
+            self.assertFalse(state.protection_pending())
+            await self.tracker.on_request(NS(request_id="new", loader_id="new", wall_time=101,
+                document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                request=NS(url="https://top.gg/api/graphql", method="POST", post_data=raw)))
+            await self.tracker.on_response(NS(request_id="new", response=NS(status=403,
+                headers={"cf-mitigated":"challenge", "content-type":"text/html"})))
         self.assertTrue(state.protection_pending())
