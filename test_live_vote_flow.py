@@ -229,26 +229,6 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
             frame.style.transform = 'scale(0.75)';
             frame.style.transformOrigin = 'top left';
         })()""")
-        document = await self.tab.send(uc.cdp.dom.get_document(depth=-1, pierce=True))
-        _, frames = cloudflare_click._checkbox_nodes(document, False)
-        viewport = await vote.evaluate(self.tab, "({width:innerWidth,height:innerHeight})")
-        for frame_id in frames:
-            try:
-                print('Fixture child targets:', await cloudflare_click._frame_checkbox_targets(
-                    self.tab, frame_id, viewport['width'], viewport['height']))
-                async with cloudflare_click._provider_session(self.tab, frame_id) as (child, owner):
-                    doc = await child.send(uc.cdp.dom.get_document(depth=-1,pierce=True))
-                    candidates, _ = cloudflare_click._checkbox_nodes(doc, True)
-                    box = await self.tab.send(uc.cdp.dom.get_box_model(backend_node_id=owner))
-                    print('Fixture owner quad:',box.content, 'candidates:',candidates)
-                    for backend in candidates:
-                        remote = await child.send(uc.cdp.dom.resolve_node(backend_node_id=backend))
-                        point = await cloudflare_click._on_node(child,remote.object_id,cloudflare_click.LOCAL_POINT_FUNCTION)
-                        print('Fixture local point:',point)
-                        print('Fixture raw rectangle:',await cloudflare_click._on_node(child,remote.object_id,
-                            'function(){ const r=this.getBoundingClientRect(); return {x:r.x,y:r.y,width:r.width,height:r.height,root:this.getRootNode().nodeName,hit:this.getRootNode().elementFromPoint(r.x+r.width/2,r.y+r.height/2)?.nodeName}; }'))
-            except Exception as exc:
-                print('Fixture child observation:',type(exc).__name__,str(exc))
         with (patch.object(cloudflare_click, "match_checkbox", side_effect=AssertionError("semantic target required")),
               patch("builtins.print") as output):
             result = await cloudflare_click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))

@@ -213,7 +213,8 @@ main-document navigation events. A committed main document gets a new readiness
 context; subframes and late responses from the earlier document cannot change it.
 
 Checkbox targeting first searches real enabled controls in provider-owned frames
-and closed shadow DOM, attaches a separate short-lived CDP session for a provider iframe in another process, checks viewport geometry and hit testing, then reacquires
+and closed shadow DOM, attaches a separate short-lived CDP session for a provider
+iframe in another process, checks viewport geometry and hit testing, then reacquires
 the stable target after hover. Its appearance need not match an old screenshot.
 The conservative image matcher remains a fallback for opaque frames. No checkbox
 means no checkbox input; managed verification can clear without a click. A
