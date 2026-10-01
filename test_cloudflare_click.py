@@ -229,9 +229,13 @@ class CheckboxBrowserTests(unittest.IsolatedAsyncioTestCase):
             Verify you are human</label>
             <script>window.received=[]; checkbox.addEventListener('click', e=>received.push(e.isTrusted));</script>''')
         with patch.object(click, "match_checkbox", side_effect=AssertionError("image matching must not run")):
-            result = await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
+            with patch("builtins.print") as output:
+                result = await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
         self.assertEqual(result, "sent")
         self.assertEqual(await vote.evaluate(self.tab, "window.received"), [True])
+        receipt = next(json.loads(c.args[0].split(": ", 1)[1])["trusted_events"]
+                       for c in output.call_args_list if "Cloudflare mouse input:" in c.args[0])
+        self.assertTrue(all(receipt.values()))
 
     async def test_closed_shadow_checkbox_is_found_without_an_image_template(self):
         await self.load('<!doctype html><title>Just a moment...</title><div id="host"></div>')
@@ -241,9 +245,13 @@ class CheckboxBrowserTests(unittest.IsolatedAsyncioTestCase):
             window.received=[]; root.querySelector('input').addEventListener('click',e=>received.push(e.isTrusted));
         })()''')
         with patch.object(click, "match_checkbox", side_effect=AssertionError("image matching must not run")):
-            result = await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
+            with patch("builtins.print") as output:
+                result = await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
         self.assertEqual(result, "sent")
         self.assertEqual(await vote.evaluate(self.tab, "window.received"), [True])
+        receipt = next(json.loads(c.args[0].split(": ", 1)[1])["trusted_events"]
+                       for c in output.call_args_list if "Cloudflare mouse input:" in c.args[0])
+        self.assertTrue(all(receipt.values()))
 
     async def test_regular_page_checkbox_does_not_become_a_challenge_target(self):
         await self.load('<!doctype html><title>Voting for AniGame</title>' + self.widget)
