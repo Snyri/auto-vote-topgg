@@ -1483,7 +1483,7 @@ class PrivacyOverlayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await vote._click_marked(tab, "data-login"))
         dismiss.assert_awaited_once_with(tab)
-        click.assert_awaited_once_with(tab, vote.evaluate, '[data-login="1"]', kind="login")
+        click.assert_awaited_once_with(tab, vote.evaluate, '[data-login="1"]', kind="login", reacquire=None)
 
     @patch("builtins.print")
     @patch("vote.send_telegram_photo", return_value=True)

@@ -111,6 +111,47 @@ class SchedulerValidationTests(unittest.TestCase):
 
 
 class ScheduleRefreshTests(unittest.TestCase):
+    def test_newer_failed_action_without_schedule_supersedes_the_old_timer_once(self):
+        with (
+            patch.object(scheduler, "latest_vote_run", return_value={"id":215,"status":"completed","conclusion":"failure"}),
+            patch.object(scheduler, "schedule_from_completed_run", return_value=None),
+            patch.object(scheduler.time, "time", return_value=2_000_000_000), patch.object(scheduler, "log"),
+        ):
+            self.assertEqual(scheduler.latest_schedule_target(minimum_run_id=214),
+                             (215, 2_000_000_000 + scheduler.ERROR_RETRY_SECONDS))
+            self.assertIsNone(scheduler.latest_schedule_target(minimum_run_id=215))
+
+    def test_artifactless_failure_refresh_cannot_slide_the_retry_ahead_forever(self):
+        clock = [2_000_000_000]
+        with (
+            patch.object(scheduler, "latest_vote_run", return_value={"id":215,"status":"completed","conclusion":"failure"}),
+            patch.object(scheduler, "schedule_from_completed_run", return_value=None),
+            patch.object(scheduler.time, "time", side_effect=lambda: clock[0]),
+            patch.object(scheduler.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(scheduler.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0,clock[0]+seconds)),
+            patch.object(scheduler, "log"),
+        ):
+            self.assertEqual(scheduler.wait_until(clock[0]+43200,source_run_id=214),
+                             (215,2_000_000_000+scheduler.ERROR_RETRY_SECONDS))
+        self.assertEqual(clock[0],2_000_000_000+scheduler.ERROR_RETRY_SECONDS)
+
+    def test_missing_schedule_does_not_replace_a_success_or_an_active_retry(self):
+        for run in ({"id":215,"status":"completed","conclusion":"success"},
+                    {"id":215,"status":"in_progress","conclusion":None}):
+            with (
+                self.subTest(run=run),
+                patch.object(scheduler,"latest_vote_run",return_value=run),
+                patch.object(scheduler,"schedule_from_completed_run",return_value=None),
+            ):
+                self.assertIsNone(scheduler.latest_schedule_target(minimum_run_id=214))
+
+    def test_failed_run_with_schedule_keeps_its_confirmed_cooldown(self):
+        with (
+            patch.object(scheduler,"latest_vote_run",return_value={"id":215,"status":"completed","conclusion":"failure"}),
+            patch.object(scheduler,"schedule_from_completed_run",return_value=(215,2_000_043_200)),
+        ):
+            self.assertEqual(scheduler.latest_schedule_target(minimum_run_id=214),(215,2_000_043_200))
+
     @patch.object(scheduler.time, "sleep")
     @patch.object(scheduler, "latest_schedule_target")
     def test_wait_until_refreshes_after_newer_manual_run(self, latest_target, sleep):
