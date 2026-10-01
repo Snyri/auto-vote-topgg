@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir --no-deps \
         certifi==2026.7.22 \
         charset-normalizer==3.4.9 \
         idna==3.18 \
-        urllib3==2.7.0 \
+        urllib3==2.8.0 \
         requests==2.34.2 \
     && python -m pip check \
     && addgroup -S app \
