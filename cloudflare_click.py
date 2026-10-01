@@ -83,19 +83,29 @@ async def _provider_session(tab, frame_id):
     """An OOPIF has its own CDP session; never reattach the observed main tab."""
     owner, _ = await _send(tab, cdp.dom.get_frame_owner(frame_id))
     node = await _send(tab, cdp.dom.describe_node(backend_node_id=owner, depth=0))
-    info = await _send(tab, cdp.target.get_target_info(cdp.target.TargetID(str(frame_id))))
-    origin = urlparse(info.url)
-    if (not _cloudflare_frame(node) or info.type_ != "iframe"
-            or str(info.target_id) != str(frame_id)
-            or origin.scheme != "https" or origin.hostname != "challenges.cloudflare.com"):
+    if not _cloudflare_frame(node):
         raise RuntimeError("Provider frame unavailable")
-    connection = Connection(target=info, parent=tab, auto_attach=False)
-    try:
-        await asyncio.wait_for(connection.attach(), timeout=2)
-        yield connection, owner
-    finally:
-        with suppress(Exception):
-            await asyncio.wait_for(connection.aclose(), timeout=2)
+    infos = await _send(tab, cdp.target.get_targets())
+    providers = [info for info in infos if info.type_ == "iframe"
+        and urlparse(info.url).scheme == "https"
+        and urlparse(info.url).hostname == "challenges.cloudflare.com"]
+    if len(providers) > 4:
+        raise RuntimeError("Ambiguous provider frames")
+    for info in providers:
+        connection = Connection(target=info, parent=tab, auto_attach=False)
+        try:
+            await asyncio.wait_for(connection.attach(), timeout=2)
+            tree = await _send(connection, cdp.page.get_frame_tree())
+            # Frame IDs and DevTools Target IDs are different identifiers.
+            # Match the actual root frame exposed by the attached session.
+            if tree.frame.id_ != frame_id:
+                continue
+            yield connection, owner
+            return
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(connection.aclose(), timeout=2)
+    raise RuntimeError("Provider frame unavailable")
 
 
 async def interstitial_context(tab) -> bool:
