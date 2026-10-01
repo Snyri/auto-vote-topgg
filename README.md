@@ -48,7 +48,7 @@ TOPGG_COOKIES_JSON (same line order as TOKENS)
     └── protection block → up to five browser attempts, then a fresh workflow run
 top.gg authenticated
     ↓ navigate to vote page → wait ad → verified Cloudflare checkbox interaction
-    ├── library verification click → observe response/page state; target and acceptance are not guaranteed
+    ├── verified native checkbox input → observe response/page state; input alone is not clearance
     ├── unresolved CAPTCHA → captcha_required (no retry this run)
     ├── cooldown text → bounded timestamp → scheduler waits until that timestamp
     └── verified → click Vote → confirm success/cooldown
@@ -178,6 +178,37 @@ local HTML fixtures using Chrome, without contacting top.gg; set `CHROME_BIN` if
 Chrome is not on `PATH`.
 
 ### Cloudflare 403 diagnosis
+
+The live vote flow also uses `/api/graphql`. Bounded request inspection identifies
+single vote mutations and vote-state queries from their actual root fields and
+linked arguments. Discord bot IDs and Top.gg's internal entity IDs are kept
+distinct; another entity cannot clear the current entity's denial. Aliases,
+variable defaults and nested output fragments are supported. Mixed mutations,
+unresolved persisted queries and unsupported root fragments remain conservative.
+Only a trusted Vote press followed by completed Cloudflare denials for every
+tracked same-site write permits another submission. Parsed read-only GraphQL
+queries do not veto that rejection; unknown writes still do.
+
+A GraphQL HTTP 200 is inspected for protocol errors and CAPTCHA/authentication
+outcomes, including typed results. It never establishes a successful vote by
+itself. API readiness needs a fresh completed JSON state response with usable
+data and no errors; page acknowledgement or persisted cooldown still establishes
+the actual outcome. Public diagnostics contain only fixed categories, never
+query text, variables, aliases, tokens or response messages.
+
+Checkbox targeting first searches real enabled controls in provider-owned frames
+and closed shadow DOM, checks viewport geometry and hit testing, then reacquires
+the stable target after hover. Its appearance need not match an old screenshot.
+The conservative image matcher remains a fallback for opaque frames. No checkbox
+means no checkbox input; managed verification can clear without a click. A
+provider-marked current document also identifies localized interstitials.
+
+The second cookie-session check is passive: it observes late page progress without
+repeating the same challenge interaction or session-fetch recovery on that page.
+Five account attempts and immediate unlimited fresh-workflow retries remain in
+place. Actions also publish an aggregate outcome summary when Telegram is absent.
+The `Check recorded vote result` job checks the script's exit status and does not
+make an independent request to Top.gg.
 
 Verification disappearance is accepted only on a ready document across two
 observations. An empty document during navigation cannot clear a challenge or

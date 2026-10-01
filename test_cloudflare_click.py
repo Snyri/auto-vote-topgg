@@ -222,6 +222,35 @@ class CheckboxBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["trusted_events"], {"pressed": True, "released": True, "clicked": True})
         self.assertTrue(await vote.evaluate(self.tab, "checkbox.__autoCfReceipt === undefined"))
 
+    async def test_restyled_checkbox_is_found_without_an_image_template(self):
+        await self.load('''<!doctype html><title>Just a moment...</title>
+            <label style="display:block;margin:80px;width:200px;height:40px">
+            <input type="checkbox" id="checkbox" style="width:30px;height:30px;accent-color:purple">
+            Verify you are human</label>
+            <script>window.received=[]; checkbox.addEventListener('click', e=>received.push(e.isTrusted));</script>''')
+        with patch.object(click, "match_checkbox", side_effect=AssertionError("image matching must not run")):
+            result = await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
+        self.assertEqual(result, "sent")
+        self.assertEqual(await vote.evaluate(self.tab, "window.received"), [True])
+
+    async def test_closed_shadow_checkbox_is_found_without_an_image_template(self):
+        await self.load('<!doctype html><title>Just a moment...</title><div id="host"></div>')
+        await vote.evaluate(self.tab, '''(() => {
+            const root=host.attachShadow({mode:'closed'});
+            root.innerHTML='<input type="checkbox" style="margin:100px;width:30px;height:30px">';
+            window.received=[]; root.querySelector('input').addEventListener('click',e=>received.push(e.isTrusted));
+        })()''')
+        with patch.object(click, "match_checkbox", side_effect=AssertionError("image matching must not run")):
+            result = await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
+        self.assertEqual(result, "sent")
+        self.assertEqual(await vote.evaluate(self.tab, "window.received"), [True])
+
+    async def test_regular_page_checkbox_does_not_become_a_challenge_target(self):
+        await self.load('<!doctype html><title>Voting for AniGame</title>' + self.widget)
+        target = await click.checkbox_target(self.tab, vote.evaluate)
+        self.assertFalse(target["ready"])
+        self.assertEqual(await vote.evaluate(self.tab, "window.received"), [])
+
     async def test_closed_shadow_iframe_receives_the_checkbox_click(self):
         # srcdoc keeps this fixture entirely local. The src attribute models a
         # Cloudflare frame owner, including a closed shadow root and frame offset.
@@ -236,8 +265,19 @@ class CheckboxBrowserTests(unittest.IsolatedAsyncioTestCase):
             const shadow = host.attachShadow({mode:'closed'}); shadow.append(frame);
         })""".replace("__WIDGET__", json.dumps(self.widget)))
         await vote.evaluate(self.tab, "fixtureFrame.contentDocument.images[0].decode()")
+        self.assertTrue((await click.widget_state(self.tab))["present"])
         self.assertEqual(await click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False)), "sent")
         self.assertEqual(await vote.evaluate(self.tab, "fixtureFrame.contentWindow.received"), [True])
+
+    async def test_response_in_closed_shadow_dom_is_observed_without_returning_its_token(self):
+        await self.load('<!doctype html><title>Vote</title><div id="host"></div>')
+        await vote.evaluate(self.tab, '''(() => {
+            const root=host.attachShadow({mode:'closed'});
+            root.innerHTML='<input type="hidden" name="cf-turnstile-response" value="PRIVATE_FIXTURE_TOKEN">';
+        })()''')
+        state = await click.widget_state(self.tab)
+        self.assertTrue(state["solved"])
+        self.assertNotIn("PRIVATE", repr(state))
 
     async def test_visible_label_activates_its_hidden_checkbox_input(self):
         await vote.evaluate(self.tab, """(() => {

@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from request_diagnostics import MAX_REQUESTS, RequestDiagnostics, request_kind, set_phase
+from test_graphql_vote import payload as graphql_payload
 
 
 class NetworkDiagnosticTests(unittest.IsolatedAsyncioTestCase):
@@ -111,3 +112,38 @@ class NetworkDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await self.tracker.start()
         self.assertEqual(self.tab.remove_handler.call_count, 5)
+
+    async def test_graphql_response_body_is_inspected_without_retaining_or_printing_secrets(self):
+        self.tracker.vote_network.select_bot("111")
+        self.tracker.phase = "vote_confirmation"
+        self.tracker.vote_network.begin_input()
+        self.tracker.vote_network.receipt({"pressed": True, "released": True, "clicked": True, "pressed_at": 100.0})
+        raw = graphql_payload(variables={"bot": "111", "token": "PRIVATE_REQUEST_TOKEN"})
+        self.tab.send.return_value = ('{"errors":[{"message":"captcha: PRIVATE_RESPONSE_TOKEN"}]}', False)
+        with patch("builtins.print") as log:
+            await self.tracker.on_request(NS(request_id="gql", wall_time=101.0,
+                document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                request=NS(url="https://top.gg/api/graphql", method="POST", post_data=raw)))
+            await self.tracker.on_response(NS(request_id="gql", response=NS(status=200,
+                headers={"content-type": "application/graphql-response+json"})))
+            await self.tracker.on_finished(NS(request_id="gql"))
+        self.assertEqual(self.tracker.vote_network.submission_outcome(), "captcha_required")
+        self.assertNotIn("PRIVATE", repr(self.tracker.completed))
+        self.assertNotIn("PRIVATE", repr(log.call_args_list))
+        self.assertIn('"outcome": "captcha_required"', repr(log.call_args_list))
+
+    async def test_unavailable_body_cannot_clear_graphql_denial(self):
+        state = self.tracker.vote_network
+        state.select_bot("111")
+        self.tab.send.side_effect = TimeoutError("PRIVATE")
+        with patch("builtins.print"):
+            for request_id, query, status, headers in (
+                ("denied", graphql_payload(), 403, {"cf-mitigated":"challenge", "content-type":"text/html"}),
+                ("read", graphql_payload('query Cast { canVote(botId:"111") }'), 200, {"content-type":"application/json"}),
+            ):
+                await self.tracker.on_request(NS(request_id=request_id, wall_time=101.0,
+                    document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                    request=NS(url="https://top.gg/api/graphql", method="POST", post_data=query)))
+                await self.tracker.on_response(NS(request_id=request_id, response=NS(status=status, headers=headers)))
+                await self.tracker.on_finished(NS(request_id=request_id))
+        self.assertTrue(state.protection_pending())

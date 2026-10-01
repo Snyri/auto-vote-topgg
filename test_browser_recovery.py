@@ -106,6 +106,24 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await vote.topgg_auth_state(tab), vote.AUTHENTICATED)
         tab.reload.assert_not_awaited()
 
+    async def test_passive_cookie_recheck_does_not_repeat_solver_or_fetch_through_a_gate(self):
+        self.mocks["is_turnstile_present"].return_value = True
+        with patch("vote.unresolved_challenge_auth_state", new=AsyncMock(return_value=vote.AUTH_BLOCKED)):
+            state = await vote.topgg_auth_state(AsyncMock(),
+                allow_session_recovery=False, allow_challenge_input=False)
+        self.assertEqual(state, vote.AUTH_BLOCKED)
+        self.mocks["solve_turnstile"].assert_not_awaited()
+        self.mocks["topgg_session_probe"].assert_not_awaited()
+
+    async def test_passive_recheck_accepts_late_authenticated_application(self):
+        self.mocks["topgg_page_auth_hint"].side_effect = ["unknown", vote.AUTHENTICATED]
+        self.mocks["is_turnstile_present"].side_effect = [True, False]
+        state = await vote.topgg_auth_state(AsyncMock(),
+            allow_session_recovery=False, allow_challenge_input=False)
+        self.assertEqual(state, vote.AUTHENTICATED)
+        self.mocks["solve_turnstile"].assert_not_awaited()
+        self.mocks["topgg_session_probe"].assert_not_awaited()
+
 
 def browser_fixture():
     tab = MagicMock()

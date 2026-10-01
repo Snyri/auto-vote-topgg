@@ -545,7 +545,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
         dockerfile = (root / "scheduler" / "Dockerfile").read_text(encoding="utf-8")
         for requirement in (
             "requests==2.34.2",
-            "urllib3==2.7.0",
+            "urllib3==2.8.0",
             "certifi==2026.7.22",
             "charset-normalizer==3.4.9",
             "idna==3.18",
