@@ -38,7 +38,8 @@ class ApplicationClickUnitTests(unittest.IsolatedAsyncioTestCase):
             result = await ui_click.click_control(tab, evaluate, "#login", timeout=2, reacquire=reacquire)
         self.assertTrue(result["input_sent"])
         self.assertEqual(reacquire.await_count, 3)
-        self.assertEqual([next(c.args[0])["params"]["type"] for c in tab.send.await_args_list],
+        self.assertEqual([p["params"]["type"] for c in tab.send.await_args_list
+                         if (p := next(c.args[0]))["method"] == "Input.dispatchMouseEvent"],
                          ["mouseMoved", "mousePressed", "mouseReleased"])
 
     async def test_missing_reselection_cannot_press_an_obsolete_marked_control(self):
@@ -58,14 +59,15 @@ class ApplicationClickUnitTests(unittest.IsolatedAsyncioTestCase):
         with (patch("ui_click.asyncio.sleep", new_callable=AsyncMock), patch("builtins.print")):
             result = await ui_click.click_control(tab, evaluate, "#login", kind="login")
         self.assertEqual(result, {"input_sent": True, "clicked": None})
-        self.assertEqual([next(c.args[0])["params"]["type"] for c in tab.send.await_args_list],
+        self.assertEqual([p["params"]["type"] for c in tab.send.await_args_list
+                         if (p := next(c.args[0]))["method"] == "Input.dispatchMouseEvent"],
                          ["mouseMoved", "mousePressed", "mouseReleased"])
 
     async def test_press_timeout_still_releases_and_reports_unknown_receipt(self):
         tab = MagicMock(); commands = []
         async def send(command):
             payload = next(command); commands.append(payload)
-            if payload["params"]["type"] == "mousePressed": raise TimeoutError
+            if payload.get("params", {}).get("type") == "mousePressed": raise TimeoutError
         tab.send = AsyncMock(side_effect=send)
         evaluate = AsyncMock(return_value={"ready": True, "x": 10, "y": 20})
         with (patch("ui_click.asyncio.sleep", new_callable=AsyncMock), patch("builtins.print")):
