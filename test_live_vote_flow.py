@@ -41,6 +41,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.mutation_field = "castVote"
         self.mutation_error = False
         self.solved_widget = False
+        self.audit_error = False
         self.fixture_errors = []
         try:
             try:
@@ -80,10 +81,11 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                 nativeClicks++;
                 await post(__MUTATION__);
                 // Model optimistic UI as well as normal acknowledgements.
+                if (__AUDIT__) await post({query:'mutation Audit { auditBotVote(botId:"111") { ok } }'});
                 surface.innerHTML='Thanks for voting!'+__WIDGET__;
             });
             </script>""".replace("__READ__", json.dumps(read)).replace("__QUERY__", query).replace(
-                "__MUTATION__", mutation).replace("__WIDGET__", json.dumps(widget))
+                "__MUTATION__", mutation).replace("__WIDGET__", json.dumps(widget)).replace("__AUDIT__", json.dumps(self.audit_error))
 
     async def fulfill(self, event):
         try:
@@ -100,6 +102,8 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                         status, headers, body = 403, {"content-type": "text/html", "cf-mitigated": "challenge"}, "Denied"
                     else:
                         status, headers, body = 200, {"content-type": "application/json"}, '{"data":{"canVote":true}}'
+                elif "auditBotVote" in raw:
+                    status, headers, body = 200, {"content-type":"application/json"}, '{"errors":[{"extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}'
                 else:
                     self.mutations += 1
                     status, headers = 200, {"content-type": "application/json"}
@@ -121,13 +125,17 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fixture_errors, [])
 
     async def load(self):
-        await self.tab.get(PAGE)
+        session_id = self.tab.session_id
+        # Setup itself uses the existing session; the cookie test below exercises
+        # production navigation separately, including its original get() bug.
+        await self.tab.send(uc.cdp.page.navigate(PAGE))
+        self.assertEqual(self.tab.session_id, session_id)
         for _ in range(100):
             if await vote.evaluate(self.tab, "window.readDone === true"):
                 break
             await asyncio.sleep(0.05)
         else:
-            self.fail("Local fixture did not initialize")
+            self.fail("Local fixture did not initialize: " + repr(self.fixture_errors))
         await self.wait(lambda: any(x["vote_network"]["operation"] == "vote_state"
                                    for x in self.tracker.completed.values()))
 
@@ -162,6 +170,25 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mutations, 1)
         self.assertEqual(self.tracker.vote_network.submission_outcome(), "usable")
         self.assertEqual(await vote.evaluate(self.tab, "window.nativeClicks"), 1)
+
+    async def test_cookie_navigation_preserves_the_session_owning_network_observers(self):
+        session_id = self.tab.session_id
+        result = await vote.login_with_cookies(self.tab, [{
+            "name":"authjs.session-token", "value":"LOCAL_FIXTURE_COOKIE",
+            "domain":".top.gg", "path":"/", "secure":True,
+        }], ["111"])
+        self.assertEqual(result, vote.AUTHENTICATED)
+        self.assertEqual(self.tab.session_id, session_id)
+        await self.wait(lambda: any(x["vote_network"]["response_outcome"] == "usable"
+                                   for x in self.tracker.completed.values()))
+
+    async def test_unrelated_mutation_error_does_not_override_an_identified_healthy_vote(self):
+        self.audit_error = True
+        await self.load()
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.documents, 1)
+        self.assertEqual(self.mutations, 1)
 
     async def test_a_new_document_does_not_inherit_an_old_api_denial(self):
         self.block_reads, self.omit_reloaded_read = "first", True
