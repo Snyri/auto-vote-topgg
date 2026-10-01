@@ -24,10 +24,10 @@ AUTHORIZE = "https://discord.com/oauth2/authorize?client_id=fixture"
 class OAuthBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.profile=tempfile.TemporaryDirectory(prefix="oauth-flow-fixture-")
-        self.browser=uc.Browser(uc.Config(
-            headless=True,browser_executable_path=CHROME,user_data_dir=self.profile.name,
+        self.browser=uc.Browser(vote.browser_environment.ChromeConfig(
+            headless=False,browser_executable_path=CHROME,user_data_dir=self.profile.name,
             sandbox=getattr(os,"geteuid",lambda:1)()!=0,
-            browser_args=["--disable-dev-shm-usage","--no-proxy-server"],
+            browser_args=["--window-size=1280,720","--disable-dev-shm-usage","--no-proxy-server"],
         ))
         self.tracker=None
         self.automatic=False
