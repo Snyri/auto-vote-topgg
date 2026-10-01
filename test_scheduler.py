@@ -180,68 +180,32 @@ class ScheduleRefreshTests(unittest.TestCase):
         self.assertEqual(scheduler.latest_vote_run(minimum_run_id=138)["id"], 140)
         get_run.assert_not_called()
 
-    @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_040_000)
-    @patch.object(scheduler, "list_vote_runs")
-    def test_failed_run_cannot_advance_still_future_success_schedule(
-        self, list_runs, artifact
-    ):
-        list_runs.return_value = [
-            {"id": 140, "status": "completed", "conclusion": "failure"},
-            {"id": 136, "status": "completed", "conclusion": "success"},
-            {"id": 138, "status": "completed", "conclusion": "success"},
-        ]
-        with patch.object(scheduler.time, "time", return_value=2_000_000_000):
-            target = scheduler.latest_prior_success_schedule(140)
-        self.assertEqual(target, (138, 2_000_040_000))
-        artifact.assert_called_once_with(138)
-
-    @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_000_000)
-    @patch.object(scheduler, "list_vote_runs")
-    def test_prior_success_guard_expires_at_original_target(self, list_runs, artifact):
-        list_runs.return_value = [
-            {"id": 138, "status": "completed", "conclusion": "success"},
-        ]
-        self.assertIsNone(scheduler.latest_prior_success_schedule(140, 2_000_000_001))
-        artifact.assert_called_once_with(138)
-
-    @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_040_000)
-    def test_prior_success_search_covers_retained_history_after_many_failures(self, artifact):
-        history = [
-            {"id": run_id, "status": "completed", "conclusion": "failure"}
-            for run_id in range(160, 138, -1)
-        ] + [{"id": 138, "status": "completed", "conclusion": "success"}]
-        with patch.object(scheduler, "list_vote_runs", side_effect=lambda per_page: history[:per_page]):
-            self.assertEqual(
-                scheduler.latest_prior_success_schedule(161, now=2_000_000_000),
-                (138, 2_000_040_000),
-            )
-
-    @patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 2_000_040_000))
+    @patch.object(scheduler, "list_vote_runs", return_value=[{"id": 138, "status": "completed", "conclusion": "success"}])
     @patch.object(scheduler, "latest_vote_run", return_value={
         "id": 140, "status": "completed", "conclusion": "failure"
     })
     @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_000_500)
-    def test_refresh_ignores_failed_retry_before_prior_success_cooldown(
+    def test_refresh_uses_newer_retry_target_instead_of_an_unscoped_success(
         self, artifact, latest_run, prior_success
     ):
-        self.assertEqual(scheduler.latest_schedule_target(), (140, 2_000_040_000))
+        self.assertEqual(scheduler.latest_schedule_target(), (140, 2_000_000_500))
         artifact.assert_called_once_with(140)
-        prior_success.assert_called_once_with(140)
+        prior_success.assert_not_called()
 
-    @patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 2_000_040_000))
+    @patch.object(scheduler, "list_vote_runs", return_value=[{"id": 138, "status": "completed", "conclusion": "success"}])
     @patch.object(scheduler, "latest_vote_run", return_value={
         "id": 140, "status": "completed", "conclusion": "failure"
     })
     @patch.object(scheduler, "next_vote_at_from_run", return_value=2_000_000_500)
-    def test_restart_retains_success_target_after_short_failed_retry(
+    def test_restart_uses_newer_retry_target(
         self, artifact, latest_run, prior_success
     ):
         with patch.object(scheduler, "log"):
-            self.assertEqual(scheduler.resolve_schedule(), (140, 2_000_040_000))
+            self.assertEqual(scheduler.resolve_schedule(), (140, 2_000_000_500))
         artifact.assert_called_once_with(140)
-        prior_success.assert_called_once_with(140)
+        prior_success.assert_not_called()
 
-    @patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 2_000_040_000))
+    @patch.object(scheduler, "list_vote_runs", return_value=[{"id": 138, "status": "completed", "conclusion": "success"}])
     @patch.object(scheduler, "latest_vote_run", return_value={
         "id": 140, "status": "completed", "conclusion": "failure"
     })
@@ -251,15 +215,15 @@ class ScheduleRefreshTests(unittest.TestCase):
     ):
         self.assertEqual(scheduler.latest_schedule_target(), (140, 2_000_050_000))
 
-    @patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 2_000_040_000))
+    @patch.object(scheduler, "list_vote_runs", return_value=[{"id": 138, "status": "completed", "conclusion": "success"}])
     @patch.object(scheduler, "latest_vote_run", return_value={
         "id": 140, "status": "completed", "conclusion": "failure"
     })
     @patch.object(scheduler, "next_vote_at_from_run", return_value=None)
-    def test_prior_success_survives_failure_without_artifact(
+    def test_missing_current_artifact_does_not_inherit_an_unscoped_target(
         self, artifact, latest_run, prior_success
     ):
-        self.assertEqual(scheduler.latest_schedule_target(), (140, 2_000_040_000))
+        self.assertIsNone(scheduler.latest_schedule_target())
 
     @patch.object(scheduler, "latest_schedule_target", return_value=(136, 2_000_000_100))
     def test_wait_ignores_older_run_even_if_its_target_is_past(self, refresh):
@@ -296,7 +260,7 @@ class ScheduleRefreshTests(unittest.TestCase):
 
 
 class SchedulerCycleTests(unittest.TestCase):
-    def test_dispatched_failure_is_guarded_before_carrying_schedule_forward(self):
+    def test_dispatched_failure_carries_its_own_retry_schedule(self):
         with (
             patch.object(scheduler, "resolve_schedule", return_value=(137, 100)),
             patch.object(scheduler, "wait_until", side_effect=[(137, 100), KeyboardInterrupt]) as wait,
@@ -304,12 +268,12 @@ class SchedulerCycleTests(unittest.TestCase):
             patch.object(scheduler, "dispatch_vote", return_value=140),
             patch.object(scheduler, "wait_for_run", return_value={"id": 140, "conclusion": "failure"}),
             patch.object(scheduler, "next_vote_at_from_run", return_value=200),
-            patch.object(scheduler, "latest_prior_success_schedule", return_value=(138, 500)),
+            patch.object(scheduler, "list_vote_runs", return_value=[{"id": 138, "status": "completed", "conclusion": "success"}]),
             patch.object(scheduler, "log"),
         ):
             with self.assertRaises(KeyboardInterrupt):
                 scheduler.main()
-        self.assertEqual(wait.call_args_list[1].args, (500,))
+        self.assertEqual(wait.call_args_list[1].args, (200,))
         self.assertEqual(wait.call_args_list[1].kwargs, {"source_run_id": 140})
 
     def test_cycle_retains_dispatched_schedule_without_reading_stale_list_again(self):
@@ -531,14 +495,16 @@ class WorkflowConfigurationTests(unittest.TestCase):
         root = pathlib.Path(__file__).parent
         workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
         retry = workflow.split("  failure-retry:\n", 1)[1].split("  cleanup:\n", 1)[0]
-        self.assertIn("needs: [vote, verify-vote, cleanup]", retry)
-        self.assertIn("!cancelled() && failure() && github.ref == 'refs/heads/master'", retry)
-        self.assertEqual(workflow.count("/dispatches"), 1)
-        self.assertIn("inputs[source]=failure-retry", retry)
+        self.assertIn("needs: [vote, verify-vote]", retry)
+        self.assertNotIn("needs: [vote, verify-vote, cleanup]", retry)
+        self.assertIn("!cancelled() && needs.vote.outputs.vote_status != '0'", retry)
+        self.assertIn("run: python action_recovery.py", retry)
+        self.assertIn("RUN_ID: ${{ github.run_id }}", retry)
         self.assertNotIn("recovery_depth", retry)
         self.assertNotIn("run_attempt", retry)
         self.assertNotIn("sleep", retry)
         self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("queue: max", workflow)
 
     def test_scheduler_image_pins_runtime_dependencies_and_non_root_user(self):
         root = pathlib.Path(__file__).parent

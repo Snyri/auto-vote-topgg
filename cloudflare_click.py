@@ -143,10 +143,24 @@ async def widget_state(tab) -> dict:
                 return state
             attrs = dict(zip((node.attributes or [])[::2], (node.attributes or [])[1::2]))
             if _cloudflare_frame(node):
+                remote = None
                 with suppress(Exception):
                     model = await _send(tab, cdp.dom.get_box_model(backend_node_id=node.backend_node_id))
                     if model.width > 0 and model.height > 0:
-                        state["present"] = True
+                        try:
+                            remote = await _send(tab, cdp.dom.resolve_node(backend_node_id=node.backend_node_id))
+                            visible = await _on_node(tab, remote.object_id, """function () {
+                                for (let node = this; node; node = node.parentElement || node.getRootNode()?.host) {
+                                    const style = getComputedStyle(node);
+                                    if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0) return false;
+                                }
+                                return true;
+                            }""")
+                            state["present"] |= visible is True
+                        finally:
+                            if remote:
+                                with suppress(Exception):
+                                    await _send(tab, cdp.runtime.release_object(remote.object_id))
             if node.node_name in {"INPUT", "TEXTAREA"} and attrs.get("name") in {
                 "cf-turnstile-response", "cf_challenge_response", "g-recaptcha-response", "h-captcha-response",
             }:
@@ -493,7 +507,7 @@ async def _send_checkbox_input(tab, observer, target) -> None:
                 await _send(observer, cdp.runtime.release_object(remote.object_id))
 
 
-async def click_cloudflare_checkbox(tab, evaluate, cleared) -> str:
+async def _click_cloudflare_checkbox_impl(tab, evaluate, cleared) -> str:
     """Wait for a stable target; send at most one click and never infer clearance."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + TARGET_WAIT_SEC
@@ -534,3 +548,11 @@ async def click_cloudflare_checkbox(tab, evaluate, cleared) -> str:
         await asyncio.sleep(POLL_SEC)
     print("  ⚠️  No verified Cloudflare checkbox target; no mouse click sent")
     return "unavailable"
+
+
+async def click_cloudflare_checkbox(tab, evaluate, cleared) -> str:
+    try:
+        return await asyncio.wait_for(_click_cloudflare_checkbox_impl(tab, evaluate, cleared), timeout=TARGET_WAIT_SEC)
+    except TimeoutError:
+        print("  ⚠️ Cloudflare control observation deadline reached")
+        return "unavailable"

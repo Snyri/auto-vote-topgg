@@ -8,6 +8,14 @@ import vote
 
 
 class VoteChallengeOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
+        patcher = patch("vote.fresh_vote_document", new=fresh)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def exercise_phase(self, phase, auth_state):
         presence_by_phase = {
             "before_ad": [True],

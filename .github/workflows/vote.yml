@@ -1,5 +1,5 @@
 name: Top.gg Auto Vote
-run-name: Top.gg Auto Vote · ${{ inputs.source || 'manual' }}
+run-name: Top.gg Auto Vote · ${{ inputs.source || 'manual' }}${{ inputs.origin_run_id && format(' · {0}', inputs.origin_run_id) || '' }}
 
 on:
   workflow_dispatch:
@@ -26,6 +26,7 @@ concurrency:
   # All branches use the same accounts and must share the same voting lock.
   group: topgg-vote
   cancel-in-progress: false
+  queue: max
 
 jobs:
   vote:
@@ -33,6 +34,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
     outputs:
       vote_status: ${{ steps.run_vote.outputs.status }}
 
@@ -60,6 +62,16 @@ jobs:
           echo "Browser: $("$CHROME_BIN" --version)"
           echo "Xvfb: $(command -v Xvfb)"
 
+      - name: Restore vote handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ORIGIN_ID: ${{ inputs.origin_run_id }}
+          RECOVERY_MODE: restore
+          RECOVERY_STATE_FILE: ${{ runner.temp }}/vote-recovery.json
+        run: python action_recovery.py
+
       - name: Run vote
         id: run_vote
         env:
@@ -72,6 +84,7 @@ jobs:
           RUN_SOURCE:                 ${{ inputs.source }}
           RUN_ORIGIN_ID:              ${{ inputs.origin_run_id }}
           RUN_RECOVERY_DEPTH:          ${{ inputs.recovery_depth }}
+          RECOVERY_STATE_FILE:          ${{ runner.temp }}/vote-recovery.json
         run: |
           secret_dir="$(mktemp -d)"
           chmod 700 "$secret_dir"
@@ -102,6 +115,15 @@ jobs:
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit 0
+
+      - name: Upload vote handoff
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vote-recovery
+          path: ${{ runner.temp }}/vote-recovery.json
+          if-no-files-found: ignore
+          retention-days: 2
 
       - name: Validate cooldown schedule
         id: cooldown
@@ -189,32 +211,31 @@ jobs:
           VOTE_JOB_RESULT: ${{ needs.vote.result }}
         run: |
           test "$VOTE_STATUS" = "0"
-          test "$VOTE_JOB_RESULT" = "success"
+          # Housekeeping/upload failures cannot turn a recorded vote into a failed vote.
 
   failure-retry:
-    # Wait for all result/cleanup jobs; the concurrency lock queues the next run
-    # until this one has finished. Cancelled runs intentionally stop the chain.
-    needs: [vote, verify-vote, cleanup]
-    if: ${{ !cancelled() && failure() && github.ref == 'refs/heads/master' }}
+    # Retry business/setup failures, independently of artifact cleanup.
+    needs: [vote, verify-vote]
+    if: ${{ !cancelled() && needs.vote.outputs.vote_status != '0' && github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write
+      contents: read
     steps:
+      - name: Checkout retry helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Dispatch a new run after failure
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          gh api --method POST "repos/$REPOSITORY/actions/workflows/vote.yml/dispatches" \
-            -f 'ref=master' \
-            -f 'inputs[source]=failure-retry' \
-            -f "inputs[origin_run_id]=$RUN_ID"
-          echo "Requested a fresh run after failed run $RUN_ID (no recovery-chain limit)."
+        run: python action_recovery.py
 
   cleanup:
+    continue-on-error: true
     needs: vote
     if: always() && github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04

@@ -404,6 +404,7 @@ const controls = (fixture.controls || []).map(item => ({
     getClientRects: () => item.visible === false ? [] : [{}],
     fixtureStyle: item.style || {},
     getAttribute: name => (item.attributes || {})[name] ?? null,
+    hasAttribute: name => Object.hasOwn(item.attributes || {}, name),
 }));
 const matches = (node, selector) => selector === node.tagName ||
     (selector === '[role="button"]' && node.getAttribute('role') === 'button');
@@ -417,9 +418,11 @@ const sandbox = {
         querySelector: selector => selector.split(',').some(
             part => (fixture.selectors || []).includes(part.trim())
         ) ? {} : null,
-        querySelectorAll: selector => controls.filter(node => selector.split(',').some(
-            part => matches(node, part.trim())
-        )),
+        querySelectorAll: selector => [
+            ...controls.filter(node => selector.split(',').some(part => matches(node, part.trim()))),
+            ...(fixture.selectors || []).filter(wanted => selector.split(',').some(part => part.trim() === wanted))
+                .map(() => ({getClientRects: () => [{}], offsetWidth: 100, offsetHeight: 20}))
+        ],
     },
     location: {
         protocol: fixture.protocol || 'https:',
@@ -541,7 +544,7 @@ class BrowserJavaScriptRegressionTests(unittest.IsolatedAsyncioTestCase):
         ]
         for fixture in fixtures:
             with self.subTest(fixture=fixture):
-                pending = fixture.get("title") == "Just a moment..." or "body" in fixture
+                pending = fixture.get("title") == "Just a moment..." or "body" in fixture or "selectors" in fixture
                 self.assertIs((await self.execute_expression(expression, fixture))["value"], pending)
         self.assertFalse((await self.execute_expression(expression, {"body": "Welcome to top.gg"}))["value"])
         self.assertTrue((await self.execute_expression(expression, {

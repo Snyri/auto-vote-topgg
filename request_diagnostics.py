@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from nodriver import cdp
 
 import graphql_vote
-from vote_network import VoteNetworkState, bot_vote_page, safe_api_route
+from vote_network import VoteNetworkState, bot_vote_page, safe_api_route, number
 
 
 MAX_REQUESTS = 256
@@ -77,9 +77,11 @@ class RequestDiagnostics:
                 max_post_data_size=graphql_vote.MAX_PAYLOAD,
             )), timeout=2)
             self.tab._topgg_diagnostics = self
+            return True
         except Exception:
             self.stop()
             print("  Network diagnostics unavailable")
+            return False
 
     async def on_navigated(self, event):
         frame = event.frame
@@ -175,7 +177,7 @@ class RequestDiagnostics:
                 if request_id in self.vote_network.candidates:
                     self.vote_network.incomplete = True
             network = info["vote_network"]
-            if (not failed and network["graphql"]
+            if (not failed and (network["graphql"] or network["operation"] != "unrelated")
                     and network["json_response"] and not network["readiness_invalid"]):
                 outcome = "unavailable"
                 try:
@@ -185,11 +187,14 @@ class RequestDiagnostics:
                         if encoded:
                             body = base64.b64decode(body, validate=True).decode("utf-8")
                         inspected_operation = "vote_submission" if network["application_submission"] else network["operation"]
-                        outcome = graphql_vote.inspect_response(body, network["response_key"], inspected_operation)
+                        if network["graphql"]:
+                            outcome = graphql_vote.inspect_response(body, network["response_key"], inspected_operation)
+                        else:
+                            outcome = graphql_vote.inspect_json_response(body, inspected_operation)
                 except Exception:
                     pass
                 self.vote_network.response_body(network, outcome)
-                print("  GraphQL response diagnostic: " + json.dumps({
+                print("  API response diagnostic: " + json.dumps({
                     "phase": info["phase"], "vote_operation": network["operation"],
                     "outcome": outcome,
                 }, sort_keys=True))

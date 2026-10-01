@@ -149,6 +149,7 @@ class VoteNetworkState:
         self.last_denial = None
         self.denial_started = None
         self.recovered_by = None
+        self.ready_started = None
         self.candidates = {}
         self.armed = False
         self.trusted = False
@@ -164,6 +165,7 @@ class VoteNetworkState:
         self.document_id = loader_id
         self.context += 1
         self.last_denial = self.denial_started = self.recovered_by = None
+        self.ready_started = None
         self.entity_key = None
         self.end_input()
 
@@ -174,6 +176,7 @@ class VoteNetworkState:
             self.last_denial = None
             self.denial_started = None
             self.recovered_by = None
+            self.ready_started = None
             self.entity_key = None
         self.end_input()
 
@@ -218,7 +221,7 @@ class VoteNetworkState:
                 "redirected": bool(getattr(event, "redirect_response", None)),
                 "json_response": False, "readiness_invalid": False, "failed": False,
                 "graphql": graphql, "response_key": descriptor.get("response_key"),
-                "response_outcome": "pending" if graphql else "not_applicable",
+                "response_outcome": "pending" if graphql or operation != "unrelated" else "not_applicable",
                 "graphql_kind": descriptor.get("graphql_kind", "not_applicable"),
                 "graphql_target": descriptor.get("graphql_target", "not_applicable"),
                 "graphql_shape": descriptor.get("graphql_shape", "not_applicable"),
@@ -226,7 +229,8 @@ class VoteNetworkState:
                 "application_submission": current_document and graphql
                     and descriptor.get("graphql_kind") == "mutation"
                     and descriptor.get("graphql_shape") == "single"
-                    and (operation == "vote_submission" or descriptor.get("graphql_target") == "matching_bot")}
+                    and (operation == "vote_submission" or descriptor.get("graphql_target") in {"matching_bot", "page_entity"})
+                    and (entity_key is None or self.entity_key is None or entity_key == self.entity_key)}
         readonly_graphql = graphql and descriptor.get("graphql_kind") == "query"
         if (current_document and self.armed and operation != "vote_state" and not readonly_graphql
                 and first_party_write(request.url, request.method, getattr(event, "document_url", None), self.bot_id)):
@@ -247,7 +251,10 @@ class VoteNetworkState:
                                    and safe["cloudflare_challenge"] is not True)
         info["readiness_invalid"] |= safe["cloudflare_challenge"] is True or safe["content_kind"] == "html"
         if info["operation"] in {"vote_submission", "vote_state"}:
-            if challenged:
+            # Old ExtraInfo/duplicate headers cannot undo a newer completed read.
+            stale = (self.ready_started is not None and info["started"] is not None
+                     and info["started"] < self.ready_started)
+            if challenged and not stale:
                 self.recovered_by = None
                 if self.last_denial is None:
                     self.denial_started = info["started"]
@@ -273,7 +280,7 @@ class VoteNetworkState:
         ready = (info["context"] == self.context and info["operation"] == "vote_state"
                 and info["finished"] and not info["failed"] and not info["redirected"]
                 and not info["readiness_invalid"] and info["json_response"]
-                and (not info["graphql"] or info["response_outcome"] == "usable")
+                and info["response_outcome"] == "usable"
                 and len(info["statuses"]) == 1 and all(200 <= status < 300 for status in info["statuses"]))
         # ExtraInfo may arrive after LoadingFinished. Revoke only this response's
         # recovery if late evidence contradicts it, without retaining raw data.
@@ -281,6 +288,11 @@ class VoteNetworkState:
             self.last_denial = self.clock()
             self.denial_started = info["started"]
             self.recovered_by = None
+            self.ready_started = None
+        if ready and info["started"] is not None and (self.ready_started is None or info["started"] >= self.ready_started):
+            self.ready_started = info["started"]
+            if self.last_denial is None:
+                self.recovered_by = info
         if (ready
                 and self.denial_started is not None and info["started"] is not None
                 and info["started"] >= self.denial_started):
@@ -310,6 +322,8 @@ class VoteNetworkState:
             requests = known
         latest = max(requests, key=lambda info: info["started"])
         def observed_outcome(info):
+            if info["failed"]:
+                return "unavailable"
             if not info["finished"]:
                 return "pending"
             if info["challenge"] and info["statuses"] == {403}:
@@ -323,6 +337,13 @@ class VoteNetworkState:
                 if outcome in {"captcha_required", "unauthenticated", "error", "invalid", "protection_rejected"}:
                     return outcome
         return observed_outcome(latest)
+
+    def confirmation_covered(self):
+        identified = any(info["operation"] == "vote_submission" and info["context"] == self.context
+                         and info["generation"] == self.generation and info["started"] is not None
+                         and self.pressed_at is not None and info["started"] >= self.pressed_at
+                         for info in self.candidates.values())
+        return identified and not self.incomplete and self.submission_outcome() == "usable"
 
     def definitely_rejected(self):
         if not self.armed or not self.trusted or self.pressed_at is None or self.incomplete:

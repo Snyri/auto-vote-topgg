@@ -86,6 +86,8 @@ class VoteResponseEvidenceTests(unittest.TestCase):
         self.state.response(info, status, headers)
         if finished:
             self.state.finish(info)
+            if status == 200 and headers == JSON and info["operation"] != "unrelated":
+                self.state.response_body(info, "usable")
         return info
 
     def test_completed_exact_challenge_establishes_rejection_not_success(self):
@@ -194,6 +196,8 @@ class VoteResponseEvidenceTests(unittest.TestCase):
         ready = self.response(event(STATE, "GET", "ready", started=102), 200, JSON, finished=False)
         self.assertTrue(self.state.protection_pending())
         self.state.finish(ready)
+        self.assertTrue(self.state.protection_pending())
+        self.state.response_body(ready, "usable")
         self.assertFalse(self.state.protection_pending())
 
     def test_redirect_failed_or_conflicting_state_response_cannot_clear_denial(self):

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import vote
+from vote_network import VoteNetworkState
 
 
 BEFORE = {"observed": True, "confirmed": False, "evidence": None}
@@ -14,9 +15,29 @@ ACK = {"observed": True, "confirmed": True, "evidence": "bounded cooldown"}
 class VoteConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, snapshots, *, challenged=False, reload_error=None, click=True):
         tab = AsyncMock()
+        network = VoteNetworkState()
+        network.select_bot("111")
+        async def native_click(*args):
+            if isinstance(click, Exception):
+                raise click
+            if click:
+                network.begin_input()
+                from types import SimpleNamespace as NS
+                info = network.on_request(NS(request_id="vote", wall_time=101, document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                    request=NS(url="https://top.gg/api/bots/111/vote", method="POST", post_data=None)))
+                network.receipt({"pressed": True, "released": True, "clicked": True, "pressed_at": 100})
+                network.response(info, 200, {"cloudflare_challenge": False, "content_kind": "json"})
+                network.finish(info)
+                network.response_body(info, "usable")
+            return click
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
         tab.reload.side_effect = reload_error
         with (
             patch("builtins.print"),
+            patch("vote.fresh_vote_document", new=fresh),
+            patch("request_diagnostics.vote_state", return_value=network),
             patch("vote.asyncio.sleep", new_callable=AsyncMock),
             patch("vote.current_url", new=AsyncMock(return_value="https://top.gg/bot/111/vote")),
             patch("vote.settle_privacy_overlay", new_callable=AsyncMock),
@@ -26,10 +47,7 @@ class VoteConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
             patch("vote.solve_turnstile", new=AsyncMock(return_value=True)) as solver,
             patch("vote.wait_for_ad", new=AsyncMock(return_value=None)),
             patch("vote.mark_vote_button", new=AsyncMock(return_value={"found": True, "disabled": False})),
-            patch("vote._click_marked", new=AsyncMock(
-                side_effect=click if isinstance(click, Exception) else None,
-                return_value=click,
-            )) as clicked,
+            patch("vote._click_marked", new=AsyncMock(side_effect=native_click)) as clicked,
             patch("vote.vote_page_confirmation", new=AsyncMock(side_effect=snapshots)),
             patch("vote.persisted_vote_confirmation", new=AsyncMock(return_value={
                 "confirmed": True, "evidence": "bounded cooldown",

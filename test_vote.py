@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import vote
+from test_vote_page_receipt import raw_page
 
 
 class LoaderTests(unittest.TestCase):
@@ -505,7 +506,9 @@ class VotePersistenceTests(unittest.IsolatedAsyncioTestCase):
         button.return_value = {"found": True, "disabled": False}
 
         with patch("vote.current_url", new=AsyncMock(return_value="https://top.gg/bot/111/vote")):
-            confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
+            with patch("vote.evaluate", new=AsyncMock(return_value=raw_page(
+                text=body_text.return_value, vote_enabled=bool(button.return_value.get("found") and not button.return_value.get("disabled"))))):
+                confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
 
         self.assertFalse(confirmation["confirmed"])
         self.assertTrue(confirmation["vote_enabled"])
@@ -519,7 +522,9 @@ class VotePersistenceTests(unittest.IsolatedAsyncioTestCase):
         button.return_value = {"found": False, "disabled": True}
 
         with patch("vote.current_url", new=AsyncMock(return_value="https://top.gg/bot/111/vote")):
-            confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
+            with patch("vote.evaluate", new=AsyncMock(return_value=raw_page(
+                text=body_text.return_value, vote_enabled=bool(button.return_value.get("found") and not button.return_value.get("disabled"))))):
+                confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
 
         self.assertTrue(confirmation["confirmed"])
         self.assertEqual(confirmation["evidence"], "bounded cooldown")
@@ -541,12 +546,28 @@ class AdditionalVoteSafetyTests(unittest.IsolatedAsyncioTestCase):
     @patch("vote.mark_vote_button", new_callable=AsyncMock, return_value={"found": False, "disabled": True})
     @patch("vote.body_text", new_callable=AsyncMock, return_value="Thanks for voting!")
     async def test_wrong_page_cannot_confirm_vote(self, _body, _button, _url):
-        confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
+        with patch("vote.evaluate", new=AsyncMock(return_value=raw_page(exact_vote_page=False))):
+            confirmation = await vote.persisted_vote_confirmation(AsyncMock(), "111")
         self.assertFalse(confirmation["confirmed"])
         self.assertFalse(confirmation["exact_vote_page"])
 
 
 class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
+        async def persisted(tab, bot_id):
+            text = await vote.body_text(tab)
+            button = await vote.mark_vote_button(tab)
+            enabled = bool(button.get("found") and not button.get("disabled"))
+            return {"observed": True, "confirmed": bool(vote.vote_success_evidence(text)) and not enabled,
+                    "evidence": vote.vote_success_evidence(text), "vote_enabled": enabled,
+                    "exact_vote_page": True, "login_required": False}
+        for patcher in (patch("vote.fresh_vote_document", new=fresh), patch("vote.persisted_vote_confirmation", new=persisted)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.solve_turnstile", new_callable=AsyncMock, return_value=True)
@@ -638,6 +659,21 @@ class PostVoteTurnstileTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FalseSuccessRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
+        async def persisted(tab, bot_id):
+            text = await vote.body_text(tab)
+            button = await vote.mark_vote_button(tab)
+            enabled = bool(button.get("found") and not button.get("disabled"))
+            return {"observed": True, "confirmed": bool(vote.vote_success_evidence(text)) and not enabled,
+                    "evidence": vote.vote_success_evidence(text), "vote_enabled": enabled,
+                    "exact_vote_page": True, "login_required": False}
+        for patcher in (patch("vote.fresh_vote_document", new=fresh), patch("vote.persisted_vote_confirmation", new=persisted)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
@@ -667,6 +703,21 @@ class FalseSuccessRegressionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AmbiguousVoteVerificationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
+        async def persisted(tab, bot_id):
+            text = await vote.body_text(tab)
+            button = await vote.mark_vote_button(tab)
+            enabled = bool(button.get("found") and not button.get("disabled"))
+            return {"observed": True, "confirmed": bool(vote.vote_success_evidence(text)) and not enabled,
+                    "evidence": vote.vote_success_evidence(text), "vote_enabled": enabled,
+                    "exact_vote_page": True, "login_required": False}
+        for patcher in (patch("vote.fresh_vote_document", new=fresh), patch("vote.persisted_vote_confirmation", new=persisted)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @patch("builtins.print")
     @patch("vote.asyncio.sleep", new_callable=AsyncMock)
     @patch("vote.is_turnstile_present", new_callable=AsyncMock, return_value=False)
@@ -697,6 +748,21 @@ class AmbiguousVoteVerificationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChallengedVoteVerificationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
+        async def persisted(tab, bot_id):
+            text = await vote.body_text(tab)
+            button = await vote.mark_vote_button(tab)
+            enabled = bool(button.get("found") and not button.get("disabled"))
+            return {"observed": True, "confirmed": bool(vote.vote_success_evidence(text)) and not enabled,
+                    "evidence": vote.vote_success_evidence(text), "vote_enabled": enabled,
+                    "exact_vote_page": True, "login_required": False}
+        for patcher in (patch("vote.fresh_vote_document", new=fresh), patch("vote.persisted_vote_confirmation", new=persisted)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     async def _run_challenged_verification(self, confirmations):
         # There are two pre-vote checks, one post-click check, one reload
         # check, and up to two read-only follow-up checks on the same page.
@@ -1535,7 +1601,7 @@ class TurnstileSolverTests(unittest.IsolatedAsyncioTestCase):
         tab = AsyncMock()
         times = iter([0.0, 0.0, 31.0])
         loop = MagicMock()
-        loop.time.side_effect = lambda: next(times)
+        loop.time.side_effect = lambda: next(times, 1000)
 
         with patch("vote.asyncio.get_running_loop", return_value=loop):
             self.assertFalse(await vote.solve_turnstile(tab))

@@ -19,11 +19,19 @@ JSON = {"content-type": "application/json"}
 class VoteNetworkFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tab = AsyncMock()
+        self.tab.send.return_value = ('{"success":true}', False)
+        async def fresh(tab, bot_id):
+            await tab.reload()
+            return True
+        patcher = patch("vote.fresh_vote_document", new=fresh)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tracker = request_diagnostics.RequestDiagnostics(self.tab)
         self.tab._topgg_diagnostics = self.tracker
         self.tracker.vote_network.select_bot("111")
 
     async def response(self, status=403, headers=CHALLENGE, url=ENDPOINT, method="POST", request_id="1", started=101):
+        request_id = vote.uc.cdp.network.RequestId(request_id)
         await self.tracker.on_request(NS(request_id=request_id, wall_time=started, document_url=PAGE,
             redirect_response=None, request=NS(url=url, method=method, post_data=None)))
         await self.tracker.on_response(NS(request_id=request_id, response=NS(status=status, headers=headers)))
@@ -133,7 +141,10 @@ class VoteNetworkFlowTests(unittest.IsolatedAsyncioTestCase):
         denied = False
 
         async def send(command):
-            commands.append(next(command)["params"]["type"])
+            wire = next(command)
+            if wire["method"] == "Network.getResponseBody":
+                return ('{"success":true}', False)
+            commands.append(wire["params"]["type"])
 
         async def target(*_, arm=False):
             if stage == "final" and arm:

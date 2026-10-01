@@ -202,7 +202,8 @@ def _target(args, bot_id):
         if isinstance(node, dict):
             for key, value in node.items():
                 if key in BOT_KEYS | ENTITY_KEYS:
-                    if type(value) not in {str, int} or not re.fullmatch(r"[0-9]{1,20}", str(value)):
+                    pattern = r"[0-9]{1,20}" if key in BOT_KEYS else r"(?:[0-9]{1,20}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+                    if type(value) not in {str, int} or not re.fullmatch(pattern, str(value)):
                         return "unknown", None
                     (bot_targets if key in BOT_KEYS else entity_targets).append(str(value))
                 elif isinstance(value, (dict, list)):
@@ -265,8 +266,8 @@ def inspect_request(raw, bot_id):
         result["response_key"] = hashlib.sha256(response_key.encode()).hexdigest()
         scope, entity_key = _target(args, bot_id)
         result["graphql_target"] = scope
-        state_field = field in STATE_FIELDS or (
-            field in {"bot", "entity"} and document.state_fields(children))
+        result["entity_key"] = entity_key
+        state_field = field in STATE_FIELDS or document.state_fields(children)
         if (kind == "mutation" and field not in VOTE_FIELDS) or (kind == "query" and not state_field):
             result["graphql_gate"] = "unrecognized_field"
             return result
@@ -347,5 +348,35 @@ def inspect_response(raw, response_key, operation=None):
         # Even a valid mutation response does not prove voting succeeded.
         # UI acknowledgement/cooldown confirmation remains mandatory.
         return "usable"
+    except (ValueError, TypeError, RecursionError):
+        return "invalid"
+
+
+def inspect_json_response(raw, operation):
+    """Inspect a bounded REST/tRPC result with the same application-error rules."""
+    if not isinstance(raw, str) or len(raw) > MAX_RESPONSE:
+        return "unavailable"
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list) and len(data) == 1:
+            data = data[0]
+        if not isinstance(data, (dict, bool)):
+            return "invalid"
+        if isinstance(data, dict) and data.get("errors"):
+            return inspect_response(json.dumps(data), None, operation)
+        if isinstance(data, dict) and data.get("error"):
+            error = data["error"]
+            if isinstance(error, dict):
+                return inspect_response(json.dumps({"errors": [{"message": error.get("message"),
+                    "extensions": {"code": error.get("code")}}]}), None, operation)
+            return "error"
+        if isinstance(data, dict) and "result" in data:
+            data = data["result"]
+            if isinstance(data, dict) and "data" in data:
+                data = data["data"]
+            if isinstance(data, dict) and "json" in data:
+                data = data["json"]
+        return inspect_response(json.dumps({"data": {"result": data}}),
+                                hashlib.sha256(b"result").hexdigest(), operation)
     except (ValueError, TypeError, RecursionError):
         return "invalid"

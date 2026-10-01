@@ -43,6 +43,9 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.mutation_error = False
         self.mutation_status = 200
         self.solved_widget = False
+        self.pre_solved_widget = False
+        self.hidden_widget = False
+        self.late_error = False
         self.audit_error = False
         self.cloud_widget = False
         self.provider_documents = 0
@@ -77,7 +80,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                  'if(e.origin==="https://challenges.cloudflare.com") widgetClick=e.data;});</script>') if self.cloud_widget else ""
         return """<!doctype html><title>Voting fixture</title>
             <style>button { margin:100px;width:180px;height:50px }</style>
-            <section id="surface"><button id="vote">Vote</button></section>
+            __BEFORE_WIDGET__<section id="surface"><button id="vote">Vote</button></section>
             <script>
             window.readDone=false; window.nativeClicks=0;
             const post = body => fetch('/api/graphql', {method:'POST',
@@ -91,10 +94,14 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                 // Model optimistic UI as well as normal acknowledgements.
                 if (__AUDIT__) await post({query:'mutation Audit { auditBotVote(botId:"111") { ok } }'});
                 surface.innerHTML='Thanks for voting!'+__WIDGET__;
+                if (__LATE_ERROR__) setTimeout(()=>post(__MUTATION__), 6000);
             });
             </script>__FRAME__""".replace("__READ__", json.dumps(read)).replace("__QUERY__", query).replace(
                 "__MUTATION__", mutation).replace("__WIDGET__", json.dumps(widget)).replace(
-                    "__AUDIT__", json.dumps(self.audit_error)).replace("__FRAME__", frame)
+                    "__AUDIT__", json.dumps(self.audit_error)).replace("__FRAME__", frame).replace(
+                    "__LATE_ERROR__", json.dumps(self.late_error)).replace("__BEFORE_WIDGET__",
+                    ('Verify you are human' + widget if self.pre_solved_widget else '') +
+                    ('<iframe src="https://challenges.cloudflare.com/local-fixture" style="display:none;width:200px;height:100px"></iframe>' if self.hidden_widget else ''))
 
     async def fulfill(self, event):
         try:
@@ -127,6 +134,8 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                     status, headers = self.mutation_status, {"content-type": "application/json"}
                     body = ('{"errors":[{"extensions":{"code":"CAPTCHA_REQUIRED"},"message":"PRIVATE_FIXTURE_ERROR"}]}'
                             if self.mutation_error else json.dumps({"data": {self.mutation_field: {"ok": True}}}))
+                    if self.late_error and self.mutations > 1:
+                        body = '{"errors":[{"extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}'
             await self.tab.send(uc.cdp.fetch.fulfill_request(
                 event.request_id, status,
                 response_headers=[uc.cdp.fetch.HeaderEntry(k, v) for k, v in headers.items()],
@@ -316,6 +325,40 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(self.documents, 1)
         self.assertEqual(self.mutations, 1)
+
+    async def test_missing_observer_forces_independent_document_verification(self):
+        await self.load()
+        self.tracker.stop()
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(self.mutations, 1)
+        self.assertGreater(self.documents, 1)
+
+    async def test_hidden_provider_frame_does_not_block_native_vote(self):
+        self.hidden_widget = True
+        await self.load()
+        self.assertFalse(await vote.is_turnstile_present(self.tab))
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.mutations, 1)
+        self.assertEqual(self.documents, 1)
+
+    async def test_solved_widget_instruction_copy_does_not_block_native_vote(self):
+        self.solved_widget = self.pre_solved_widget = True
+        await self.load()
+        self.assertTrue(await vote.is_turnstile_solved(self.tab))
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(self.mutations, 1)
+        self.assertEqual(self.documents, 1)
+
+    async def test_late_application_error_during_stable_acknowledgement_is_not_success(self):
+        self.late_error = True
+        await self.load()
+        result = await self.exercise_vote()
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(self.mutations, 2)
+        self.assertGreater(self.documents, 1)
 
 
 if __name__ == "__main__":

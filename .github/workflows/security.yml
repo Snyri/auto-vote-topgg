@@ -27,9 +27,11 @@ jobs:
       - name: Install locked dependencies
         run: python -m pip install --require-hashes -r requirements.lock
       - name: Run tests
+        env:
+          REQUIRE_BROWSER_TESTS: '1'
         run: |
-          xvfb-run -a -s "-screen 0 1280x720x24" python -m unittest -v
-          python -m py_compile vote.py test_vote.py test_vote_regressions.py test_scheduler.py test_audit_dependencies.py audit_dependencies.py scheduler/scheduler.py
+          xvfb-run -a -s "-screen 0 1280x720x24" python ci_tests.py
+          python -c 'import pathlib, py_compile; [py_compile.compile(str(path), doraise=True) for path in [*pathlib.Path(".").glob("*.py"), *pathlib.Path("scheduler").glob("*.py")]]'
           python -m pip check
           git diff --check
 
@@ -42,10 +44,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Build scheduler image
-        run: docker build -t topgg-scheduler-ci scheduler
+        run: docker build --build-arg BUILD_REVISION="${{ github.sha }}" -t topgg-scheduler-ci scheduler
       - name: Verify scheduler image runtime
         run: |
-          docker run --rm --entrypoint python topgg-scheduler-ci -c 'import os, requests; assert os.geteuid() != 0; assert requests.__version__ == "2.34.2"'
+          docker run --rm -e GH_TOKEN=ci-placeholder -e GH_REPOSITORY=owner/repo --entrypoint python topgg-scheduler-ci -c 'import os, requests, scheduler; assert os.geteuid() != 0; assert requests.__version__ == "2.34.2"; assert scheduler.GH_WORKFLOW == "vote.yml"; assert scheduler.session.headers["Authorization"] == "Bearer ci-placeholder"'
+          docker run --rm -v "$PWD:/tests:ro" -w /tests --entrypoint python topgg-scheduler-ci -m unittest -v test_scheduler
 
   dependency-audit:
     runs-on: ubuntu-24.04
