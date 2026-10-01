@@ -5,26 +5,19 @@ import json
 from contextlib import suppress
 
 from nodriver import cdp
+from vote_controls import VOTE_CONTROL_JS
 
 
-TARGET_SCRIPT = """(() => {
+TARGET_SCRIPT = "(() => {" + VOTE_CONTROL_JS + """
     const state = window.__autoUiPointer || (window.__autoUiPointer = {});
     const blocked = reason => { state.since = null; return {ready: false, reason}; };
     if (document.readyState === 'loading') return blocked('loading');
     const el = document.querySelector(__SELECTOR__);
     if (!el || !el.isConnected) return blocked('missing');
-    if (el.matches(':disabled') || el.closest('[inert], [aria-disabled="true"]')) return blocked('disabled');
-    const style = getComputedStyle(el);
-    if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0 ||
-        style.pointerEvents === 'none' || !el.getClientRects().length) return blocked('hidden');
-    el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-    const rect = el.getBoundingClientRect();
-    const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
-    const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
-    if (right <= left || bottom <= top) return blocked('offscreen');
-    const x = (left + right) / 2, y = (top + bottom) / 2;
-    const hit = document.elementFromPoint(x, y);
-    if (!hit || !el.contains(hit)) return blocked('covered');
+    if (voteControl.disabled(el)) return blocked('disabled');
+    const position = voteControl.position(el, true);
+    if (!position.ready) return blocked(position.reason);
+    const {x, y, rect} = position;
     const geometry = [rect.left, rect.top, rect.width, rect.height];
     if (state.element !== el || !state.geometry || state.since == null ||
         geometry.some((value, i) => Math.abs(value - state.geometry[i]) > 1)) state.since = performance.now();
@@ -52,7 +45,7 @@ CLEAN_SCRIPT = """(() => {
 })()"""
 
 
-async def click_control(tab, evaluate, selector: str, *, kind="control", timeout=8) -> dict:
+async def click_control(tab, evaluate, selector: str, *, kind="control", timeout=8, reacquire=None) -> dict:
     """Input receipt is separate from the caller's redirect/dismissal checks."""
     kind = kind if kind in {"login", "oauth", "consent"} else "control"
     sent = False
@@ -61,14 +54,20 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
     deadline = asyncio.get_running_loop().time() + timeout
 
     async def target(arm=False):
-        script = TARGET_SCRIPT.replace("__SELECTOR__", json.dumps(selector)).replace("__ARM__", json.dumps(arm))
-        result = await asyncio.wait_for(evaluate(tab, script), timeout=2)
-        return result if isinstance(result, dict) else {"ready": False, "reason": "unavailable"}
+        try:
+            if reacquire is not None and not await reacquire():
+                return {"ready": False, "reason": "missing"}
+            script = TARGET_SCRIPT.replace("__SELECTOR__", json.dumps(selector)).replace("__ARM__", json.dumps(arm))
+            result = await asyncio.wait_for(evaluate(tab, script), timeout=2)
+            return result if isinstance(result, dict) else {"ready": False, "reason": "unavailable"}
+        except Exception:
+            return {"ready": False, "reason": "unavailable"}
 
     async def send(command):
         return await asyncio.wait_for(tab.send(command), timeout=2)
 
-    try:
+    async def prepare():
+        nonlocal reason
         while asyncio.get_running_loop().time() < deadline:
             position = await target()
             if position.get("ready") is True:
@@ -76,10 +75,14 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
                 await asyncio.sleep(0.25)
                 position = await target(arm=True)
                 if position.get("ready") is True:
-                    break
+                    return position
             reason = position.get("reason", "unavailable")
             await asyncio.sleep(0.25)
-        else:
+        return None
+
+    try:
+        position = await asyncio.wait_for(prepare(), timeout=timeout)
+        if position is None:
             return {"input_sent": False, "clicked": False}
         sent = True
         try:

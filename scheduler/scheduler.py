@@ -401,7 +401,16 @@ def latest_schedule_target(minimum_run_id=None):
     run = latest_vote_run(minimum_run_id=minimum_run_id)
     if not run or run.get("status") != "completed":
         return None
-    return schedule_from_completed_run(run)
+    schedule = schedule_from_completed_run(run)
+    if (schedule is None and minimum_run_id is not None and run["id"] > minimum_run_id
+            and run.get("conclusion") not in {"success", "neutral", "skipped"}):
+        # A setup/dispatch failure can produce no artifact. Supersede the old
+        # future timer once; after accepting this run ID, do not slide its retry
+        # target forward on every refresh. The ordinary failure Action chain
+        # remains immediate and unlimited; this is its scheduler fallback.
+        log(f"Newer failed run {run['id']} has no schedule; recovering in {ERROR_RETRY_SECONDS}s")
+        return run["id"], int(time.time()) + ERROR_RETRY_SECONDS
+    return schedule
 
 
 def wait_until(epoch, source_run_id=None):

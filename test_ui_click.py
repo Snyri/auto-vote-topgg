@@ -16,6 +16,40 @@ from test_vote_pointer import CHROME, FIXTURE
 
 
 class ApplicationClickUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stalled_reselection_is_cancelled_before_any_input(self):
+        tab = MagicMock(); tab.send = AsyncMock()
+        cancelled = asyncio.Event()
+        async def reacquire():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        with patch("builtins.print"):
+            result = await ui_click.click_control(tab, AsyncMock(), "#login", timeout=0.01, reacquire=reacquire)
+        self.assertFalse(result["input_sent"])
+        self.assertTrue(cancelled.is_set())
+        tab.send.assert_not_awaited()
+
+    async def test_transient_reselection_failure_recovers_before_input(self):
+        tab = MagicMock(); tab.send = AsyncMock()
+        reacquire = AsyncMock(side_effect=[RuntimeError("document changed"), True, True])
+        evaluate = AsyncMock(return_value={"ready": True, "x": 10, "y": 20, "clicked": True})
+        with patch("builtins.print"):
+            result = await ui_click.click_control(tab, evaluate, "#login", timeout=2, reacquire=reacquire)
+        self.assertTrue(result["input_sent"])
+        self.assertEqual(reacquire.await_count, 3)
+        self.assertEqual([next(c.args[0])["params"]["type"] for c in tab.send.await_args_list],
+                         ["mouseMoved", "mousePressed", "mouseReleased"])
+
+    async def test_missing_reselection_cannot_press_an_obsolete_marked_control(self):
+        tab = MagicMock(); tab.send = AsyncMock()
+        evaluate = AsyncMock(return_value={"ready": True, "x": 10, "y": 20})
+        with patch("builtins.print"):
+            result = await ui_click.click_control(tab, evaluate, "#login", timeout=0.01,
+                                                 reacquire=AsyncMock(return_value=False))
+        self.assertFalse(result["input_sent"])
+        tab.send.assert_not_awaited()
+
     async def test_navigation_can_destroy_receipt_without_fabricating_a_click(self):
         tab = MagicMock(); tab.send = AsyncMock()
         async def evaluate(_tab, script):
@@ -96,6 +130,48 @@ class ApplicationClickBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await vote._click_marked(self.tab, "data-auto-login"))
         self.assertEqual(await vote.evaluate(self.tab, "window.votes"), 1)
 
+    async def test_covered_and_inherited_hidden_login_copies_do_not_capture_selection(self):
+        await vote.evaluate(self.tab, """(() => {
+            vote.textContent='Login';
+            const hidden=document.createElement('div'); hidden.style.opacity='0';
+            hidden.innerHTML='<button>Login</button>';
+            const covered=document.createElement('div');
+            covered.style.cssText='position:fixed;left:0;top:0;width:80px;height:60px;z-index:2';
+            covered.innerHTML='<button style="margin:0;width:80px;height:60px">Login</button>'+
+                '<div style="position:absolute;inset:0;background:white;z-index:1"></div>';
+            document.body.prepend(hidden,covered);
+        })()""")
+        self.assertTrue(await vote._click_exact_element(self.tab, "button", ["Login"], "data-auto-login"))
+        self.assertEqual(await vote.evaluate(self.tab, "window.votes"), 1)
+        self.assertTrue(all(e["trusted"] for e in await vote.evaluate(self.tab, "window.events")))
+
+    async def test_login_and_authorize_are_reselected_after_hover_remount(self):
+        for label, marker in (("Login", "data-auto-login"), ("Authorize", "data-auto-oauth")):
+            with self.subTest(label=label):
+                await vote.evaluate(self.tab, """(() => {
+                    const button=document.getElementById('vote'); button.textContent=__LABEL__;
+                    events=[];votes=0;lastPress=null;
+                    button.addEventListener('pointerenter',()=>{
+                        const replacement=button.cloneNode(true);
+                        replacement.removeAttribute(__MARKER__);
+                        button.replaceWith(replacement); window.remounted=true;
+                    },{once:true});
+                    window.remounted=false;
+                })()""".replace("__LABEL__", json.dumps(label)).replace("__MARKER__", json.dumps(marker)))
+                # Move away so the second label also receives a new hover.
+                await self.tab.send(uc.cdp.input_.dispatch_mouse_event("mouseMoved", x=0, y=0, buttons=0))
+                self.assertTrue(await vote._click_exact_element(self.tab, "button", [label], marker))
+                self.assertTrue(await vote.evaluate(self.tab, "window.remounted"))
+                self.assertEqual(await vote.evaluate(self.tab, "window.votes"), 1)
+
+    async def test_login_can_appear_after_selection_starts(self):
+        await vote.evaluate(self.tab, """(() => {
+            const button=document.getElementById('vote');button.textContent='Login';button.remove();
+            setTimeout(()=>document.body.append(button),300);
+        })()""")
+        self.assertTrue(await vote._click_exact_element(self.tab, "button", ["Login"], "data-auto-login"))
+        self.assertEqual(await vote.evaluate(self.tab, "window.votes"), 1)
+
     async def test_consent_requires_native_input_and_observed_overlay_disappearance(self):
         await vote.evaluate(self.tab, """(() => {
             const modal=document.createElement('section'); modal.id='consent';
@@ -108,6 +184,36 @@ class ApplicationClickBrowserTests(unittest.IsolatedAsyncioTestCase):
         })()""")
         self.assertTrue(await vote.evaluate(self.tab, "Boolean(document.getElementById('consent'))"))
         self.assertTrue(await vote.dismiss_privacy_overlay(self.tab))
+        self.assertFalse(await vote.evaluate(self.tab, "Boolean(document.getElementById('consent'))"))
+
+    async def test_covered_preferred_consent_does_not_hide_a_clickable_accept(self):
+        await vote.evaluate(self.tab, """(() => {
+            const modal=document.createElement('section');modal.id='consent';
+            modal.innerHTML='<p>We value your privacy</p>'+
+                '<div style="position:relative"><button id="accept-btn">Accept</button>'+
+                '<div style="position:absolute;inset:0;background:white;z-index:1"></div></div>'+
+                '<button id="working-accept">Accept</button>';
+            document.body.append(modal);let down=false;
+            modal.addEventListener('pointerdown',e=>{down=e.isTrusted&&e.target.id==='working-accept'});
+            modal.addEventListener('click',e=>{if(down&&e.isTrusted&&e.target.id==='working-accept')modal.remove()});
+        })()""")
+        self.assertTrue(await vote.dismiss_privacy_overlay(self.tab))
+        self.assertFalse(await vote.evaluate(self.tab, "Boolean(document.getElementById('consent'))"))
+
+    async def test_consent_is_reselected_after_hover_remount(self):
+        await vote.evaluate(self.tab, """(() => {
+            const modal=document.createElement('section');modal.id='consent';
+            modal.innerHTML='<p>We value your privacy</p><button id="accept-btn">Accept</button>';
+            document.body.append(modal);const button=modal.querySelector('button');
+            button.addEventListener('pointerenter',()=>{
+                const replacement=button.cloneNode(true);replacement.removeAttribute('data-auto-consent');
+                button.replaceWith(replacement);window.consentRemounted=true;
+            },{once:true});
+            let down=false;modal.addEventListener('pointerdown',e=>{down=e.isTrusted});
+            modal.addEventListener('click',e=>{if(down&&e.isTrusted)modal.remove()});
+        })()""")
+        self.assertTrue(await vote.dismiss_privacy_overlay(self.tab))
+        self.assertTrue(await vote.evaluate(self.tab, "window.consentRemounted"))
         self.assertFalse(await vote.evaluate(self.tab, "Boolean(document.getElementById('consent'))"))
 
     async def test_hover_overlay_stops_generic_mouse_press(self):

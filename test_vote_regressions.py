@@ -357,11 +357,13 @@ class PersistentChallengeClassificationTests(unittest.IsolatedAsyncioTestCase):
             patch("vote.evaluate", new_callable=AsyncMock),
             patch("vote._mark_exact_element", new=AsyncMock(return_value=True)),
             patch("vote._click_marked", new=AsyncMock(return_value=True)),
+            patch("vote.wait_for_oauth_start", new=AsyncMock(return_value="discord")) as start,
             patch("vote.wait_for_domain", new=AsyncMock(return_value=True)) as wait,
             patch("vote._handle_discord_oauth", new=AsyncMock(return_value=vote.AUTH_BLOCKED)),
         ):
             self.assertEqual(await vote.discord_oauth_login(tab, "test-token", ["111"]), vote.AUTH_BLOCKED)
-            self.assertEqual(wait.await_count, 1)
+            start.assert_awaited_once()
+            wait.assert_not_awaited()
 
     async def test_oauth_redirect_timeouts_distinguish_persistent_challenge(self):
         for waits in ([False], [True, False]):
@@ -377,7 +379,8 @@ class PersistentChallengeClassificationTests(unittest.IsolatedAsyncioTestCase):
                 patch("vote.evaluate", new_callable=AsyncMock),
                 patch("vote._mark_exact_element", new=AsyncMock(return_value=True)),
                 patch("vote._click_marked", new=AsyncMock(return_value=True)),
-                patch("vote.wait_for_domain", new=AsyncMock(side_effect=waits)),
+                patch("vote.wait_for_oauth_start", new=AsyncMock(return_value="discord" if waits[0] else None)),
+                patch("vote.wait_for_domain", new=AsyncMock(return_value=False)),
                 patch("vote._handle_discord_oauth", new=AsyncMock(return_value=vote.AUTHENTICATED)),
                 patch("vote.is_turnstile_present", new=AsyncMock(return_value=True)),
                 patch("vote.solve_turnstile", new=AsyncMock(return_value=False)),

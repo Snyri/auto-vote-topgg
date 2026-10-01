@@ -870,19 +870,15 @@ async def wait_for_domain(tab: Any, domain: str, timeout: int) -> bool:
 
 
 async def _mark_exact_element(tab: Any, selector: str, texts: list[str], marker: str) -> bool:
-    script = f"""(() => {{
+    script = "(() => {" + VOTE_CONTROL_JS + f"""
         const wanted = new Set({json.dumps(texts)}.map(text => text.trim().toLowerCase()));
         document.querySelectorAll('[' + {json.dumps(marker)} + ']').forEach(
             node => node.removeAttribute({json.dumps(marker)})
         );
         const nodes = [...document.querySelectorAll({json.dumps(selector)})];
-        const element = nodes.find(node => {{
-            if (!wanted.has((node.textContent || '').trim().toLowerCase()) ||
-                node.matches(':disabled') || node.closest('[inert], [aria-disabled="true"]') ||
-                !node.getClientRects().length) return false;
-            const style = getComputedStyle(node);
-            return style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) !== 0;
-        }});
+        const candidates = nodes.filter(node => wanted.has((node.textContent || '').trim().toLowerCase()) &&
+            !voteControl.disabled(node) && voteControl.visible(node));
+        const element = candidates.find(node => voteControl.position(node, true).ready) || candidates[0];
         if (!element) return false;
         element.setAttribute({json.dumps(marker)}, '1');
         return true;
@@ -890,15 +886,23 @@ async def _mark_exact_element(tab: Any, selector: str, texts: list[str], marker:
     return bool(await evaluate(tab, script))
 
 
-async def _click_marked(tab: Any, marker: str) -> bool:
+async def _click_marked(tab: Any, marker: str, *, reacquire=None) -> bool:
     if marker == "data-auto-vote":
         return await _click_vote_control(tab)
     await dismiss_privacy_overlay(tab)
     kind = "oauth" if marker == "data-auto-oauth" else "login"
-    receipt = await ui_click.click_control(tab, evaluate, f'[{marker}="1"]', kind=kind)
+    receipt = await ui_click.click_control(tab, evaluate, f'[{marker}="1"]', kind=kind, reacquire=reacquire)
     # A navigation can destroy the observer. The OAuth caller still checks its
     # destination and authenticated application state; input alone is not login.
     return receipt["input_sent"] and receipt["clicked"] is not False
+
+
+async def _click_exact_element(tab: Any, selector: str, texts: list[str], marker: str) -> bool:
+    async def reacquire():
+        return await _mark_exact_element(tab, selector, texts, marker)
+    # Reacquire throughout hydration/remounts and after hover, including when
+    # the first observation has not yet exposed the control.
+    return await _click_marked(tab, marker, reacquire=reacquire)
 
 
 async def _vote_pointer_target(tab: Any, *, arm: bool = False) -> dict:
@@ -1045,7 +1049,7 @@ async def _click_vote_control(tab: Any) -> bool:
 
 
 async def dismiss_privacy_overlay(tab: Any) -> bool:
-    script = """(() => {
+    script = "(() => {" + VOTE_CONTROL_JS + """
         const body = document.body ? document.body.innerText.toLowerCase() : '';
         const present = body.includes('we value your privacy') ||
             body.includes('partners store and/or access information') ||
@@ -1056,15 +1060,13 @@ async def dismiss_privacy_overlay(tab: Any) -> bool:
         const controls = [...document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]')];
         const direct = document.querySelector('#accept-btn');
         const candidates = direct ? [direct, ...controls.filter(el => el !== direct)] : controls;
-        const target = candidates.find(el => {
-            const style = getComputedStyle(el);
-            if (!el.getClientRects().length || el.matches(':disabled') ||
-                el.closest('[inert], [aria-disabled="true"]') || style.visibility !== 'visible' ||
-                style.display === 'none' || Number(style.opacity) === 0) return false;
+        const eligible = candidates.filter(el => {
+            if (voteControl.disabled(el) || !voteControl.visible(el)) return false;
             const text = [el.innerText, el.textContent, el.value, el.getAttribute('aria-label'), el.id]
                 .filter(Boolean).join(' ').trim().toLowerCase();
             return el === direct || labels.has(text) || text.includes('agree') || text.includes('accept');
         });
+        const target = eligible.find(el => voteControl.position(el, true).ready) || eligible[0];
         if (target) target.setAttribute('data-auto-consent', '1');
         return {present: true, button_found: Boolean(target), reason: 'consent_button_not_found'};
     })()"""
@@ -1073,7 +1075,10 @@ async def dismiss_privacy_overlay(tab: Any) -> bool:
         if not isinstance(result, dict) or not result.get("present"):
             return False
         if result.get("button_found"):
-            receipt = await ui_click.click_control(tab, evaluate, '[data-auto-consent="1"]', kind="consent")
+            async def reacquire():
+                observed = await evaluate(tab, script)
+                return isinstance(observed, dict) and observed.get("present") is True and observed.get("button_found") is True
+            receipt = await ui_click.click_control(tab, evaluate, '[data-auto-consent="1"]', kind="consent", reacquire=reacquire)
             if receipt["input_sent"]:
                 for _ in range(4):
                     await asyncio.sleep(0.25)
@@ -1295,7 +1300,7 @@ async def is_topgg_authenticated(tab: Any) -> bool:
 
 async def topgg_page_auth_hint(tab: Any) -> str:
     """Infer auth only from strong vote-page UI signals; otherwise return unknown."""
-    result = await evaluate(tab, "(() => {" + VOTE_CONTROL_JS + """
+    result = await evaluate(tab, "(() => {" + VOTE_CONTROL_JS + r"""
         const body = (document.body ? document.body.innerText : '').toLowerCase();
         if (location.protocol !== 'https:' ||
             !['top.gg', 'www.top.gg'].includes(location.hostname) ||
@@ -1321,10 +1326,18 @@ async def topgg_page_auth_hint(tab: Any) -> str:
             body.includes('already voted') ||
             body.includes('can vote again');
 
-        if (loginRequired || (hasLoginButton && !hasVoteSurface)) return 'invalid';
+        if (loginRequired) return 'invalid';
         if (hasVoteSurface) return 'authenticated';
+        if (body.includes('thanks for voting') && /^\/bot\/[0-9]+\/vote\/?$/.test(location.pathname))
+            return 'acknowledgement';
+        if (hasLoginButton) return 'invalid';
         return 'unknown';
     })()""")
+    if result == "acknowledgement":
+        path = urlparse(await current_url(tab)).path
+        match = re.fullmatch(r"/bot/([0-9]+)/vote/?", path)
+        if match and (await vote_page_confirmation(tab, match.group(1))).get("confirmed") is True:
+            return AUTHENTICATED
     return result if result in {AUTHENTICATED, AUTH_INVALID} else "unknown"
 
 
@@ -1484,7 +1497,7 @@ async def _handle_discord_oauth(tab: Any) -> str:
             return await unresolved_challenge_auth_state(tab)
         marker = "data-auto-oauth"
         if await _mark_exact_element(tab, "button", ["Authorize", "Authorise"], marker):
-            if await _click_marked(tab, marker):
+            if await _click_exact_element(tab, "button", ["Authorize", "Authorise"], marker):
                 dbg(f"Authorize clicked (attempt {attempt + 1})")
                 return AUTHENTICATED
         await evaluate(tab, """(() => {
@@ -1539,23 +1552,24 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
         return state
 
     marker = "data-auto-login"
-    if not await _mark_exact_element(
-        tab,
-        "a,button,[role=\"button\"]",
-        ["Login", "Log in", "Sign in"],
-        marker,
-    ):
-        print("  ❌ Could not find top.gg Login button")
-        return AUTH_INVALID
-    if not await _click_marked(tab, marker):
+    before = await evaluate(tab, "({url: location.href, epoch: performance.timeOrigin})")
+    if not await _click_exact_element(tab, 'a,button,[role="button"]', ["Login", "Log in", "Sign in"], marker):
         print("  ❌ Could not click top.gg Login button")
         return AUTH_INVALID
-    if not await wait_for_domain(tab, "discord.com", TIMEOUT_OAUTH_SEC):
+    destination = await wait_for_oauth_start(tab, before)
+    if destination is None:
         if await is_turnstile_present(tab) and not await solve_turnstile(tab):
             return await unresolved_challenge_auth_state(tab)
         print("  ❌ Discord OAuth page did not open")
         return AUTH_INVALID
-    if "/oauth2/authorize" not in urlparse(await current_url(tab)).path:
+    destination_url = await current_url(tab)
+    if destination == "topgg" or url_has_domain(destination_url, "top.gg"):
+        # Existing Discord grants can pass through authorize faster than a
+        # browser poll. The returned application still has to validate auth.
+        await asyncio.sleep(3)
+        await settle_privacy_overlay(tab)
+        return await topgg_auth_state(tab)
+    if "/oauth2/authorize" not in urlparse(destination_url).path:
         print("  ❌ Unexpected Discord redirect")
         return AUTH_INVALID
 
@@ -1576,6 +1590,39 @@ async def discord_oauth_login(tab: Any, token: str, bot_ids: list[str]) -> str:
     state = await topgg_auth_state(tab)
     print("  ✅ Logged into top.gg" if state == AUTHENTICATED else "  ❌ top.gg session not established")
     return state
+
+
+async def wait_for_oauth_start(tab: Any, before: dict) -> str | None:
+    """Observe either the Discord dialog or an already completed return."""
+    deadline = asyncio.get_running_loop().time() + TIMEOUT_OAUTH_SEC
+    before_epoch = request_diagnostics.number(before.get("epoch")) if isinstance(before, dict) else None
+
+    async def observe():
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                snapshot = await asyncio.wait_for(evaluate(tab, "({url: location.href, epoch: performance.timeOrigin})"),
+                    timeout=min(2, max(0.001, deadline - asyncio.get_running_loop().time())))
+                url = snapshot.get("url") if isinstance(snapshot, dict) else None
+                parsed = urlparse(url) if isinstance(url, str) else None
+                if (parsed is not None and parsed.scheme == "https" and parsed.port in {None, 443}
+                        and not parsed.username and not parsed.password):
+                    if parsed.hostname in {"discord.com", "www.discord.com"}:
+                        return "discord"
+                    if parsed.hostname in {"top.gg", "www.top.gg"} and not parsed.path.startswith("/api/auth/"):
+                        epoch = request_diagnostics.number(snapshot.get("epoch"))
+                        if (before_epoch is not None and epoch is not None and epoch > before_epoch
+                                or await topgg_page_auth_hint(tab) == AUTHENTICATED):
+                            return "topgg"
+            except Exception:
+                # Execution contexts can disappear during an ordinary redirect.
+                pass
+            await asyncio.sleep(min(0.25, max(0, deadline - asyncio.get_running_loop().time())))
+        return None
+
+    try:
+        return await asyncio.wait_for(observe(), timeout=TIMEOUT_OAUTH_SEC)
+    except asyncio.TimeoutError:
+        return None
 
 
 async def is_cloudflare_challenge_page(tab: Any) -> bool:
