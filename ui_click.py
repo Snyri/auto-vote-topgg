@@ -70,13 +70,12 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
 
     async def prepare():
         nonlocal reason
-        activated = False
+        # Activate before waiting for layout stability: a background document
+        # may not expose a settled layout until Chrome foregrounds the tab.
+        await browser_environment.foreground(tab)
         while asyncio.get_running_loop().time() < deadline:
             position = await target()
             if position.get("ready") is True:
-                if not activated:
-                    await browser_environment.foreground(tab)
-                    activated = True
                 await send(cdp.input_.dispatch_mouse_event("mouseMoved", x=position["x"], y=position["y"], buttons=0))
                 await asyncio.sleep(0.25)
                 position = await target(arm=True)

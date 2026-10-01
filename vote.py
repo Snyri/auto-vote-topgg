@@ -974,7 +974,7 @@ async def _click_vote_control(tab: Any) -> bool:
     deadline = asyncio.get_running_loop().time() + TIMEOUT_VOTE_SEC
     try:
         async with asyncio.timeout(TIMEOUT_VOTE_SEC):
-            activated = False
+            await browser_environment.foreground(tab)
             while asyncio.get_running_loop().time() < deadline:
                 await _wait_for_vote_api(tab)
                 await dismiss_privacy_overlay(tab)
@@ -982,9 +982,6 @@ async def _click_vote_control(tab: Any) -> bool:
                 await mark_vote_button(tab)
                 target = await _vote_pointer_target(tab)
                 if target.get("ready") is True:
-                    if not activated:
-                        await browser_environment.foreground(tab)
-                        activated = True
                     await asyncio.wait_for(tab.send(uc.cdp.input_.dispatch_mouse_event(
                         "mouseMoved", x=target["x"], y=target["y"], buttons=0,
                     )), timeout=2)

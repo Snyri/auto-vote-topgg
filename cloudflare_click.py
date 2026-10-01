@@ -509,6 +509,9 @@ async def _click_cloudflare_checkbox_impl(tab, evaluate, cleared) -> str:
     while loop.time() < deadline:
         if await cleared():
             return "cleared"
+        if not activated:
+            await browser_environment.foreground(tab)
+            activated = True
         try:
             target = await checkbox_target(tab, evaluate)
         except Exception:
@@ -518,9 +521,6 @@ async def _click_cloudflare_checkbox_impl(tab, evaluate, cleared) -> str:
                 stable_since = loop.time()
             previous = target
             if loop.time() - stable_since >= TARGET_STABLE_SEC:
-                if not activated:
-                    await browser_environment.foreground(tab)
-                    activated = True
                 await _send(tab, cdp.input_.dispatch_mouse_event(
                     "mouseMoved", x=target["x"], y=target["y"], buttons=0,
                 ))

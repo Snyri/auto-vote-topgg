@@ -28,7 +28,7 @@ class ApplicationClickUnitTests(unittest.IsolatedAsyncioTestCase):
             result = await ui_click.click_control(tab, AsyncMock(), "#login", timeout=0.01, reacquire=reacquire)
         self.assertFalse(result["input_sent"])
         self.assertTrue(cancelled.is_set())
-        tab.send.assert_not_awaited()
+        self.assertFalse(any(next(call.args[0])["method"] == "Input.dispatchMouseEvent" for call in tab.send.await_args_list))
 
     async def test_transient_reselection_failure_recovers_before_input(self):
         tab = MagicMock(); tab.send = AsyncMock()
@@ -49,7 +49,7 @@ class ApplicationClickUnitTests(unittest.IsolatedAsyncioTestCase):
             result = await ui_click.click_control(tab, evaluate, "#login", timeout=0.01,
                                                  reacquire=AsyncMock(return_value=False))
         self.assertFalse(result["input_sent"])
-        tab.send.assert_not_awaited()
+        self.assertFalse(any(next(call.args[0])["method"] == "Input.dispatchMouseEvent" for call in tab.send.await_args_list))
 
     async def test_navigation_can_destroy_receipt_without_fabricating_a_click(self):
         tab = MagicMock(); tab.send = AsyncMock()

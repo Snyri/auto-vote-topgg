@@ -143,10 +143,12 @@ class OAuthBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.block_session=True
         session=vote.AccountBrowserSession()
         session.browser,session.tab,session.diagnostics=self.browser,self.tab,self.tracker
+        cookies=vote.load_topgg_cookies(raw=json.dumps([
+            {"name":"authjs.session-token", "value":"local-only-cookie", "domain":".top.gg", "path":"/", "secure":True}]))[0]
         try:
             with patch("vote.vote_for_bot",new=AsyncMock(return_value={"bot_id":"111","status":"success"})) as cast:
                 results=await asyncio.wait_for(vote._run_account("local-only-fixture-token",["111"],"fixture",
-                    [{"name":"authjs.session-token", "value":"local-only-cookie", "domain":".top.gg", "path":"/", "secure":True}],
+                    cookies,
                     session=session),75)
             self.assertEqual(results[0]["status"],"success")
             self.assertEqual(self.login_requests,1)

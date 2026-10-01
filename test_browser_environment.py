@@ -108,7 +108,7 @@ class HeadedChromeTests(unittest.IsolatedAsyncioTestCase):
         self.browser = uc.Browser(environment.ChromeConfig(headless=False, browser_executable_path=CHROME,
             user_data_dir=str(folder / "profile"), sandbox=getattr(os,"geteuid",lambda:1)()!=0,
             # Certificate exception and host mappings belong only to this local fixture.
-            browser_args=["--disable-dev-shm-usage", "--no-proxy-server", "--ignore-certificate-errors", "--site-per-process",
+            browser_args=["--window-size=1280,720", "--disable-dev-shm-usage", "--no-proxy-server", "--ignore-certificate-errors", "--site-per-process",
                 "--host-resolver-rules=MAP top.gg 127.0.0.1,MAP challenges.cloudflare.com 127.0.0.1"]))
         try:
             try: await asyncio.wait_for(self.browser.start(), 20)
@@ -134,7 +134,10 @@ class HeadedChromeTests(unittest.IsolatedAsyncioTestCase):
         await vote.navigate_page(self.tab, "https://top.gg:" + str(self.server.server_port) + "/login-fixture")
         other = await self.browser.get("about:blank", new_tab=True)
         await environment.foreground(other)
-        self.assertTrue(await vote._click_exact_element(self.tab, "button", ["Login"], "data-auto-login"))
+        await environment.log_facts(self.tab, vote.evaluate, "startup")
+        clicked=await vote._click_exact_element(self.tab, "button", ["Login"], "data-auto-login")
+        await environment.log_facts(self.tab, vote.evaluate, "startup")
+        self.assertTrue(clicked)
         receipts = await vote.evaluate(self.tab, "window.received")
         self.assertEqual(len(receipts), 1)
         self.assertTrue(receipts[0]["trusted"])
