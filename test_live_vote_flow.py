@@ -41,6 +41,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.omit_reloaded_read = False
         self.mutation_field = "castVote"
         self.mutation_error = False
+        self.mutation_status = 200
         self.solved_widget = False
         self.audit_error = False
         self.cloud_widget = False
@@ -123,7 +124,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
                     status, headers, body = 200, {"content-type":"application/json"}, '{"errors":[{"extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}'
                 else:
                     self.mutations += 1
-                    status, headers = 200, {"content-type": "application/json"}
+                    status, headers = self.mutation_status, {"content-type": "application/json"}
                     body = ('{"errors":[{"extensions":{"code":"CAPTCHA_REQUIRED"},"message":"PRIVATE_FIXTURE_ERROR"}]}'
                             if self.mutation_error else json.dumps({"data": {self.mutation_field: {"ok": True}}}))
             await self.tab.send(uc.cdp.fetch.fulfill_request(
@@ -207,8 +208,7 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.documents, 1)
         self.assertEqual(self.mutations, 1)
 
-    async def test_cross_origin_closed_shadow_control_is_reachable_without_image_matching(self):
-        from unittest.mock import AsyncMock
+    async def load_widget(self):
         self.cloud_widget = True
         await self.load()
         for _ in range(100):
@@ -218,47 +218,47 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.provider_documents, 1, "Provider document must be fulfilled locally")
         self.assertTrue(await vote.evaluate(self.tab, "window.widgetClick?.ready === true"),
                         "Cross-origin fixture must finish loading before input")
-        for _ in range(100):
-            if (await cloudflare_click.widget_state(self.tab))["present"]:
-                break
-            await asyncio.sleep(0.05)
-        # Fixture-only diagnostics distinguish a missing child document from a
-        # coordinate/hit-test failure. These contain no real-site state.
-        document = await self.tab.send(uc.cdp.dom.get_document(depth=-1, pierce=True))
-        pending, nodes, candidates = [document], [], []
-        while pending:
-            node = pending.pop()
-            if node.node_name in {"IFRAME", "INPUT", "#document"}:
-                nodes.append({"name":node.node_name, "frame":str(node.frame_id),
-                              "backend":int(node.backend_node_id),
-                              "document":bool(node.content_document)})
-            if node.node_name == "INPUT":
-                candidates.append(node.backend_node_id)
-            pending.extend((node.children or []) + (node.shadow_roots or []))
-            if node.content_document:
-                pending.append(node.content_document)
-        print("Local cross-origin DOM:", json.dumps(nodes))
-        for backend in candidates:
-            try:
-                box = await self.tab.send(uc.cdp.dom.get_box_model(backend_node_id=backend))
-                x, y = sum(box.border[::2])/4, sum(box.border[1::2])/4
-                print("Local cross-origin hit:", json.dumps({"border":box.border,
-                    "hit":await cloudflare_click._hit_target(self.tab,x,y)}))
-            except Exception as exc:
-                print("Local cross-origin observation error:", type(exc).__name__)
-        print("Local cross-origin targets:", [(x.type_, x.url) for x in await self.tab.send(uc.cdp.target.get_targets())])
-        viewport = await vote.evaluate(self.tab, "({width:innerWidth,height:innerHeight})")
-        print("Local cross-origin semantic:", await cloudflare_click.semantic_checkbox_target(
-            self.tab, viewport["width"], viewport["height"]))
-        with patch.object(cloudflare_click, "match_checkbox", side_effect=AssertionError("semantic target required")):
+        self.assertTrue((await cloudflare_click.widget_state(self.tab))["present"])
+
+    async def test_cross_origin_closed_shadow_control_is_reachable_without_image_matching(self):
+        from unittest.mock import AsyncMock
+        await self.load_widget()
+        session_id = self.tab.session_id
+        await vote.evaluate(self.tab, """(() => {
+            const frame = document.querySelector('iframe');
+            frame.style.transform = 'scale(0.75)';
+            frame.style.transformOrigin = 'top left';
+        })()""")
+        with (patch.object(cloudflare_click, "match_checkbox", side_effect=AssertionError("semantic target required")),
+              patch("builtins.print") as output):
             result = await cloudflare_click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
         self.assertEqual(result, "sent")
+        self.assertEqual(self.tab.session_id, session_id)
         for _ in range(100):
             value = await vote.evaluate(self.tab, "window.widgetClick")
-            if value:
+            if isinstance(value, dict) and "trusted" in value:
                 break
             await asyncio.sleep(0.05)
         self.assertEqual(value, {"trusted":True})
+        receipts = [json.loads(str(x.args[0]).split(': ',1)[1]) for x in output.call_args_list
+                    if str(x.args[0]).startswith('  → Cloudflare mouse input: ')]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["target_source"], "frame_dom")
+        self.assertTrue(all(receipts[0]["trusted_events"].values()))
+
+    async def test_parent_overlay_blocks_cross_origin_checkbox_input(self):
+        from unittest.mock import AsyncMock
+        await self.load_widget()
+        await vote.evaluate(self.tab, """(() => {
+            const cover = document.createElement('div');
+            cover.style.cssText='position:fixed;inset:0;background:white;z-index:1000';
+            document.body.append(cover);
+        })()""")
+        with (patch.object(cloudflare_click, "match_checkbox", side_effect=AssertionError("semantic target required")),
+              patch.object(cloudflare_click, "TARGET_WAIT_SEC", 2)):
+            result = await cloudflare_click.click_cloudflare_checkbox(self.tab, vote.evaluate, AsyncMock(return_value=False))
+        self.assertEqual(result, "unavailable")
+        self.assertEqual(await vote.evaluate(self.tab, "window.widgetClick"), {"ready":True})
 
     async def test_a_new_document_does_not_inherit_an_old_api_denial(self):
         self.block_reads, self.omit_reloaded_read = "first", True
@@ -295,6 +295,14 @@ class LiveVoteFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mutations, 1)
         self.assertEqual(self.tracker.vote_network.submission_outcome(), "captcha_required")
         self.assertNotIn("PRIVATE", repr(self.tracker.completed))
+
+    async def test_http_denial_cannot_accept_an_optimistic_acknowledgement(self):
+        self.mutation_field, self.mutation_status = "submitEntityBallot", 403
+        await self.load()
+        result = await self.exercise_vote()
+        self.assertNotEqual(result["status"], "success")
+        self.assertEqual(self.mutations, 1)
+        self.assertGreater(self.documents, 1)
 
     async def test_solved_widget_does_not_force_reload_after_fresh_ack(self):
         self.solved_widget = True

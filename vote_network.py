@@ -298,7 +298,7 @@ class VoteNetworkState:
         if not self.armed or not self.trusted or self.pressed_at is None:
             return None
         requests = [info for info in self.candidates.values()
-                    if info["application_submission"]
+                    if (info["application_submission"] or info["operation"] == "vote_submission")
                     and info["context"] == self.context and info["generation"] == self.generation
                     and info["started"] is not None and info["started"] >= self.pressed_at]
         if not requests:
@@ -309,13 +309,20 @@ class VoteNetworkState:
         if known:
             requests = known
         latest = max(requests, key=lambda info: info["started"])
+        def observed_outcome(info):
+            if not info["finished"]:
+                return "pending"
+            if info["challenge"] and info["statuses"] == {403}:
+                return "protection_rejected"
+            if any(status >= 400 for status in info["statuses"]):
+                return "error"
+            return info["response_outcome"]
         if not known:
             for info in requests:
-                if info["finished"] and info["response_outcome"] in {"captcha_required", "unauthenticated", "error", "invalid"}:
-                    return info["response_outcome"]
-        if latest["finished"] and latest["challenge"] and latest["statuses"] == {403}:
-            return "protection_rejected"
-        return latest["response_outcome"] if latest["finished"] else "pending"
+                outcome = observed_outcome(info)
+                if outcome in {"captcha_required", "unauthenticated", "error", "invalid", "protection_rejected"}:
+                    return outcome
+        return observed_outcome(latest)
 
     def definitely_rejected(self):
         if not self.armed or not self.trusted or self.pressed_at is None or self.incomplete:

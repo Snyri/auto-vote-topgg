@@ -166,6 +166,25 @@ class NetworkDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.definitely_rejected())
         self.assertNotIn("PRIVATE", repr(log.call_args_list))
 
+    async def test_http_failure_of_targeted_mutation_is_not_a_healthy_acknowledgement(self):
+        for field in ("castVote", "submitEntityBallot"):
+            for status in (401, 403, 500):
+                with self.subTest(field=field, status=status):
+                    state = self.tracker.vote_network
+                    state.select_bot("111")
+                    state.begin_input()
+                    state.receipt({"pressed":True,"released":True,"clicked":True,"pressed_at":100})
+                    with patch("builtins.print"):
+                        await self.tracker.on_request(NS(request_id="http-error", wall_time=101,
+                            document_url="https://top.gg/bot/111/vote", redirect_response=None,
+                            request=NS(url="https://top.gg/api/graphql", method="POST",
+                                post_data=graphql_payload('mutation Cast { '+field+'(botId:"111") { ok } }'))))
+                        await self.tracker.on_response(NS(request_id="http-error", response=NS(status=status,
+                            headers={"content-type":"application/json"})))
+                        await self.tracker.on_finished(NS(request_id="http-error"))
+                    self.assertEqual(state.submission_outcome(), "error")
+                    self.assertFalse(state.definitely_rejected())
+
     async def test_committed_main_document_clears_old_gates_and_late_responses_cannot_restore_them(self):
         state = self.tracker.vote_network
         state.select_bot("111")
