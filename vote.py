@@ -24,6 +24,7 @@ import request_diagnostics
 import ui_click
 import browser_environment
 import native_mouse
+import flaresolverr_browser
 from page_signals import CHALLENGE_JS
 from vote_controls import VOTE_CONTROL_JS
 from recovery_state import SubmissionJournal
@@ -2579,10 +2580,17 @@ async def close_browser_safely(browser: Any, context: str) -> bool:
         return False
 
 
-async def start_browser() -> Any:
+async def start_browser(*, initial_url: str | None = None) -> Any:
     last_error = None
     last_error_detail = "no detail"
     scrub_browser_environment()
+    if os.environ.get("FLARESOLVERR_URL", "").strip():
+        try:
+            browser = await flaresolverr_browser.start(initial_url)
+            await browser_environment.log_facts(next(iter(browser)), evaluate, "startup")
+            return browser
+        except Exception as exc:
+            print(f"  ⚠️  Free FlareSolverr unavailable ({type(exc).__name__}); starting ordinary Chrome")
     for attempt in range(1, BROWSER_START_RETRIES + 1):
         profile_path = tempfile.mkdtemp(prefix="auto-vote-topgg-")
         config = browser_environment.ChromeConfig(
@@ -2647,9 +2655,9 @@ class AccountBrowserSession:
         self.authenticated = False
         self.diagnostics = None
 
-    async def acquire(self):
+    async def acquire(self, *, initial_url=None):
         if self.browser is None:
-            self.browser = await start_browser()
+            self.browser = await start_browser(initial_url=initial_url) if initial_url else await start_browser()
             self.tab = next(iter(self.browser))
             self.diagnostics = request_diagnostics.RequestDiagnostics(self.tab)
             if not await self.diagnostics.start():
@@ -2699,7 +2707,7 @@ async def _run_account(
     session = session if session is not None else AccountBrowserSession()
     results = []
     try:
-        browser, tab = await session.acquire()
+        browser, tab = await session.acquire(initial_url=f"https://top.gg/bot/{bot_ids[0]}/vote" if bot_ids else None)
         if bot_ids:
             request_diagnostics.select_vote_bot(tab, bot_ids[0])
         auth_state = AUTH_INVALID
