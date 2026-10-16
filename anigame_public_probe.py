@@ -50,7 +50,8 @@ async def main():
                 continue
             resource = await vote.evaluate(tab, "fetch(" + json.dumps(url) + ").then(async r => ({status:r.status, source:await r.text()}))")
             text = resource.get("source", "")
-            if resource.get("status") == 200 and ("/api/vote/" in text or 'rel:\"preload\"' in text or 'VotePage' in text):
+            print(json.dumps({"asset_summary": parsed.path, "status": resource.get("status"), "length": len(text), "vote_mentions": text.lower().count("vote")}))
+            if resource.get("status") == 200 and ("/api/vote" in text or parsed.path.endswith("3ivcc6t1s04dh.js") or parsed.path.endswith("0l-manuc7x-06.js") or parsed.path.endswith("3issewngvlwwb.js")):
                 print(json.dumps({"public_asset": parsed.path, "status": resource["status"], "source": text}))
         tab.add_handler(uc.cdp.debugger.ScriptParsed, inspect)
         await tab.send(uc.cdp.debugger.enable())
