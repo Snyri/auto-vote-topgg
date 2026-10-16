@@ -1,51 +1,58 @@
-"""Inspect public AniGame assets only; no sign-in and no vote submission."""
+"""Inspect public AniGame client code in an empty browser; never sign in or vote."""
 
-import concurrent.futures
+import asyncio
 import hashlib
 import json
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
+from urllib.parse import urlparse
+
+import nodriver as uc
+import vote
 
 
-ROOT = "https://www.anigame.gg"
+async def main():
+    browser = await vote.start_browser(initial_url="https://www.anigame.gg/vote")
+    pending, results, seen = set(), [], set()
 
-
-def read(url):
-    try:
-        with urllib.request.urlopen(url, timeout=20) as response:
-            return response.status, response.read(3_000_000).decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(1000).decode("utf-8", "replace")
-
-
-def main():
-    status, html = read(ROOT + "/vote")
-    print(json.dumps({"document_status": status, "length": len(html)}))
-    if status != 200:
-        print(html[:500])
-        return
-    paths = sorted(set(re.findall(r'/_next/static/chunks/[^"\\\s<>]+\.js', html)))
-    def inspect(path):
-        status, text = read(ROOT + path)
-        excerpts = []
-        if status == 200:
-            matches = list(re.finditer(r'/api/|cooldown|vote|claim|turnstile|nextVote|canVote|top\.gg', text, re.I))
+    async def inspect(event):
+        parsed = urlparse(event.url)
+        if parsed.hostname not in {"anigame.gg", "www.anigame.gg"} or not parsed.path.startswith("/_next/static/chunks/") or event.script_id in seen:
+            return
+        seen.add(event.script_id)
+        task = asyncio.current_task()
+        pending.add(task)
+        try:
+            source = await tab.send(uc.cdp.debugger.get_script_source(event.script_id))
+            text = source[0] if isinstance(source, tuple) else source
             spans = []
-            for match in matches:
-                left, right = max(0, match.start() - 250), min(len(text), match.end() + 450)
+            for match in re.finditer(r'/api/|cooldown|vote|claim|turnstile|nextVote|canVote|top\.gg', text, re.I):
+                left, right = max(0, match.start() - 250), min(len(text), match.end() + 500)
                 if spans and left <= spans[-1][1]:
                     spans[-1][1] = max(spans[-1][1], right)
                 else:
                     spans.append([left, right])
             excerpts = [text[left:right] for left, right in spans]
-        return {"path": path, "status": status, "length": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest(), "excerpts": excerpts}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        for result in executor.map(inspect, paths):
-            if result["excerpts"] or result["status"] != 200:
-                print(json.dumps(result))
+            if excerpts:
+                results.append({"path": parsed.path, "length": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest(), "excerpts": excerpts})
+        finally:
+            pending.discard(task)
+
+    try:
+        tab = browser.tabs[0]
+        if "anigame.gg/vote" not in await vote.current_url(tab):
+            await vote.navigate_page(tab, "https://www.anigame.gg/vote")
+        await asyncio.sleep(10)
+        print(json.dumps({"public_page_text": (await vote.body_text(tab))[:2500]}))
+        tab.add_handler(uc.cdp.debugger.ScriptParsed, inspect)
+        await tab.send(uc.cdp.debugger.enable())
+        await asyncio.sleep(5)
+        if pending:
+            await asyncio.wait_for(asyncio.gather(*list(pending)), 20)
+        for result in sorted(results, key=lambda item: item["path"]):
+            print(json.dumps(result))
+    finally:
+        await vote.close_browser(browser)
 
 
 if __name__ == "__main__":
-    main()
+    uc.loop().run_until_complete(main())
