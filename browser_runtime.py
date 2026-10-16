@@ -96,7 +96,7 @@ def consume_secret(name: str) -> str:
 
 
 def scrub_browser_environment() -> None:
-    for name in ("TOKENS", "ANIGAME_COOKIES_JSON", "TG_BOT_TOKEN", "TG_CHAT_ID"):
+    for name in ("TOKENS", "TOPGG_COOKIES_JSON", "ANIGAME_COOKIES_JSON", "TG_BOT_TOKEN", "TG_CHAT_ID"):
         os.environ.pop(name, None)
         os.environ.pop(f"{name}_FILE", None)
     # Preserve a valid session bus (for example from dbus-run-session) but

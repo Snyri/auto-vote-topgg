@@ -305,10 +305,10 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
         browser.start = AsyncMock(side_effect=RuntimeError('connect failed'))
         browser.aclose = AsyncMock()
         browser._process = None
-        with patch.dict(os.environ, {'TOKENS': 'token', 'ANIGAME_COOKIES_JSON': 'cookies', 'TG_BOT_TOKEN': 'telegram', 'TG_CHAT_ID': 'chat'}, clear=False):
+        with patch.dict(os.environ, {'TOKENS': 'token', 'ANIGAME_COOKIES_JSON': 'cookies', 'TOPGG_COOKIES_JSON': 'retired-session', 'TG_BOT_TOKEN': 'telegram', 'TG_CHAT_ID': 'chat'}, clear=False):
             with self.assertRaises(vote.BrowserStartupError):
                 await vote.start_browser()
-            for name in ('TOKENS', 'ANIGAME_COOKIES_JSON', 'TG_BOT_TOKEN', 'TG_CHAT_ID'):
+            for name in ('TOKENS', 'ANIGAME_COOKIES_JSON', 'TOPGG_COOKIES_JSON', 'TG_BOT_TOKEN', 'TG_CHAT_ID'):
                 self.assertNotIn(name, os.environ)
         profile_path = config_class.call_args.kwargs['user_data_dir']
         self.assertFalse(os.path.exists(profile_path))
