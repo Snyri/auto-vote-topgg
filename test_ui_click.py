@@ -117,7 +117,7 @@ class ApplicationClickBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_and_authorize_receive_trusted_input_instead_of_js_clicks(self):
         for label, marker in (('Login', 'data-auto-login'), ('Authorize', 'data-auto-oauth')):
             with self.subTest(label=label):
-                await vote.evaluate(self.tab, 'browser_runtime.textContent=' + json.dumps(label) + '; events=[]; votes=0; lastPress=null;')
+                await vote.evaluate(self.tab, 'vote.textContent=' + json.dumps(label) + '; events=[]; votes=0; lastPress=null;')
                 self.assertTrue(await vote._mark_exact_element(self.tab, 'button', [label], marker))
                 self.assertTrue(await vote._click_marked(self.tab, marker))
                 self.assertEqual(await vote.evaluate(self.tab, 'window.votes'), 1)
@@ -178,5 +178,7 @@ class ApplicationClickBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_residual_managed_title_does_not_block_an_actionable_vote(self):
         await vote.evaluate(self.tab, "document.title='Just a moment...'")
         self.assertFalse(await vote.is_turnstile_present(self.tab))
-        self.assertTrue(await vote._click_marked(self.tab, 'data-auto-vote'))
+        receipt = await ui_click.click_control(self.tab, vote.evaluate, '#vote', kind='control')
+        self.assertTrue(receipt['input_sent'])
+        self.assertTrue(receipt['clicked'])
         self.assertEqual(await vote.evaluate(self.tab, 'window.votes'), 1)
