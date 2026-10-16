@@ -47,6 +47,7 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.deadline = int(time.time()) + 1200
         self.guard = None
         self.errors = []
+        self.closing = False
         self.authenticated = True
         self.cookie_login = False
         self.discord_logins = 0
@@ -83,6 +84,7 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
             raise
 
     async def close_fixture(self):
+        self.closing = True
         process = getattr(self.browser, "_process", None)
         with suppress(Exception):
             await asyncio.wait_for(self.browser.aclose(), 5)
@@ -211,6 +213,10 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
                 response_headers=[uc.cdp.fetch.HeaderEntry(name=k,value=v) for k,v in headers.items()],
                 body=base64.b64encode(body.encode()).decode()))
         except Exception as exc:
+            if self.closing and isinstance(exc, ConnectionError):
+                # Destroying the browser rejects outstanding favicon/fixture
+                # replies. A connection failure before teardown remains fatal.
+                return
             self.errors.append(type(exc).__name__)
 
     async def open_page(self):
