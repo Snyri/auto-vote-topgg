@@ -11,9 +11,12 @@ MAX_RECORDS = 256
 PENDING_LIFETIME = 12 * 3600 + 30
 
 
-def configuration_scope(tokens, bot_ids):
+def configuration_scope(tokens, bot_ids, namespace=""):
     accounts = sorted(hashlib.sha256(token.encode()).hexdigest() for token in tokens)
-    return hashlib.sha256(json.dumps([accounts, sorted(bot_ids)], separators=(",", ":")).encode()).hexdigest()
+    scope = [accounts, sorted(bot_ids)]
+    if namespace:
+        scope.insert(0, namespace)
+    return hashlib.sha256(json.dumps(scope, separators=(",", ":")).encode()).hexdigest()
 
 
 def validate_state(data, now=None):
@@ -33,23 +36,30 @@ def validate_state(data, now=None):
 
 
 class SubmissionJournal:
-    def __init__(self, path, tokens, bot_ids, clock=time.time):
+    def __init__(self, path, tokens, bot_ids, clock=time.time, *, namespace=""):
         self.path, self.clock = Path(path), clock
-        self.scope = configuration_scope(tokens, bot_ids)
+        self.namespace = namespace
+        self.scope = configuration_scope(tokens, bot_ids, namespace)
         self.records, self.active_key = {}, None
         if self.path.exists():
             if self.path.stat().st_size > MAX_STATE_BYTES:
                 raise ValueError("Vote recovery state is too large")
             data = validate_state(json.loads(self.path.read_text(encoding="utf-8")), self.clock())
-            allowed = {hashlib.sha256((token + "\0" + bot_id).encode()).hexdigest()
+            allowed = {self._key(token, bot_id)
                        for token in tokens for bot_id in bot_ids}
             self.records = {key: dict(value) for key, value in data["records"].items()
                             if key in allowed and value["until"] > self.clock()}
         self.save()
 
     def select(self, token, bot_id):
-        self.active_key = hashlib.sha256((token + "\0" + bot_id).encode()).hexdigest()
+        self.active_key = self._key(token, bot_id)
         return self.records.get(self.active_key)
+
+    def _key(self, token, bot_id):
+        value = token + "\0" + bot_id
+        if self.namespace:
+            value = self.namespace + "\0" + value
+        return hashlib.sha256(value.encode()).hexdigest()
 
     def save(self):
         data = {"version": 1, "scope": self.scope, "records": self.records}
@@ -75,3 +85,4 @@ class SubmissionJournal:
     def clear_current(self):
         self.records.pop(self.active_key, None)
         self.save()
+
