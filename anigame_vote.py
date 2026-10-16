@@ -92,7 +92,9 @@ def valid_oauth(url):
 def load_cookies(raw, count):
     if not raw.strip():
         return [[] for _ in range(count)]
-    lines = raw.strip().splitlines()
+    # A normal cookie export is often indented JSON. One account does not
+    # require converting that valid export to a single physical line.
+    lines = [raw.strip()] if count == 1 else raw.strip().splitlines()
     if len(lines) != count:
         raise ValueError("ANIGAME_COOKIES_JSON must have one JSON array per account")
     result = []

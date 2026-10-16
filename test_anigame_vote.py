@@ -48,6 +48,7 @@ class AniGamePageTests(unittest.TestCase):
         cookies = [{"name":"session","value":"PRIVATE","domain":".anigame.gg"},
                    {"name":"cf_clearance","value":"DEVICE_BOUND","domain":".anigame.gg"}]
         self.assertEqual(len(client.load_cookies(json.dumps(cookies), 1)[0]), 1)
+        self.assertEqual(client.load_cookies(json.dumps(cookies, indent=2), 1), [cookies[:1]])
         cookies[0]["domain"] = ".top.gg"
         with self.assertRaisesRegex(ValueError, "AniGame"):
             client.load_cookies(json.dumps(cookies), 1)
