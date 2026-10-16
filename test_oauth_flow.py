@@ -170,7 +170,20 @@ class OAuthBrowserTests(unittest.IsolatedAsyncioTestCase):
         ]
         for script in variants:
             with self.subTest(script=script):
+                previous = await vote.evaluate(self.tab, "performance.timeOrigin")
                 await vote.navigate_page(self.tab,PAGE)
-                await vote.evaluate(self.tab,script)
+                for _ in range(100):
+                    try:
+                        state = await vote.evaluate(self.tab, """({epoch:performance.timeOrigin,
+                            ready:document.readyState === 'complete' && !!document.querySelector('#login')})""")
+                        if isinstance(state,dict) and state.get("epoch") != previous and state.get("ready"):
+                            break
+                    except RuntimeError:
+                        pass
+                    await asyncio.sleep(.05)
+                else:
+                    self.fail("The next OAuth fixture document did not finish loading")
+                await vote.evaluate(self.tab,"(() => {"+script+"})()")
                 self.assertFalse(await vote.public_topgg_login_ready(self.tab))
         self.assertEqual(self.login_requests,0)
+
