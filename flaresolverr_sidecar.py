@@ -10,7 +10,7 @@ import requests
 
 
 IMAGE = "ghcr.io/flaresolverr/flaresolverr:v3.5.2"
-CONTAINER = "topgg-free-flaresolverr"
+CONTAINER = "anigame-free-flaresolverr"
 URL = "http://127.0.0.1:8191"
 
 

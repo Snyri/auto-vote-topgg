@@ -112,17 +112,17 @@ async def _provider_session(tab, frame_id):
 
 async def interstitial_context(tab) -> bool:
     """A provider-marked current document also covers localized challenge titles."""
-    tracker = getattr(tab, "_topgg_diagnostics", None)
+    tracker = getattr(tab, "_browser_diagnostics", None)
     marked = getattr(tracker, "document_challenged", None) is True
     expression = """(() => {
         const managed = document.title.toLowerCase().startsWith('just a moment') ||
             Boolean(document.querySelector('#challenge-stage, #challenge-running, #challenge-form')) || __MARKED__;
         const usable = [...document.querySelectorAll('button, [role="button"]')].some(el =>
-            el.textContent.trim().toLowerCase() === 'vote' && !el.disabled &&
+            ['vote', 'vote for anigame'].includes(el.textContent.trim().toLowerCase()) && !el.disabled &&
             el.getAttribute('aria-disabled') !== 'true' && el.getClientRects().length);
         const body = (document.body?.innerText || '').toLowerCase();
         const app = body.includes('must be logged in') || body.includes('thanks for voting') ||
-            body.includes('you will be able to vote after this ad') || body.includes('vote again in') ||
+            body.includes('your next free vote is') || body.includes('vote again in') ||
             body.includes('already voted');
         return managed && !usable && !app;
     })()""".replace("__MARKED__", "true" if marked else "false")

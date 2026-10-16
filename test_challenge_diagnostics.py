@@ -8,7 +8,7 @@ import subprocess
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import vote
+import browser_runtime as vote
 
 
 BOOLEAN_FIELDS = {
@@ -48,13 +48,13 @@ class ChallengeDiagnosticLoggingTests(unittest.IsolatedAsyncioTestCase):
             "vote_enabled": {"secret": secret},
             "login_visible": False,
             "raw_title": secret,
-            "url": "https://top.gg/?token=" + secret,
+            "url": "https://anigame.gg/?token=" + secret,
             "cookies": [secret],
             "body": secret,
         }
         with (
             patch("builtins.print") as printer,
-            patch("vote.challenge_diagnostic", new=AsyncMock(return_value=raw)),
+            patch("browser_runtime.challenge_diagnostic", new=AsyncMock(return_value=raw)),
         ):
             await vote.log_challenge_diagnostic(MagicMock(), "timeout")
 
@@ -76,7 +76,7 @@ class ChallengeDiagnosticLoggingTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(type=type(ready_state).__name__):
                 with (
                     patch("builtins.print") as printer,
-                    patch("vote.challenge_diagnostic", new=AsyncMock(return_value={"ready_state": ready_state})),
+                    patch("browser_runtime.challenge_diagnostic", new=AsyncMock(return_value={"ready_state": ready_state})),
                 ):
                     await vote.log_challenge_diagnostic(MagicMock(), "timeout")
                 output = captured_output(printer)
@@ -89,7 +89,7 @@ class ChallengeDiagnosticLoggingTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(error=type(error).__name__):
                 with (
                     patch("builtins.print") as printer,
-                    patch("vote.challenge_diagnostic", new=AsyncMock(side_effect=error)),
+                    patch("browser_runtime.challenge_diagnostic", new=AsyncMock(side_effect=error)),
                 ):
                     await vote.log_challenge_diagnostic(MagicMock(), "error")
                 self.assertNotIn(secret, captured_output(printer))
@@ -100,13 +100,13 @@ class ChallengeDiagnosticLoggingTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(type=type(raw).__name__):
                 with (
                     patch("builtins.print") as printer,
-                    patch("vote.challenge_diagnostic", new=AsyncMock(return_value=raw)),
+                    patch("browser_runtime.challenge_diagnostic", new=AsyncMock(return_value=raw)),
                 ):
                     await vote.log_challenge_diagnostic(MagicMock(), secret)
                 self.assertNotIn(secret, captured_output(printer))
         with (
             patch("builtins.print") as printer,
-            patch("vote.challenge_diagnostic", new=AsyncMock(return_value={"ready_state": "complete"})),
+            patch("browser_runtime.challenge_diagnostic", new=AsyncMock(return_value={"ready_state": "complete"})),
         ):
             await vote.log_challenge_diagnostic(MagicMock(), secret)
         payload = diagnostic_payload(captured_output(printer))
@@ -129,8 +129,8 @@ class ChallengeDiagnosticLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("builtins.print"),
-            patch("vote.challenge_diagnostic", new=hanging_diagnostic),
-            patch("vote.asyncio.wait_for", new=accelerated_wait_for),
+            patch("browser_runtime.challenge_diagnostic", new=hanging_diagnostic),
+            patch("browser_runtime.asyncio.wait_for", new=accelerated_wait_for),
         ):
             await original_wait_for(vote.log_challenge_diagnostic(MagicMock(), "timeout"), timeout=0.5)
 
@@ -185,7 +185,7 @@ const document = {
 };
 const sandbox = {
     document,
-    location: {protocol: 'https:', hostname: 'top.gg'},
+    location: {protocol: 'https:', hostname: 'anigame.gg'},
     getComputedStyle: node => ({
         display: node.offsetWidth ? 'block' : 'none',
         visibility: node.offsetWidth ? 'visible' : 'hidden',
@@ -207,7 +207,7 @@ sandbox.window = sandbox;
 @unittest.skipUnless(NODE, "Node.js is needed to execute browser diagnostic fixtures")
 class ChallengeDiagnosticJavaScriptTests(unittest.IsolatedAsyncioTestCase):
     async def execute_diagnostic(self, fixture):
-        with patch("vote.evaluate", new=AsyncMock(return_value={})) as evaluate:
+        with patch("browser_runtime.evaluate", new=AsyncMock(return_value={})) as evaluate:
             await vote.challenge_diagnostic(MagicMock())
         expression = evaluate.await_args.args[1]
         process = await asyncio.to_thread(

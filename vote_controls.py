@@ -11,7 +11,8 @@ const voteControl = (() => {
         }
         return true;
     };
-    const action = node => (node.textContent || '').trim().toLowerCase() === 'vote' &&
+    const action = node => ['vote', 'vote for anigame'].includes(
+        (node.textContent || '').trim().toLowerCase()) &&
         node.matches('button, [role="button"]') &&
         (node.tagName.toLowerCase() !== 'a' || !(node.getAttribute('href') || '').trim() ||
             (node.getAttribute('href') || '').trim().startsWith('#'));

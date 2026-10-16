@@ -19,8 +19,8 @@ import nodriver as uc
 import browser_environment as environment
 import cloudflare_click
 import native_mouse
-import vote
-from test_vote_pointer import CHROME
+import browser_runtime as vote
+from browser_test_support import CHROME
 
 
 class ChromeConfigurationTests(unittest.TestCase):
@@ -109,7 +109,7 @@ class HeadedChromeTests(unittest.IsolatedAsyncioTestCase):
             user_data_dir=str(folder / "profile"), sandbox=getattr(os,"geteuid",lambda:1)()!=0,
             # Certificate exception and host mappings belong only to this local fixture.
             browser_args=["--window-size=1280,720", "--disable-dev-shm-usage", "--no-proxy-server", "--ignore-certificate-errors", "--site-per-process",
-                "--host-resolver-rules=MAP top.gg 127.0.0.1,MAP challenges.cloudflare.com 127.0.0.1"]))
+                "--host-resolver-rules=MAP anigame.gg 127.0.0.1,MAP challenges.cloudflare.com 127.0.0.1"]))
         try:
             try: await asyncio.wait_for(self.browser.start(), 20)
             except Exception:
@@ -131,7 +131,7 @@ class HeadedChromeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self): await self.close_fixture()
 
     async def test_background_login_is_activated_and_receives_a_finite_native_press(self):
-        await vote.navigate_page(self.tab, "https://top.gg:" + str(self.server.server_port) + "/login-fixture")
+        await vote.navigate_page(self.tab, "https://anigame.gg:" + str(self.server.server_port) + "/login-fixture")
         other = await self.browser.get("about:blank", new_tab=True)
         await environment.foreground(other)
         await environment.log_facts(self.tab, vote.evaluate, "startup")
@@ -146,7 +146,7 @@ class HeadedChromeTests(unittest.IsolatedAsyncioTestCase):
         await environment.log_facts(self.tab, vote.evaluate, "startup")
 
     async def test_site_isolated_closed_shadow_provider_receives_native_checkbox_input(self):
-        await vote.navigate_page(self.tab, "https://top.gg:" + str(self.server.server_port) + "/challenge-fixture")
+        await vote.navigate_page(self.tab, "https://anigame.gg:" + str(self.server.server_port) + "/challenge-fixture")
         for _ in range(40):
             infos = await self.tab.send(uc.cdp.target.get_targets())
             if any(info.type_ == "iframe" and info.url.startswith("https://challenges.cloudflare.com:") for info in infos): break

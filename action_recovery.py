@@ -136,11 +136,14 @@ def restore(client, current_run, origin, path, *, clock=time.monotonic, sleep=ti
 
 
 def dispatch_retry(client, origin, *, clock=time.monotonic, sleep=time.sleep, budget=210):
-    title = f"Top.gg Auto Vote · failure-retry · {origin}"
+    # Keep recognizing runs from the currently deployed scheduler as well as
+    # the new name, so a naming transition cannot duplicate a retry dispatch.
+    titles = {f"{prefix} · failure-retry · {origin}" for prefix in (
+        "AniGame Auto Vote", "Top.gg Auto Vote")}
     deadline, acknowledged = clock() + budget, False
     while clock() < deadline:
         try:
-            existing = [run for run in client.runs() if run.get("display_title") == title]
+            existing = [run for run in client.runs() if run.get("display_title") in titles]
             if existing:
                 print(f"Fresh retry already exists as run {max(existing, key=lambda run: run['id'])['id']}")
                 return
@@ -155,7 +158,7 @@ def dispatch_retry(client, origin, *, clock=time.monotonic, sleep=time.sleep, bu
                     observe_until = min(deadline, clock() + 30)
                     while clock() < observe_until:
                         sleep(2)
-                        if any(run.get("display_title") == title for run in client.runs()):
+                        if any(run.get("display_title") in titles for run in client.runs()):
                             return
             sleep(2)
         except (OSError, TimeoutError, urllib.error.URLError) as exc:

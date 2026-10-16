@@ -14,10 +14,10 @@ from unittest.mock import patch
 import nodriver as uc
 
 import flaresolverr_browser as provider
-import vote
-from test_oauth_flow import OAuthBrowserTests
-from test_live_vote_flow import LiveVoteFlowTests
+import browser_runtime as vote
 from test_anigame_browser import AniGameBrowserTests
+from test_ui_click import ApplicationClickBrowserTests
+from test_inspection_guard import InspectionGuardBrowserTests
 
 
 class RealSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -93,11 +93,7 @@ class SameBrowserMixin:
             self.assertNotIn(self._service_browser._flare_client.session_id, listed["sessions"])
 
 
-class ServiceOAuthTests(SameBrowserMixin, OAuthBrowserTests):
-    pass
-
-
-class ServiceVoteTests(SameBrowserMixin, LiveVoteFlowTests):
+class ServiceInputTests(SameBrowserMixin, ApplicationClickBrowserTests):
     pass
 
 
@@ -105,10 +101,14 @@ class ServiceAniGameTests(SameBrowserMixin, AniGameBrowserTests):
     pass
 
 
+class ServiceInspectionTests(SameBrowserMixin, InspectionGuardBrowserTests):
+    pass
+
+
 if __name__ == "__main__":
     os.environ["FLARESOLVERR_URL"] = "http://127.0.0.1:8191"
     suite = unittest.TestSuite()
-    for cls in (RealSessionTests, ServiceOAuthTests, ServiceVoteTests, ServiceAniGameTests):
+    for cls in (RealSessionTests, ServiceInputTests, ServiceAniGameTests, ServiceInspectionTests):
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(cls))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if result.skipped:

@@ -17,7 +17,7 @@ import nodriver as uc
 
 import anigame_page as page
 import anigame_vote as client
-import vote as core
+import browser_runtime as core
 
 
 CHROME = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
@@ -213,6 +213,9 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
                 response_headers=[uc.cdp.fetch.HeaderEntry(name=k,value=v) for k,v in headers.items()],
                 body=base64.b64encode(body.encode()).decode()))
         except Exception as exc:
+            if core.is_expired_interception(exc):
+                # A new document or fetch abort can cancel a queued fixture reply.
+                return
             if self.closing and isinstance(exc, ConnectionError):
                 # Destroying the browser rejects outstanding favicon/fixture
                 # replies. A connection failure before teardown remains fatal.

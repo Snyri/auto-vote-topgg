@@ -21,7 +21,7 @@ import nodriver as uc
 import anigame_page as page
 import browser_environment
 import ui_click
-import vote as core
+import browser_runtime as core
 from recovery_state import SubmissionJournal
 
 
@@ -211,19 +211,33 @@ class ReadOnlyGuard:
 
     def __init__(self, tab):
         self.tab, self.denied = tab, 0
+        self.expired = 0
+        self.failure = None
+        self.handled = set()
 
     async def paused(self, event):
+        if event.request_id in self.handled:
+            return
+        self.handled.add(event.request_id)
         parsed = urlsplit(event.request.url)
         method = event.request.method.upper()
         permitted = (method in {"GET", "HEAD", "OPTIONS"}
                      or parsed.path.startswith(("/api/auth/", "/cdn-cgi/"))
                      or parsed.path == "/api/status")
-        if parsed.hostname in page.HOSTS and not permitted:
-            self.denied += 1
-            await self.tab.send(uc.cdp.fetch.fail_request(
-                event.request_id, uc.cdp.network.ErrorReason.BLOCKED_BY_CLIENT))
-        else:
-            await self.tab.send(uc.cdp.fetch.continue_request(event.request_id))
+        try:
+            if parsed.hostname in page.HOSTS and not permitted:
+                self.denied += 1
+                command = uc.cdp.fetch.fail_request(
+                    event.request_id, uc.cdp.network.ErrorReason.BLOCKED_BY_CLIENT)
+            else:
+                command = uc.cdp.fetch.continue_request(event.request_id)
+            await asyncio.wait_for(self.tab.send(command), core.BROWSER_COMMAND_TIMEOUT_SEC)
+        except Exception as exc:
+            if core.is_expired_interception(exc):
+                self.expired += 1
+            else:
+                self.failure = type(exc).__name__
+                print("  → Inspection request control failed: " + self.failure)
 
     async def start(self):
         self.tab.add_handler(uc.cdp.fetch.RequestPaused, self.paused)
@@ -424,12 +438,14 @@ async def process_account(token, cookies, journal=None, *, inspect_only=False):
     last = result("error", "AniGame account was not processed")
     for attempt in range(1, (1 if inspect_only else MAX_RETRIES) + 1):
         browser = None
+        guard = None
         print(f"  → AniGame account {account_id}, attempt {attempt}/{1 if inspect_only else MAX_RETRIES}")
         try:
             browser = await core.start_browser(initial_url=page.VOTE_URL)
             tab = browser.tabs[0]
             if inspect_only:
-                await ReadOnlyGuard(tab).start()
+                guard = ReadOnlyGuard(tab)
+                await guard.start()
             if page.page_kind(await core.current_url(tab)) not in {"vote", "confirmation"}:
                 await core.navigate_page(tab, page.VOTE_URL)
             ok, failure = await authenticate(browser, tab, token, cookies)
@@ -439,6 +455,8 @@ async def process_account(token, cookies, journal=None, *, inspect_only=False):
                 record = journal.select(token, page.BOT_ID) if journal else None
                 last = await vote_once(tab, journal, inspect_only=inspect_only,
                     prior_pending=bool(record and record["kind"] == "pending"))
+                if guard is not None and guard.failure:
+                    last = result("error", "Inspection request control could not be verified")
                 if journal is not None and not inspect_only and last["status"] in {"success", "cooldown"}:
                     journal.record_result(last)
                 if last["status"] in {"success", "cooldown", "inspected"}:
