@@ -394,7 +394,8 @@ async def process_account(token, cookies, journal=None, *, inspect_only=False):
                 if last["status"] in {"success", "cooldown", "inspected"}:
                     return {**last, "account_id": account_id}
         except core.BrowserStartupError:
-            last = result("error", "Browser startup failed: AniGame browser unavailable")
+            last = {**result("error", "Browser startup failed: AniGame browser unavailable"),
+                    "bot_id": "all"}
             # start_browser already exhausted its own startup retries. Let the
             # existing fresh-Action recovery obtain a new runner immediately.
             break

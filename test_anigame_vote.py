@@ -161,6 +161,7 @@ class AniGameFlowTests(unittest.IsolatedAsyncioTestCase):
             outcome = await client.process_account("PRIVATE", [])
         self.assertEqual(outcome["status"], "error")
         self.assertTrue(outcome["detail"].startswith("Browser startup failed:"))
+        self.assertTrue(client.core.should_request_browser_startup_retry([[outcome]]))
         self.assertEqual(start.await_count, 1)
 
     async def test_completed_handoff_skips_browser_and_preserves_schedule(self):
