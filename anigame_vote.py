@@ -13,7 +13,6 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from html import escape
-from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -318,7 +317,8 @@ async def vote_once(tab, journal=None, *, inspect_only=False, prior_pending=Fals
             if cooldown_count >= 2:
                 print("  → Existing AniGame cooldown confirmed; preserving its deadline")
                 return cooldown
-            if inspect_only and state.get("ready") and state.get("kind") == "vote" and not state.get("login"):
+            if (inspect_only and state.get("ready") and state.get("kind") == "vote" and not state.get("login")
+                    and (state.get("vote_present") or state.get("registering") or state.get("cooldown_seconds") is not None)):
                 print("  Inspection: " + json.dumps({key: state.get(key) for key in (
                     "kind", "vote_present", "vote_enabled", "registering", "countdown", "cooldown_seconds")}, sort_keys=True))
                 return result("inspected", "Authenticated AniGame page inspected; no Vote input")
@@ -389,12 +389,15 @@ async def process_account(token, cookies, journal=None, *, inspect_only=False):
                 record = journal.select(token, page.BOT_ID) if journal else None
                 last = await vote_once(tab, journal, inspect_only=inspect_only,
                     prior_pending=bool(record and record["kind"] == "pending"))
-                if journal is not None and last["status"] in {"success", "cooldown"}:
+                if journal is not None and not inspect_only and last["status"] in {"success", "cooldown"}:
                     journal.record_result(last)
                 if last["status"] in {"success", "cooldown", "inspected"}:
                     return {**last, "account_id": account_id}
         except core.BrowserStartupError:
             last = result("error", "Browser startup failed: AniGame browser unavailable")
+            # start_browser already exhausted its own startup retries. Let the
+            # existing fresh-Action recovery obtain a new runner immediately.
+            break
         except Exception as exc:
             print("  → AniGame attempt ended: " + type(exc).__name__)
             last = result("uncertain" if journal and journal.select(token, page.BOT_ID) else "error",
@@ -456,7 +459,9 @@ async def main(*, inspect_only=False):
     if inspect_only:
         return 0 if all(item["status"] in {"cooldown", "inspected"} for item in results) else 1
     all_results = [[item] for item in results]
-    core.write_next_vote_state(all_results)
+    next_vote_at = core.write_next_vote_state(all_results)
+    if next_vote_at is not None:
+        print("Next AniGame vote: " + datetime.fromtimestamp(next_vote_at, ROME).strftime("%Y-%m-%d %H:%M:%S %Z"))
     core.write_browser_startup_retry_state(all_results)
     core.write_protection_retry_state(all_results)
     lines = ["🗳️ <b>AniGame Auto Vote Report</b>"]

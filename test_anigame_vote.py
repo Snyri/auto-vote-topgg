@@ -64,6 +64,17 @@ RECEIPT = {"kind":"confirmation","ready":True,"visible":True,"confirmed":True}
 
 
 class AniGameFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inspection_waits_for_the_voting_component_to_mount(self):
+        initial = {"kind":"vote", "ready":True, "visible":True}
+        states = AsyncMock(side_effect=[initial, READY])
+        with patch.object(client,"snapshot",states), \
+             patch.object(client,"availability",AsyncMock(return_value={"available":True,"retry_at":None})), \
+             patch.object(client.browser_environment,"foreground",AsyncMock()), \
+             patch.object(client,"POLL_INTERVAL",0):
+            outcome = await client.vote_once(MagicMock(), inspect_only=True)
+        self.assertEqual(outcome["status"], "inspected")
+        self.assertEqual(states.await_count, 2)
+
     async def test_inspection_never_sends_vote_input(self):
         with patch.object(client, "snapshot", AsyncMock(return_value=READY)), \
              patch.object(client, "availability", AsyncMock(return_value={"available":True,"retry_at":None})), \
@@ -144,6 +155,13 @@ class AniGameFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome["status"], "blocked")
         self.assertEqual(start.await_count, 5)
         self.assertEqual(close.await_count, 5)
+
+    async def test_exhausted_browser_startup_is_delegated_to_fresh_action(self):
+        with patch.object(client.core,"start_browser",AsyncMock(side_effect=client.core.BrowserStartupError("fixture"))) as start:
+            outcome = await client.process_account("PRIVATE", [])
+        self.assertEqual(outcome["status"], "error")
+        self.assertTrue(outcome["detail"].startswith("Browser startup failed:"))
+        self.assertEqual(start.await_count, 1)
 
     async def test_completed_handoff_skips_browser_and_preserves_schedule(self):
         journal = MagicMock()

@@ -74,7 +74,9 @@ SNAPSHOT_JS = "(() => {" + CHALLENGE_JS + r"""
     if (!root) return {url:location.href, ready:false};
     const body = text(root);
     const controls = [...document.querySelectorAll('button, a[role="button"], input[type="submit"], [role="button"]')];
-    const matches = controls.filter(el => /^vote for anigame$/i.test(text(el) || el.value || '') && voteControl.visible(el));
+    const freeVote = el => [el.getAttribute('aria-label'), text(el), el.value].some(value =>
+        /^vote for anigame$/i.test((value || '').trim().replace(/\s*[\u2192\u2197\u203a\u00bb]+$/, '').trim()));
+    const matches = controls.filter(el => freeVote(el) && voteControl.visible(el));
     const candidate = matches.find(el => !voteControl.disabled(el)) || matches[0];
     const headings = [...root.querySelectorAll('h1,h2,h3')].filter(voteControl.visible).map(el => text(el).toLowerCase());
     const login = controls.some(el => /^(?:sign in with discord|login with discord)$/i.test(text(el)) && voteControl.visible(el));
@@ -101,9 +103,9 @@ MARK_VOTE_JS = "(() => {" + VOTE_CONTROL_JS + r"""
     if (!['anigame.gg','www.anigame.gg'].includes(location.hostname) ||
         location.protocol !== 'https:' || location.pathname.replace(/\/+$/, '') !== '/vote') return false;
     const controls = [...document.querySelectorAll('button,a[role="button"],input[type="submit"],[role="button"]')];
-    const candidates = controls.filter(el => /^vote for anigame$/i.test(
-        (el.innerText || el.textContent || el.value || '').replace(/\s+/g,' ').trim()
-    ) && voteControl.visible(el) && !voteControl.disabled(el));
+    const freeVote = el => [el.getAttribute('aria-label'), el.innerText, el.textContent, el.value].some(value =>
+        /^vote for anigame$/i.test((value || '').replace(/\s+/g,' ').trim().replace(/\s*[\u2192\u2197\u203a\u00bb]+$/, '').trim()));
+    const candidates = controls.filter(el => freeVote(el) && voteControl.visible(el) && !voteControl.disabled(el));
     const selected = candidates.find(el => voteControl.position(el, true).ready) || candidates[0];
     if (!selected) return false;
     selected.setAttribute('data-anigame-vote', '1');
