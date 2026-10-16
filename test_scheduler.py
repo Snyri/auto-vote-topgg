@@ -534,6 +534,16 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertEqual(scheduler.dispatch_vote(), 99)
         api.assert_not_called()
 
+    def test_new_name_is_recognized_without_accepting_another_dispatch_source(self):
+        runs = [
+            {"id": 13, "event": "workflow_dispatch", "created_at": "2033-05-18T03:33:31Z",
+             "display_title": "AniGame Auto Vote · manual"},
+            {"id": 12, "event": "workflow_dispatch", "created_at": "2033-05-18T03:33:30Z",
+             "display_title": "AniGame Auto Vote · northflank"},
+        ]
+        self.assertEqual(scheduler.select_new_dispatched_run(
+            runs, set(), 2_000_000_000, expected_source="northflank"), 12)
+
 
     def test_vote_workflow_retries_failures_without_a_chain_limit(self):
         root = pathlib.Path(__file__).parent

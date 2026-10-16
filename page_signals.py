@@ -10,7 +10,8 @@ const challengeState = (() => {
     const visible = voteControl.visible;
     const vote = voteControl.candidates().some(voteControl.enabled);
     const surface = vote || body.includes('vote again in') || body.includes('already voted') ||
-        body.includes('thanks for voting') || body.includes('you will be able to vote after this ad');
+        body.includes('thanks for voting') || body.includes('your next free vote is') ||
+        body.includes('your rewards have been added');
     const groups = [
         ['iframe[src*="challenges.cloudflare.com"], .cf-turnstile',
          'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="cf_challenge_response"]'],

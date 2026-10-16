@@ -15,7 +15,7 @@ class AniGamePageTests(unittest.TestCase):
     def test_only_actual_anigame_vote_and_confirmation_urls_match(self):
         self.assertEqual(page.page_kind("https://www.anigame.gg/vote"), "vote")
         self.assertEqual(page.page_kind("https://anigame.gg/vote/confirmation?id=private"), "confirmation")
-        for url in ["https://top.gg/bot/571027211407196161/vote", "https://anigame.gg.evil/vote",
+        for url in ["https://other.example/vote", "https://anigame.gg.evil/vote",
                     "https://evil/?next=https://anigame.gg/vote", "http://anigame.gg/vote",
                     "https://anigame.gg:444/vote", "https://x@anigame.gg/vote"]:
             self.assertEqual(page.page_kind(url), "external", url)
@@ -43,13 +43,13 @@ class AniGamePageTests(unittest.TestCase):
         for key, value in [("client_id","123"),("redirect_uri","https://evil/callback"),("scope","identify administrator")]:
             self.assertFalse(client.valid_oauth("https://discord.com/oauth2/authorize?" + urlencode({**query,key:value})))
 
-    def test_optional_cookies_do_not_import_topgg_or_cloudflare_state(self):
+    def test_optional_cookies_do_not_import_other_provider_or_cloudflare_state(self):
         self.assertEqual(client.load_cookies("", 1), [[]])
         cookies = [{"name":"session","value":"PRIVATE","domain":".anigame.gg"},
                    {"name":"cf_clearance","value":"DEVICE_BOUND","domain":".anigame.gg"}]
         self.assertEqual(len(client.load_cookies(json.dumps(cookies), 1)[0]), 1)
         self.assertEqual(client.load_cookies(json.dumps(cookies, indent=2), 1), [cookies[:1]])
-        cookies[0]["domain"] = ".top.gg"
+        cookies[0]["domain"] = ".other.example"
         with self.assertRaisesRegex(ValueError, "AniGame"):
             client.load_cookies(json.dumps(cookies), 1)
 

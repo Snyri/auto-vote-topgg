@@ -6,6 +6,7 @@ on:
 permissions: {}
 
 concurrency:
+  # Share the existing voting lock with runs started before the migration.
   group: topgg-vote
   cancel-in-progress: false
   queue: max

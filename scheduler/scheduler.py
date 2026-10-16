@@ -46,7 +46,7 @@ HEADERS = {
     "Accept": "application/vnd.github+json",
     "Authorization": f"Bearer {GH_TOKEN}",
     "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "northflank-topgg-scheduler",
+    "User-Agent": "northflank-anigame-scheduler",
 }
 
 session = requests.Session()
@@ -237,8 +237,10 @@ def select_new_dispatched_run(
             and created_at >= not_before - 5
         ):
             if expected_source is not None:
-                expected_title = f"Top.gg Auto Vote · {expected_source}"
-                if str(run.get("display_title") or "") != expected_title:
+                # Accept both names when the running deployment is upgraded.
+                expected_titles = {f"{prefix} · {expected_source}" for prefix in (
+                    "AniGame Auto Vote", "Top.gg Auto Vote")}
+                if str(run.get("display_title") or "") not in expected_titles:
                     continue
             candidates.append((created_at, run_id))
 

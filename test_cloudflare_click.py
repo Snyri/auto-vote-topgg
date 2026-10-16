@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 import nodriver as uc
 
 import cloudflare_click as click
-import vote
+import browser_runtime as vote
 
 
 # Probe in a child so a broken native OpenCV installation cannot crash unittest.

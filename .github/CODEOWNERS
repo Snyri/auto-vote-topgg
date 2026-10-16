@@ -4,9 +4,12 @@
 /requirements.txt @Snyri
 /requirements.lock @Snyri
 /vote.py @Snyri
-/test_vote.py @Snyri
+/test_browser_runtime.py @Snyri
 /test_scheduler.py @Snyri
 /audit_dependencies.py @Snyri
 /test_audit_dependencies.py @Snyri
 /.github/dependabot.yml @Snyri
 /SECURITY.md @Snyri
+/browser_runtime.py @Snyri
+/anigame_vote.py @Snyri
+/anigame_page.py @Snyri
