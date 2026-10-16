@@ -11,7 +11,7 @@ import unittest
 from contextlib import suppress
 from datetime import datetime, timezone
 from unittest.mock import patch
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import nodriver as uc
 
@@ -21,6 +21,10 @@ import vote as core
 
 
 CHROME = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
+FIXTURE_TOKEN = "local-only-discord-fixture-token"
+AUTHORIZE = "https://discord.com/oauth2/authorize?" + urlencode({
+    "client_id":page.BOT_ID, "redirect_uri":"https://anigame.gg/api/auth/discord/callback",
+    "response_type":"code", "scope":"identify email guilds"})
 
 
 @unittest.skipUnless(CHROME, "Chrome needed for AniGame native-input fixtures")
@@ -43,6 +47,12 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.deadline = int(time.time()) + 1200
         self.guard = None
         self.errors = []
+        self.authenticated = True
+        self.cookie_login = False
+        self.discord_logins = 0
+        self.oauth_requests = 0
+        self.oauth_grants = 0
+        self.new_tab_urls = []
         try:
             try:
                 await asyncio.wait_for(self.browser.start(), 20)
@@ -53,6 +63,21 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
             self.tab.add_handler(uc.cdp.fetch.RequestPaused, self.fulfill)
             await self.tab.send(uc.cdp.fetch.enable(
                 patterns=[uc.cdp.fetch.RequestPattern(url_pattern="*")]))
+            original_get = self.browser.get
+            async def get_with_local_replies(url, *args, **kwargs):
+                if kwargs.get("new_tab"):
+                    self.new_tab_urls.append(url)
+                    # No new target may start an un-intercepted live request.
+                    self.assertEqual(url, "about:blank")
+                tab = await original_get(url, *args, **kwargs)
+                if kwargs.get("new_tab"):
+                    async def fulfill_new(event):
+                        await self.fulfill_on(tab, event)
+                    tab.add_handler(uc.cdp.fetch.RequestPaused, fulfill_new)
+                    await tab.send(uc.cdp.fetch.enable(
+                        patterns=[uc.cdp.fetch.RequestPattern(url_pattern="*")]))
+                return tab
+            self.browser.get = get_with_local_replies
         except BaseException:
             await self.close_fixture()
             raise
@@ -120,21 +145,54 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
             "__RECEIPT__", json.dumps(self.receipt()))
 
     async def fulfill(self, event):
+        await self.fulfill_on(self.tab, event)
+
+    async def fulfill_on(self, tab, event):
         try:
-            path = urlsplit(event.request.url).path
+            parsed = urlsplit(event.request.url)
+            path = parsed.path
             if self.guard is not None and event.request.method == "POST" and path.startswith("/_fixture/"):
                 await self.guard.paused(event)
                 return
             status, headers, body = 404, {"content-type":"text/plain"}, "Local fixture only"
-            if path == "/vote":
+            if self.cookie_login and not self.authenticated and parsed.hostname in page.HOSTS:
+                self.authenticated = any(cookie.name == "anigame_fixture_session" and cookie.value == "local-session-only"
+                    and cookie.domain.lstrip(".") in page.HOSTS for cookie in await self.browser.cookies.get_all())
+            if parsed.hostname in {"discord.com", "www.discord.com"} and path == "/login":
+                self.discord_logins += 1
+                # Reproduce the broken JS branch while origin storage remains
+                # writable through the real browser protocol.
+                status, headers, body = 200, {"content-type":"text/html"}, '''<!doctype html><title>Discord fixture</title>
+                    <p>Local login fixture</p><script>
+                    Object.defineProperty(window, 'localStorage', {value:undefined, configurable:true});
+                    </script>'''
+            elif event.request.url == AUTHORIZE:
+                self.oauth_requests += 1
+                status, headers = 200, {"content-type":"text/html"}
+                body = '''<!doctype html><style>button{margin:100px;width:180px;height:50px}</style><body><script>
+                    const stored = localStorage.getItem('token') === __TOKEN__ && localStorage.getItem('tokens') === __TOKENS__;
+                    document.body.innerHTML = stored ? '<button id="authorize">Authorize</button>' : '<p>Discord session missing</p>';
+                    if(stored) authorize.addEventListener('click',e=>{if(e.isTrusted)location.href=
+                    'https://anigame.gg/api/auth/discord/callback?code=local-fixture-only'});
+                    </script>'''.replace("__TOKEN__", json.dumps(json.dumps(FIXTURE_TOKEN))).replace(
+                        "__TOKENS__", json.dumps(json.dumps({"default":FIXTURE_TOKEN})))
+            elif parsed.hostname in page.HOSTS and path == "/api/auth/discord/callback":
+                self.oauth_grants += 1
+                self.authenticated = True
+                status, headers, body = 302, {"location":page.VOTE_URL}, ""
+            elif path == "/vote":
                 self.vote_documents += 1
-                status, headers, body = 200, {"content-type":"text/html"}, self.html()
+                signed_out = '''<!doctype html><main><h1>Sign in to AniGame</h1>
+                    <button id="login">Sign in with Discord</button></main>
+                    <script>login.addEventListener('click',e=>{if(e.isTrusted)location.href=__AUTHORIZE__})</script>'''.replace(
+                        "__AUTHORIZE__", json.dumps(AUTHORIZE))
+                status, headers, body = 200, {"content-type":"text/html"}, self.html() if self.authenticated else signed_out
             elif path == "/vote/confirmation":
                 self.receipt_documents += 1
                 status, headers, body = 200, {"content-type":"text/html"}, self.receipt()
             elif path == "/api/auth/me":
                 status, headers, body = 200, {"content-type":"application/json"}, json.dumps(
-                    {"user":{"id":"196428430126870001"}})
+                    {"user":{"id":"196428430126870001"} if self.authenticated else None})
             elif path == "/api/vote/availability":
                 on_cooldown = self.registered or self.cooldown_initial
                 status, headers, body = 200, {"content-type":"application/json"}, json.dumps(
@@ -148,7 +206,7 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
             elif path == "/_fixture/purchase":
                 self.purchases += 1
                 status, headers, body = 200, {"content-type":"application/json"}, '{}'
-            await self.tab.send(uc.cdp.fetch.fulfill_request(
+            await tab.send(uc.cdp.fetch.fulfill_request(
                 event.request_id, response_code=status,
                 response_headers=[uc.cdp.fetch.HeaderEntry(name=k,value=v) for k,v in headers.items()],
                 body=base64.b64encode(body.encode()).decode()))
@@ -170,6 +228,33 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await core.evaluate(self.tab, page.MARK_VOTE_JS))
         self.assertEqual(await core.evaluate(self.tab,
             "document.querySelector('[data-anigame-vote]').id"), "free")
+
+    async def test_anigame_cookie_import_authenticates_without_discord_or_vote(self):
+        self.authenticated, self.cookie_login = False, True
+        await core.navigate_page(self.tab, page.VOTE_URL)
+        cookies = client.load_cookies(json.dumps([{
+            "name":"anigame_fixture_session", "value":"local-session-only", "domain":".anigame.gg",
+            "path":"/", "httpOnly":True, "secure":True}]), 1)[0]
+        self.assertIsNone(self.browser.connection)
+        ok, reason = await client.authenticate(self.browser, self.tab, FIXTURE_TOKEN, cookies)
+        self.assertTrue(ok, reason)
+        self.assertTrue(self.authenticated)
+        self.assertEqual(self.new_tab_urls, [])
+        self.assertEqual(self.oauth_grants, 0)
+        self.assertEqual(self.registration_requests, 0)
+
+    async def test_full_signed_out_oauth_works_without_the_page_storage_accessor(self):
+        self.authenticated = False
+        await core.navigate_page(self.tab, page.VOTE_URL)
+        with patch.object(client, "POLL_INTERVAL", .05):
+            ok, reason = await client.authenticate(self.browser, self.tab, FIXTURE_TOKEN, [])
+        self.assertTrue(ok, reason)
+        self.assertEqual(self.new_tab_urls, ["about:blank"])
+        self.assertEqual(self.discord_logins, 2)
+        self.assertEqual(self.oauth_requests, 1)
+        self.assertEqual(self.oauth_grants, 1)
+        self.assertEqual(self.registration_requests, 0)
+        self.assertFalse((await client.snapshot(self.tab))["login"])
 
     async def test_full_fifteen_seconds_native_input_and_automatic_receipt(self):
         self.duration = 15

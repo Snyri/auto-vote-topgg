@@ -64,6 +64,40 @@ RECEIPT = {"kind":"confirmation","ready":True,"visible":True,"confirmed":True}
 
 
 class AniGameFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discord_document_waits_through_blank_and_replaced_context(self):
+        states = AsyncMock(side_effect=[{"ready":True,"origin":"null"}, RuntimeError("context changed"),
+                                       {"ready":True,"origin":"https://discord.com"}])
+        with patch.object(client.core,"evaluate",states), patch.object(client.asyncio,"sleep",AsyncMock()):
+            origin = await client.wait_for_discord_document(MagicMock())
+        self.assertEqual(origin, "https://discord.com")
+        self.assertEqual(states.await_count, 3)
+
+    async def test_discord_credentials_are_never_written_on_a_foreign_origin(self):
+        tab, browser = MagicMock(), MagicMock()
+        tab.send, tab.close = AsyncMock(), AsyncMock()
+        browser.get = AsyncMock(return_value=tab)
+        with patch.object(client.core,"navigate_page",AsyncMock()), \
+             patch.object(client.core,"evaluate",AsyncMock(return_value={"ready":True,"origin":"https://evil.example"})), \
+             patch.object(client.browser_environment,"foreground",AsyncMock()):
+            with self.assertRaisesRegex(client.DiscordPreparationError, "unexpected_origin"):
+                await client.prepare_discord_session(browser, MagicMock(), "PRIVATE_TOKEN")
+        browser.get.assert_awaited_once_with("about:blank", new_tab=True)
+        tab.send.assert_not_called()
+        tab.close.assert_awaited_once()
+
+    async def test_discord_storage_failure_reports_only_safe_phase_and_always_closes(self):
+        tab, browser = MagicMock(), MagicMock()
+        tab.send, tab.close = AsyncMock(side_effect=RuntimeError("PRIVATE_TOKEN")), AsyncMock()
+        browser.get = AsyncMock(return_value=tab)
+        with patch.object(client.core,"navigate_page",AsyncMock()), \
+             patch.object(client,"wait_for_discord_document",AsyncMock(return_value="https://discord.com")), \
+             patch.object(client.browser_environment,"foreground",AsyncMock()):
+            with self.assertRaises(client.DiscordPreparationError) as raised:
+                await client.prepare_discord_session(browser, MagicMock(), "PRIVATE_TOKEN")
+        self.assertEqual(str(raised.exception), "Discord preparation failed at storage: RuntimeError")
+        self.assertNotIn("PRIVATE_TOKEN", str(raised.exception))
+        tab.close.assert_awaited_once()
+
     async def test_inspection_waits_for_the_voting_component_to_mount(self):
         initial = {"kind":"vote", "ready":True, "visible":True}
         states = AsyncMock(side_effect=[initial, READY])

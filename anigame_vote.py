@@ -27,6 +27,7 @@ from recovery_state import SubmissionJournal
 
 MAX_RETRIES = 5
 AUTH_TIMEOUT = 75
+DISCORD_DOCUMENT_TIMEOUT = 25
 READY_TIMEOUT = 45
 RESULT_TIMEOUT = 100
 POLL_INTERVAL = 1
@@ -138,7 +139,69 @@ async def inject_cookies(browser, cookies):
             options["expires"] = uc.cdp.network.TimeSinceEpoch(expires)
         params.append(uc.cdp.network.CookieParam(**options))
     if params:
-        await asyncio.wait_for(browser.connection.send(uc.cdp.network.set_cookies(params)), 8)
+        await asyncio.wait_for(browser.cookies.set_all(params), 8)
+
+
+class DiscordPreparationError(RuntimeError):
+    """Only fixed phases and exception class names; never credential values."""
+
+    def __init__(self, phase, reason):
+        self.phase, self.reason = phase, reason
+        super().__init__(f"Discord preparation failed at {phase}: {reason}")
+
+
+async def wait_for_discord_document(tab):
+    deadline = asyncio.get_running_loop().time() + DISCORD_DOCUMENT_TIMEOUT
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            state = await core.evaluate(tab, """(() => ({
+                origin: location.origin,
+                ready: !!document.body && ['interactive','complete'].includes(document.readyState)
+            }))()""")
+            if isinstance(state, dict) and state.get("ready"):
+                if state.get("origin") in {"https://discord.com", "https://www.discord.com"}:
+                    return state["origin"]
+                if state.get("origin") not in {None, "null"}:
+                    raise DiscordPreparationError("document", "unexpected_origin")
+        except DiscordPreparationError:
+            raise
+        except Exception:
+            # Navigation can replace the JS context before the document settles.
+            pass
+        await asyncio.sleep(.25)
+    raise DiscordPreparationError("document", "not_ready")
+
+
+async def prepare_discord_session(browser, app_tab, token):
+    discord_tab, phase = None, "open_tab"
+    try:
+        # Attach first, then navigate; do not race a newly created live target.
+        discord_tab = await asyncio.wait_for(browser.get("about:blank", new_tab=True), 15)
+        phase = "navigation"
+        await core.navigate_page(discord_tab, core.DISCORD_LOGIN_URL)
+        phase = "document"
+        origin = await wait_for_discord_document(discord_tab)
+        phase = "storage"
+        storage = uc.cdp.dom_storage.StorageId(is_local_storage=True, security_origin=origin)
+        # Use Chrome's origin-scoped storage API. Page JS can remove its
+        # window.localStorage accessor; credentials need not enter evaluated JS.
+        for key, value in (("token", json.dumps(token)), ("tokens", json.dumps({"default":token}))):
+            await asyncio.wait_for(discord_tab.send(
+                uc.cdp.dom_storage.set_dom_storage_item(storage, key, value)), 8)
+        print("  → Discord session state stored; waiting for its application")
+        phase = "reload"
+        await core.navigate_page(discord_tab, core.DISCORD_LOGIN_URL)
+        await wait_for_discord_document(discord_tab)
+        await asyncio.sleep(3)
+    except DiscordPreparationError:
+        raise
+    except Exception as exc:
+        raise DiscordPreparationError(phase, type(exc).__name__) from None
+    finally:
+        if discord_tab is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(discord_tab.close(), 8)
+        await browser_environment.foreground(app_tab)
 
 
 class ReadOnlyGuard:
@@ -175,6 +238,7 @@ async def clear_challenge(tab, state):
 
 async def authenticate(browser, tab, token, cookies):
     if cookies:
+        print("  → Importing the configured AniGame account session cookies")
         try:
             await inject_cookies(browser, cookies)
         except Exception as exc:
@@ -192,24 +256,8 @@ async def authenticate(browser, tab, token, cookies):
             break
         await asyncio.sleep(1)
 
-    print("  → Preparing the existing Discord account session")
-    discord_tab = await asyncio.wait_for(browser.get(core.DISCORD_LOGIN_URL, new_tab=True), 15)
-    try:
-        await asyncio.sleep(2)
-        url = urlsplit(await core.current_url(discord_tab))
-        if url.scheme != "https" or url.hostname not in {"discord.com", "www.discord.com"}:
-            return False, "auth_failed"
-        await core.evaluate(discord_tab, """(() => {
-            const token = __TOKEN__;
-            localStorage.setItem('token', JSON.stringify(token));
-            localStorage.setItem('tokens', JSON.stringify({default:token}));
-        })()""".replace("__TOKEN__", json.dumps(token)))
-        await asyncio.wait_for(discord_tab.reload(), 10)
-        await asyncio.sleep(3)
-    finally:
-        with suppress(Exception):
-            await asyncio.wait_for(discord_tab.close(), 8)
-        await browser_environment.foreground(tab)
+    print("  → AniGame session unavailable; preparing the existing Discord account session")
+    await prepare_discord_session(browser, tab, token)
 
     state = await snapshot(tab)
     if not state.get("login"):
@@ -399,6 +447,9 @@ async def process_account(token, cookies, journal=None, *, inspect_only=False):
             # start_browser already exhausted its own startup retries. Let the
             # existing fresh-Action recovery obtain a new runner immediately.
             break
+        except DiscordPreparationError as exc:
+            print("  → " + str(exc))
+            last = result("auth_failed", str(exc))
         except Exception as exc:
             print("  → AniGame attempt ended: " + type(exc).__name__)
             last = result("uncertain" if journal and journal.select(token, page.BOT_ID) else "error",
