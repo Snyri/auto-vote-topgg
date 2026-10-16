@@ -199,4 +199,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(vote.uc.loop().run_until_complete(main()))
+    from anigame_vote import main as inspect_anigame
+    raise SystemExit(vote.uc.loop().run_until_complete(inspect_anigame(inspect_only=True)))
+

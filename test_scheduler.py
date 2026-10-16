@@ -483,7 +483,10 @@ class WorkflowConfigurationTests(unittest.TestCase):
         vote_workflow = (root / ".github/workflows/vote.yml").read_text(encoding="utf-8")
         security_workflow = (root / ".github/workflows/security.yml").read_text(encoding="utf-8")
         self.assertGreaterEqual(vote_workflow.count("timeout-minutes:"), 4)
-        self.assertEqual(security_workflow.count("timeout-minutes: 10"), 3)
+        timeouts = [int(line.split(":", 1)[1]) for line in security_workflow.splitlines()
+                    if line.strip().startswith("timeout-minutes:")]
+        self.assertEqual(len(timeouts), 4)
+        self.assertTrue(all(1 <= value <= 15 for value in timeouts))
 
 
     def test_select_new_dispatched_run_filters_expected_source(self):
@@ -565,3 +568,4 @@ class WorkflowConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

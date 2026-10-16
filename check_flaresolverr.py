@@ -17,6 +17,7 @@ import flaresolverr_browser as provider
 import vote
 from test_oauth_flow import OAuthBrowserTests
 from test_live_vote_flow import LiveVoteFlowTests
+from test_anigame_browser import AniGameBrowserTests
 
 
 class RealSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -100,12 +101,17 @@ class ServiceVoteTests(SameBrowserMixin, LiveVoteFlowTests):
     pass
 
 
+class ServiceAniGameTests(SameBrowserMixin, AniGameBrowserTests):
+    pass
+
+
 if __name__ == "__main__":
     os.environ["FLARESOLVERR_URL"] = "http://127.0.0.1:8191"
     suite = unittest.TestSuite()
-    for cls in (RealSessionTests, ServiceOAuthTests, ServiceVoteTests):
+    for cls in (RealSessionTests, ServiceOAuthTests, ServiceVoteTests, ServiceAniGameTests):
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(cls))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if result.skipped:
         print("Required service/browser fixtures were skipped")
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+

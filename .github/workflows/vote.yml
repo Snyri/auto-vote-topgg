@@ -1,4 +1,5 @@
-name: Top.gg Auto Vote
+name: AniGame Auto Vote
+# Retain correlation with already deployed Northflank schedulers and retry runs.
 run-name: Top.gg Auto Vote · ${{ inputs.source || 'manual' }}${{ inputs.origin_run_id && format(' · {0}', inputs.origin_run_id) || '' }}
 
 on:
@@ -79,11 +80,10 @@ jobs:
         id: run_vote
         env:
           TOKENS:                    ${{ secrets.TOKENS }}
-          BOT_IDS:                   ${{ secrets.BOT_IDS }}
           TG_BOT_TOKEN:              ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:                ${{ secrets.TG_CHAT_ID }}
           SEND_ERROR_SCREENSHOTS:    ${{ secrets.SEND_ERROR_SCREENSHOTS }}
-          TOPGG_COOKIES_JSON:        ${{ secrets.TOPGG_COOKIES_JSON }}
+          ANIGAME_COOKIES_JSON:      ${{ secrets.ANIGAME_COOKIES_JSON }}
           RUN_SOURCE:                 ${{ inputs.source }}
           RUN_ORIGIN_ID:              ${{ inputs.origin_run_id }}
           RUN_RECOVERY_DEPTH:          ${{ inputs.recovery_depth }}
@@ -102,18 +102,18 @@ jobs:
             export "${name}_FILE"
           }
           write_secret TOKENS "$TOKENS"
-          write_secret TOPGG_COOKIES_JSON "$TOPGG_COOKIES_JSON"
+          write_secret ANIGAME_COOKIES_JSON "$ANIGAME_COOKIES_JSON"
           write_secret TG_BOT_TOKEN "$TG_BOT_TOKEN"
           write_secret TG_CHAT_ID "$TG_CHAT_ID"
-          unset TOKENS TOPGG_COOKIES_JSON TG_BOT_TOKEN TG_CHAT_ID
+          unset TOKENS ANIGAME_COOKIES_JSON TG_BOT_TOKEN TG_CHAT_ID
           export NEXT_VOTE_STATE_FILE="$RUNNER_TEMP/next-vote.json"
           export BROWSER_RETRY_STATE_FILE="$RUNNER_TEMP/browser-startup-retry.json"
           export PROTECTION_RETRY_STATE_FILE="$RUNNER_TEMP/protection-retry.json"
           set +e
           if command -v dbus-run-session >/dev/null 2>&1; then
-            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x720x24" python -u vote.py
+            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x720x24" python -u anigame_vote.py
           else
-            xvfb-run -a -s "-screen 0 1280x720x24" python -u vote.py
+            xvfb-run -a -s "-screen 0 1280x720x24" python -u anigame_vote.py
           fi
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
@@ -264,3 +264,4 @@ jobs:
             fi
           done
           echo "✅ Cleanup done — latest 30 completed vote runs kept."
+

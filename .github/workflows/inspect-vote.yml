@@ -1,4 +1,4 @@
-name: Inspect vote page (no submission)
+name: Inspect AniGame vote page (no submission)
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   inspect:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 12
     permissions:
       contents: read
     steps:
@@ -35,21 +35,28 @@ jobs:
           CHROME_BIN="$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
           test -n "$CHROME_BIN" || { echo "No supported browser found"; exit 1; }
           echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
-          echo "Browser: $("$CHROME_BIN" --version)"
-      - name: Observe page without submitting a vote
+      - name: Start the same free browser service used for voting
+        run: python flaresolverr_sidecar.py start
+      - name: Inspect AniGame without pressing Vote
         env:
-          BOT_IDS: ${{ secrets.BOT_IDS }}
-          TOPGG_COOKIES_JSON: ${{ secrets.TOPGG_COOKIES_JSON }}
+          TOKENS: ${{ secrets.TOKENS }}
+          ANIGAME_COOKIES_JSON: ${{ secrets.ANIGAME_COOKIES_JSON }}
         run: |
           secret_dir="$(mktemp -d)"
           chmod 700 "$secret_dir"
           trap 'rm -rf "$secret_dir"' EXIT
-          export TOPGG_COOKIES_JSON_FILE="$secret_dir/cookies"
-          printf '%s' "$TOPGG_COOKIES_JSON" > "$TOPGG_COOKIES_JSON_FILE"
-          chmod 600 "$TOPGG_COOKIES_JSON_FILE"
-          unset TOPGG_COOKIES_JSON
+          export TOKENS_FILE="$secret_dir/tokens"
+          export ANIGAME_COOKIES_JSON_FILE="$secret_dir/cookies"
+          printf '%s' "$TOKENS" > "$TOKENS_FILE"
+          printf '%s' "$ANIGAME_COOKIES_JSON" > "$ANIGAME_COOKIES_JSON_FILE"
+          chmod 600 "$TOKENS_FILE" "$ANIGAME_COOKIES_JSON_FILE"
+          unset TOKENS ANIGAME_COOKIES_JSON
           if command -v dbus-run-session >/dev/null 2>&1; then
-            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x720x24" python -u inspect_vote_page.py
+            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x720x24" python -u anigame_vote.py --inspect
           else
-            xvfb-run -a -s "-screen 0 1280x720x24" python -u inspect_vote_page.py
+            xvfb-run -a -s "-screen 0 1280x720x24" python -u anigame_vote.py --inspect
           fi
+      - name: Remove browser service and profiles
+        if: always()
+        run: python flaresolverr_sidecar.py stop
+
