@@ -53,6 +53,7 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
     sent = False
     flags = {key: None for key in ("pressed", "released", "clicked")}
     reason = "unavailable"
+    exception_type = None
     deadline = asyncio.get_running_loop().time() + timeout
 
     async def target(arm=False):
@@ -95,10 +96,10 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
             receipt = await asyncio.wait_for(evaluate(tab, "window.__autoUiPointer?.receipt || null"), timeout=2)
             if isinstance(receipt, dict):
                 flags = {key: receipt.get(key) is True for key in flags}
-    except Exception:
+    except Exception as exc:
         # Navigation can destroy the event observer after a successful press.
         # The caller must still observe the expected application outcome.
-        pass
+        exception_type = type(exc).__name__
     finally:
         with suppress(Exception):
             await asyncio.wait_for(evaluate(tab, CLEAN_SCRIPT), timeout=2)
@@ -108,5 +109,7 @@ async def click_control(tab, evaluate, selector: str, *, kind="control", timeout
         print("  → Application mouse input: " + json.dumps({
             "kind": kind, "input_sent": sent, "trusted_events": flags,
             "reason": "sent" if sent else safe_reason,
+            "exception_type": exception_type,
         }, sort_keys=True))
     return {"input_sent": sent, "clicked": flags["clicked"] if sent else False}
+

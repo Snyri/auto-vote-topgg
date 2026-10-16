@@ -58,10 +58,18 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
             raise
 
     async def close_fixture(self):
+        process = getattr(self.browser, "_process", None)
         with suppress(Exception):
             await asyncio.wait_for(self.browser.aclose(), 5)
-        with suppress(Exception):
-            self.browser.stop()
+        if process and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), 5)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                await asyncio.wait_for(process.wait(), 5)
         self.profile.cleanup()
 
     async def asyncTearDown(self):
@@ -171,7 +179,7 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
         started = time.monotonic()
         with patch.object(client, "POLL_INTERVAL", .1):
             outcome = await client.vote_once(self.tab)
-        self.assertEqual(outcome["status"], "success")
+        self.assertEqual(outcome["status"], "success", outcome)
         self.assertGreaterEqual(time.monotonic()-started, 15)
         self.assertEqual(self.registration_requests, 1)
         self.assertEqual(self.vote_documents, 1)
@@ -186,7 +194,7 @@ class AniGameBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.open_page()
         with patch.object(client,"POLL_INTERVAL",.05):
             outcome = await client.vote_once(self.tab)
-        self.assertEqual(outcome["status"], "success")
+        self.assertEqual(outcome["status"], "success", outcome)
         self.assertEqual(self.registration_requests, 1)
         self.assertEqual(self.vote_documents, 1)
         self.assertEqual(self.receipt_documents, 0)
