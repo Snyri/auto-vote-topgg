@@ -43,6 +43,15 @@ async def main():
             await vote.navigate_page(tab, "https://www.anigame.gg/vote")
         await asyncio.sleep(10)
         print(json.dumps({"public_page_text": (await vote.body_text(tab))[:2500]}))
+        resources = await vote.evaluate(tab, "Array.from(document.querySelectorAll('script[src],link[as=script]')).map(el => el.src || el.href)")
+        for url in dict.fromkeys(resources):
+            parsed = urlparse(url)
+            if parsed.hostname not in {"anigame.gg", "www.anigame.gg"} or not parsed.path.startswith("/_next/static/chunks/"):
+                continue
+            resource = await vote.evaluate(tab, "fetch(" + json.dumps(url) + ").then(async r => ({status:r.status, source:await r.text()}))")
+            text = resource.get("source", "")
+            if resource.get("status") == 200 and ("/api/vote/" in text or 'rel:\"preload\"' in text or 'VotePage' in text):
+                print(json.dumps({"public_asset": parsed.path, "status": resource["status"], "source": text}))
         tab.add_handler(uc.cdp.debugger.ScriptParsed, inspect)
         await tab.send(uc.cdp.debugger.enable())
         await asyncio.sleep(5)
